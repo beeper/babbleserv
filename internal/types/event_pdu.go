@@ -2,16 +2,30 @@ package types
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
+	"github.com/rs/zerolog/log"
 )
 
 // Wrapper around an Event that implements the PDU interface from gomatrixserverlib:
 // https://pkg.go.dev/github.com/matrix-org/gomatrixserverlib#PDU
 
 type EventPDU struct {
-	ev *Event
+	ev          *Event
+	roomVersion gomatrixserverlib.RoomVersion
+}
+
+func (pdu EventPDU) MarshalJSON() ([]byte, error) {
+	// return json.Marshal(pdu.ev)
+	b, err := json.Marshal(pdu.ev)
+	if err != nil {
+		return nil, err
+	}
+	log.Info().Str("DATA", string(b)).Msg("SIGNED")
+	return b, err
+	// return gomatrixserverlib.CanonicalJSON(b)
 }
 
 func (pdu EventPDU) Event() *Event {
@@ -66,7 +80,7 @@ func (pdu EventPDU) PowerLevels() (*gomatrixserverlib.PowerLevelContent, error) 
 }
 
 func (pdu EventPDU) Version() gomatrixserverlib.RoomVersion {
-	return "11"
+	return pdu.roomVersion
 }
 
 func (pdu EventPDU) RoomID() spec.RoomID {
@@ -81,19 +95,19 @@ func (pdu EventPDU) Redacts() string {
 // // Redacted returns whether the event is redacted.
 
 func (pdu EventPDU) Redacted() bool {
-	return true
+	return false
 }
 
 func (pdu EventPDU) PrevEventIDs() []string {
 	eventIDs := make([]string, 0, len(pdu.ev.PrevEventIDs))
 	for _, eventID := range pdu.ev.PrevEventIDs {
-		eventIDs = append(eventIDs, string(eventID))
+		eventIDs = append(eventIDs, eventID.String())
 	}
 	return eventIDs
 }
 
 func (pdu EventPDU) OriginServerTS() spec.Timestamp {
-	return 0
+	return spec.Timestamp(pdu.ev.Timestamp)
 }
 
 // // Redact redacts the event.
@@ -111,7 +125,7 @@ func (pdu EventPDU) Unsigned() []byte {
 // // SetUnsigned sets the unsigned key of the event.
 // // Returns a copy of the event with the "unsigned" key set.
 
-func (pdu EventPDU) SetUnsigned(unsigned interface{}) (gomatrixserverlib.PDU, error) {
+func (pdu EventPDU) SetUnsigned(unsigned any) (gomatrixserverlib.PDU, error) {
 	return pdu, nil
 }
 
@@ -120,7 +134,7 @@ func (pdu EventPDU) SetUnsigned(unsigned interface{}) (gomatrixserverlib.PDU, er
 // // path is a dot separated path into the unsigned dict (see gjson package
 // // for details on format). In particular some characters like '.' and '*' must
 // // be escaped.
-func (pdu EventPDU) SetUnsignedField(path string, value interface{}) error {
+func (pdu EventPDU) SetUnsignedField(path string, value any) error {
 	return nil
 }
 
@@ -130,12 +144,25 @@ func (pdu EventPDU) Sign(signingName string, keyID gomatrixserverlib.KeyID, priv
 }
 
 func (pdu EventPDU) Depth() int64 {
-	return 0
+	return pdu.ev.Depth
 }
+
 func (pdu EventPDU) JSON() []byte {
-	return nil
+	b, err := json.Marshal(pdu.ev)
+	if err != nil {
+		panic("failed to JSON marshal event")
+	}
+	return b
 }
+
 func (pdu EventPDU) AuthEventIDs() []string {
-	return nil
+	eventIDs := make([]string, 0, len(pdu.ev.AuthEventIDs))
+	for _, eventID := range pdu.ev.AuthEventIDs {
+		eventIDs = append(eventIDs, eventID.String())
+	}
+	return eventIDs
 }
-func (pdu EventPDU) ToHeaderedJSON() ([]byte, error) { return nil, nil }
+
+func (pdu EventPDU) ToHeaderedJSON() ([]byte, error) {
+	return nil, nil
+}

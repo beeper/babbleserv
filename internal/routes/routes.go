@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
@@ -15,17 +16,23 @@ import (
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/middleware"
+	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/routes/client"
+	"github.com/beeper/babbleserv/internal/routes/debug"
 	"github.com/beeper/babbleserv/internal/routes/federation"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/libserv/pkg/requestlog"
 )
 
 type Routes struct {
-	log        zerolog.Logger
+	log    zerolog.Logger
+	config config.BabbleConfig
+
 	client     *client.ClientRoutes
 	federation *federation.FederationRoutes
-	servers    []*Server
+	babbleserv *debug.DebugRoutes
+
+	servers []*Server
 }
 
 type Server struct {
@@ -37,19 +44,26 @@ func NewRoutes(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
 	databases *databases.Databases,
+	notifier *notifier.Notifier,
+	fclient fclient.FederationClient,
+	keyStore *util.KeyStore,
 ) *Routes {
 	log := logger.With().
 		Str("component", "routes").
 		Logger()
 
 	r := &Routes{
-		log:        log,
-		client:     client.NewClientRoutes(cfg, logger, databases),
-		federation: federation.NewFederationRoutes(cfg, logger, databases),
-		servers:    make([]*Server, 0),
+		log:    log,
+		config: cfg,
+
+		babbleserv: debug.NewDebugRoutes(cfg, logger, databases, notifier),
+		client:     client.NewClientRoutes(cfg, logger, databases, fclient, keyStore),
+		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, keyStore),
+
+		servers: make([]*Server, 0),
 	}
 
-	for _, serverCfg := range cfg.Servers {
+	for _, serverCfg := range cfg.Routes.Servers {
 		server := &Server{
 			Server: http.Server{
 				Addr:    serverCfg.ListenAddr,
@@ -70,10 +84,12 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 	rtr.Use(hlog.RequestIDHandler("request_id", ""))
 	rtr.Use(requestlog.AccessLogger(true))
 	rtr.Use(middleware.NewRecoveryMiddleware(r.log))
-	rtr.Use(middleware.AuthMiddleware)
+	rtr.Use(middleware.NewUserAuthMiddleware(r.config.ServerName))
 
 	for _, group := range groups {
 		switch group {
+		case "babbleserv":
+			rtr.Route("/_babbleserv", r.babbleserv.AddDebugRoutes)
 		case "client":
 			rtr.Route("/_matrix/client", r.client.AddClientRoutes)
 		case "federation":
@@ -91,11 +107,20 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 		util.ResponseErrorJSON(w, r, util.MMethodNotAllowed)
 	})
 
+	// Add .well-known routes if configured - useful for development servers
+	// running on a subdomain.
+	if r.config.WellKnown.Client != "" {
+		rtr.MethodFunc(http.MethodGet, "/.well-known/matrix/client", r.WellKnownClient)
+	}
+	if r.config.WellKnown.Server != "" {
+		rtr.MethodFunc(http.MethodGet, "/.well-known/matrix/server", r.WellKnownServer)
+	}
+
 	return rtr
 }
 
 func (r *Routes) Start() {
-	r.log.Info().Msg("Starting servers...")
+	r.log.Info().Msg("Starting routes...")
 
 	for _, server := range r.servers {
 		go func() {
@@ -104,7 +129,7 @@ func (r *Routes) Start() {
 				server.Addr,
 				server.ServiceGroups,
 			)
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := server.ListenAndServeTLS("cert.pem", "key.pem"); err != nil && err != http.ErrServerClosed {
 				r.log.Panic().Err(err).Msg("Error in server listener")
 			}
 		}()
@@ -112,7 +137,7 @@ func (r *Routes) Start() {
 }
 
 func (r *Routes) Stop() {
-	r.log.Info().Msg("Shutdown initiated...")
+	r.log.Info().Msg("Stopping routes...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -127,7 +152,9 @@ func (r *Routes) Stop() {
 			}
 		}()
 	}
-
 	wg.Wait()
-	r.log.Info().Msg("Servers stopped")
+
+	// Now that the server has stopped and we can't receive more requests, wait
+	// on any background work.
+	r.client.Stop()
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases/rooms"
+	"github.com/beeper/babbleserv/internal/notifier"
 )
 
 type Databases struct {
@@ -21,13 +22,26 @@ type Databases struct {
 	Rooms *rooms.RoomsDatabase
 }
 
-func NewDatabases(cfg config.BabbleConfig, logger zerolog.Logger) *Databases {
+func NewDatabases(
+	cfg config.BabbleConfig,
+	logger zerolog.Logger,
+	notifier *notifier.Notifier,
+) *Databases {
 	log := logger.With().
 		Str("component", "databases").
 		Logger()
 
 	return &Databases{
 		log:   log,
-		Rooms: rooms.NewRoomsDatabase(cfg, log),
+		Rooms: rooms.NewRoomsDatabase(cfg, log, notifier),
 	}
+}
+
+func (d *Databases) Start() {
+	// noop
+}
+
+func (d *Databases) Stop() {
+	d.log.Info().Msg("Stopping databases...")
+	d.Rooms.Stop()
 }

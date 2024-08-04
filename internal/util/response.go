@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/matrix-org/gomatrix"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 )
@@ -19,6 +20,9 @@ var (
 	MMethodNotAllowed = mautrix.RespError{
 		ErrCode: "M_METHOD_NOT_ALLOWED",
 	}
+	MUnauthorized = mautrix.RespError{
+		ErrCode: "M_UNAUTHORIZED",
+	}
 )
 
 type errorMeta struct {
@@ -28,22 +32,43 @@ type errorMeta struct {
 
 var errorToMeta = map[string]errorMeta{
 	mautrix.MNotJSON.ErrCode:      {400, "Request body is not valid JSON"},
+	mautrix.MInvalidParam.ErrCode: {400, ""},
+
 	mautrix.MMissingToken.ErrCode: {401, ""},
 	mautrix.MUnknownToken.ErrCode: {401, ""},
+	MUnauthorized.ErrCode:         {401, ""},
 	mautrix.MForbidden.ErrCode:    {403, ""},
-	mautrix.MNotFound.ErrCode:     {404, "Nothing found here"},
-	MUnknown.ErrCode:              {500, "An unknown error occurred"},
-	MMethodNotAllowed.ErrCode:     {405, "Wrong HTTP method"},
+
+	mautrix.MNotFound.ErrCode: {404, "Nothing found here"},
+	MMethodNotAllowed.ErrCode: {405, "Wrong HTTP method"},
+
+	MUnknown.ErrCode: {500, "An unknown error occurred"},
 }
+
+var EmptyJSON struct{}
 
 type errorData struct {
 	Code  string `json:"errcode"`
-	Error string `json:"error"`
+	Error string `json:"error,omitempty"`
 }
 
 func MakeMatrixError(error mautrix.RespError, message string) mautrix.RespError {
 	error.Err = message
 	return error
+}
+
+func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error) {
+	if httpErr, ok := err.(gomatrix.HTTPError); ok {
+		hlog.FromRequest(r).Err(httpErr.WrappedError).Msg("Matrix error processing request")
+		ResponseRawJSON(w, r, httpErr.Code, httpErr.Contents)
+		return
+	}
+	hlog.FromRequest(r).Err(err).Msg("Unknown error processing request")
+	ResponseErrorJSON(w, r, MUnknown)
+}
+
+func ResponseErrorJSON(w http.ResponseWriter, r *http.Request, error mautrix.RespError) {
+	ResponseErrorMessageJSON(w, r, error, "")
 }
 
 func ResponseErrorMessageJSON(w http.ResponseWriter, r *http.Request, error mautrix.RespError, message string) {
@@ -54,28 +79,28 @@ func ResponseErrorMessageJSON(w http.ResponseWriter, r *http.Request, error maut
 	if message == "" {
 		message = meta.defaultMsg
 	}
+	hlog.FromRequest(r).Error().
+		Str("error_code", error.ErrCode).
+		Str("error_message", message).
+		Msg("Send response error")
 	ResponseJSON(w, r, meta.statusCode, errorData{error.ErrCode, message})
 }
 
-func ResponseErrorJSON(w http.ResponseWriter, r *http.Request, error mautrix.RespError) {
-	ResponseErrorMessageJSON(w, r, error, "")
-}
-
-func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error) {
-	hlog.FromRequest(r).Err(err).Msg("Error processing request")
-	ResponseErrorJSON(w, r, MUnknown)
-}
-
 func ResponseJSON(w http.ResponseWriter, r *http.Request, statusCode int, data any) {
-	log := hlog.FromRequest(r)
-
 	addCORSHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Err(err).Msgf("Failed to marshal output to JSON: %T", data)
+		hlog.FromRequest(r).Err(err).Msgf("Failed to marshal output to JSON: %T", data)
 	}
+}
+
+func ResponseRawJSON(w http.ResponseWriter, r *http.Request, statusCode int, data []byte) {
+	addCORSHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	w.Write(data)
 }
 
 func addCORSHeaders(w http.ResponseWriter) {

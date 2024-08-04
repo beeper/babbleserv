@@ -8,12 +8,15 @@ import (
 type Room struct {
 	ID id.RoomID `json:"room_id" msgpack:"rid"`
 
-	Version int `json:"version" msgpack:"ver"`
+	Version string `json:"version" msgpack:"ver"`
+
+	CurrentDepth       int64 `msgpack:"dpt"`
+	CurrentStreamDepth int64 `msgpack:"sdp"`
 
 	Name      string `json:"name" msgpack:"nme"`
 	Type      string `json:"type"`
 	Topic     string `json:"topic" msgpack:"tpc"`
-	AvatarURL string `json:"avatar_urk" msgpack:"aul"`
+	AvatarURL string `json:"avatar_url" msgpack:"aul"`
 
 	CanonicalAlias string `json:"canonical_alias" msgpack:"cas"`
 
@@ -40,9 +43,9 @@ func MustNewRoomFromBytes(b []byte) *Room {
 }
 
 func (r *Room) ToMsgpack() []byte {
-	if bytes, err := msgpack.Marshal(r); err != nil {
+	if b, err := msgpack.Marshal(r); err != nil {
 		panic(err)
 	} else {
-		return bytes
+		return b
 	}
 }

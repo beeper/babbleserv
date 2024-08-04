@@ -15,19 +15,6 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func handleResults(w http.ResponseWriter, r *http.Request, ev *types.Event, eventMap map[id.EventID]error) {
-	if err, found := eventMap[ev.ID]; !found {
-		panic("input event missing from results")
-	} else if err != nil {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
-		return
-	} else {
-		util.ResponseJSON(w, r, http.StatusOK, map[string]id.EventID{
-			"event_id": ev.ID,
-		})
-	}
-}
-
 func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 	evType := event.NewEventType(chi.URLParam(r, "eventType"))
@@ -39,15 +26,13 @@ func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID("localhost")
-	ev := types.NewEvent(roomID, evType, &stateKey, userID, content)
-
-	if results, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, []*types.Event{ev}); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else {
-		handleResults(w, r, ev, results.EventMap())
-	}
+	userID := middleware.GetRequestUser(r).UserID()
+	ev := types.NewPartialEvent(roomID, evType, &stateKey, userID, content)
+	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
+		return map[string]id.EventID{
+			"event_id": ev.ID,
+		}
+	})
 }
 
 func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
@@ -63,13 +48,11 @@ func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID("localhost")
-	ev := types.NewEvent(roomID, evType, nil, userID, content)
-
-	if results, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, []*types.Event{ev}); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else {
-		handleResults(w, r, ev, results.EventMap())
-	}
+	userID := middleware.GetRequestUser(r).UserID()
+	ev := types.NewPartialEvent(roomID, evType, nil, userID, content)
+	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
+		return map[string]id.EventID{
+			"event_id": ev.ID,
+		}
+	})
 }

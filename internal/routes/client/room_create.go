@@ -1,15 +1,19 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -17,27 +21,25 @@ import (
 
 const defaultRoomVersion = "11"
 
-var presets map[string][]types.Event
-
-func init() {
-	sKey := ""
-	presets = map[string][]types.Event{
-		"private_chat": {
-			*types.NewEvent("", event.StateJoinRules, &sKey, "", map[string]any{"join_rule": event.JoinRuleInvite}),
-			*types.NewEvent("", event.StateHistoryVisibility, &sKey, "", map[string]any{"join_rule": event.HistoryVisibilityShared}),
-			*types.NewEvent("", event.StateGuestAccess, &sKey, "", map[string]any{"join_rule": event.GuestAccessCanJoin}),
-		},
-		"trusted_private_chat": {
-			*types.NewEvent("", event.StateJoinRules, &sKey, "", map[string]any{"join_rule": event.JoinRuleInvite}),
-			*types.NewEvent("", event.StateHistoryVisibility, &sKey, "", map[string]any{"join_rule": event.HistoryVisibilityShared}),
-			*types.NewEvent("", event.StateGuestAccess, &sKey, "", map[string]any{"join_rule": event.GuestAccessCanJoin}),
-		},
-		"public_chat": {
-			*types.NewEvent("", event.StateJoinRules, &sKey, "", map[string]any{"join_rule": event.JoinRulePublic}),
-			*types.NewEvent("", event.StateHistoryVisibility, &sKey, "", map[string]any{"join_rule": event.HistoryVisibilityShared}),
-			*types.NewEvent("", event.StateGuestAccess, &sKey, "", map[string]any{"join_rule": event.GuestAccessForbidden}),
-		},
-	}
+var presets = map[string][]struct {
+	Type    event.Type
+	Content map[string]any
+}{
+	"private_chat": {
+		{event.StateJoinRules, map[string]any{"join_rule": event.JoinRuleInvite}},
+		{event.StateHistoryVisibility, map[string]any{"history_visibility": event.HistoryVisibilityShared}},
+		{event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessCanJoin}},
+	},
+	"trusted_private_chat": {
+		{event.StateJoinRules, map[string]any{"join_rule": event.JoinRuleInvite}},
+		{event.StateHistoryVisibility, map[string]any{"history_visibility": event.HistoryVisibilityShared}},
+		{event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessCanJoin}},
+	},
+	"public_chat": {
+		{event.StateJoinRules, map[string]any{"join_rule": event.JoinRulePublic}},
+		{event.StateHistoryVisibility, map[string]any{"history_visibility": event.HistoryVisibilityShared}},
+		{event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessForbidden}},
+	},
 }
 
 // https://spec.matrix.org/v1.10/client-server-api/#post_matrixclientv3createroom
@@ -48,16 +50,15 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user := middleware.GetRequestUser(r)
-	userID := user.UserID("localhost") // TODO: hostname
+	userID := middleware.GetRequestUser(r).UserID()
 
 	roomID, err := c.db.Rooms.GenerateRoomID()
 	if err != nil {
-		hlog.FromRequest(r).Err(err).Msg("Failed to create room ID")
+		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error creating new room ID: %w", err))
 		return
 	}
 
-	evs := make([]*types.Event, 0, len(req.InitialState)+5)
+	evs := make([]*types.PartialEvent, 0, len(req.InitialState)+5)
 	sKey := "" // blank state key to point at
 
 	// Create events per the spec:
@@ -70,16 +71,16 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	createContent["creator"] = userID
 	if req.RoomVersion == "" {
-		createContent["version"] = defaultRoomVersion
+		createContent["room_version"] = c.config.Rooms.DefaultVersion
 	} else {
-		createContent["version"] = req.RoomVersion
+		createContent["room_version"] = req.RoomVersion
 	}
-	createEv := types.NewEvent(roomID, event.StateCreate, &sKey, userID, createContent)
+	createEv := types.NewPartialEvent(roomID, event.StateCreate, &sKey, userID, createContent)
 	evs = append(evs, createEv)
 
 	// 2: An m.room.member event for the creator to join the room. This is needed so the remaining events can be sent.
 	userIDStr := string(userID)
-	creatorEv := types.NewEvent(roomID, event.StateMember, &userIDStr, userID, map[string]any{
+	creatorEv := types.NewPartialEvent(roomID, event.StateMember, &userIDStr, userID, map[string]any{
 		"membership": event.MembershipJoin,
 	})
 	evs = append(evs, creatorEv)
@@ -94,7 +95,7 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			userPowerLevels[uid] = 100
 		}
 	}
-	powerEv := types.NewEvent(roomID, event.StatePowerLevels, &sKey, userID, map[string]any{
+	powerEv := types.NewPartialEvent(roomID, event.StatePowerLevels, &sKey, userID, map[string]any{
 		"users": userPowerLevels,
 		"events": map[event.Type]int{
 			event.StateHistoryVisibility: 100,
@@ -115,39 +116,70 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, ev := range preset {
-		ev.RoomID = roomID
-		ev.Sender = userID
-		evs = append(evs, &ev)
+		evs = append(evs, types.NewPartialEvent(roomID, ev.Type, &sKey, userID, ev.Content))
 	}
 
 	// 6: Events listed in initial_state, in the order that they are listed.
 	for _, ev := range req.InitialState {
-		evs = append(evs, types.NewEventFromMautrix(ev))
+		if ev.ID != "" || ev.RoomID != "" || ev.Sender != "" {
+			util.ResponseErrorMessageJSON(
+				w, r, mautrix.MInvalidParam,
+				"Initial state events should not contain ID, room ID or sender",
+			)
+			return
+		}
+		evs = append(evs, types.NewPartialEvent(roomID, ev.Type, ev.StateKey, userID, ev.Content.Raw))
 	}
 
 	// 7: Events implied by name and topic (m.room.name and m.room.topic state events).
 	if req.Name != "" {
-		nameEv := types.NewEvent(roomID, event.StateRoomName, &sKey, userID, map[string]any{"name": req.Name})
+		nameEv := types.NewPartialEvent(roomID, event.StateRoomName, &sKey, userID, map[string]any{"name": req.Name})
 		evs = append(evs, nameEv)
 	}
 	if req.Topic != "" {
-		topicEv := types.NewEvent(roomID, event.StateTopic, &sKey, userID, map[string]any{"name": req.Topic})
+		topicEv := types.NewPartialEvent(roomID, event.StateTopic, &sKey, userID, map[string]any{"topic": req.Topic})
 		evs = append(evs, topicEv)
 	}
 
 	// 8: Invite events implied by invite and invite_3pid (m.room.member with membership: invite and m.room.third_party_invite).
+	// Note we'll keep external (federated) invites separate and send them after we create the room
+	// as we need the room persisted first.
+	externalInvites := make(map[id.UserID]*types.PartialEvent, 0)
 	for _, uid := range req.Invite {
 		uidStr := string(uid)
-		inviteEv := types.NewEvent(roomID, event.StateMember, &uidStr, userID, map[string]any{"membership": "invite"})
-		evs = append(evs, inviteEv)
+		inviteEv := types.NewPartialEvent(roomID, event.StateMember, &uidStr, userID, map[string]any{"membership": "invite"})
+		if uid.Homeserver() != c.config.ServerName {
+			externalInvites[uid] = inviteEv
+		} else {
+			evs = append(evs, inviteEv)
+		}
 	}
 
-	// Send it!
-	_, err = c.db.Rooms.SendLocalEvents(r.Context(), roomID, evs)
+	_, err = c.db.Rooms.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
 	if err != nil {
-		hlog.FromRequest(r).Err(err).Msg("Failed to store new room events")
+		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error sending local events: %w", err))
 		return
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespCreateRoom{RoomID: roomID})
+
+	// Now send any external invites in a background goroutine so we don't block the create call
+	backgroundCtx := zerolog.Ctx(r.Context()).With().
+		Str("background_task", "SendRemoteInvitesAfterRoomCreate").
+		Logger().
+		WithContext(context.Background())
+	log := zerolog.Ctx(backgroundCtx)
+
+	c.backgroundWg.Add(1)
+	go func() {
+		defer c.backgroundWg.Done()
+
+		for uid, ev := range externalInvites {
+			_, respErr, err := c.prepareAndSendInviteForRemoteUser(backgroundCtx, roomID, uid, ev)
+			if err != nil {
+				log.Err(err).Any("resp_error", respErr).Msg("Error sending federated invite to newly created room")
+				// TODO: tell the request user about this! (via their personal control room)
+			}
+		}
+	}()
 }
