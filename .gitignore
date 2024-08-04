@@ -1,3 +1,5 @@
 *.dylib
 config.yaml
 clusterfile
+ed25519-*
+*.pem
