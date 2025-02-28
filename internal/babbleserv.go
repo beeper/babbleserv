@@ -17,10 +17,10 @@ import (
 )
 
 type Babbleserv struct {
-	db       *databases.Databases
-	notifier *notifier.Notifier
-	routes   *routes.Routes
-	workers  *workers.Workers
+	db        *databases.Databases
+	notifiers *notifier.Notifiers
+	routes    *routes.Routes
+	workers   *workers.Workers
 }
 
 type UserAgentTransport struct {
@@ -50,36 +50,42 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 	// Create a global key store to cache server signing keys
 	keyStore := util.NewKeyStore(fclient)
 
-	// Create the notifier instance
-	notif := notifier.NewNotifier(cfg, log)
+	// Create global datastores
+	var datastores *util.Datastores
+	if cfg.Media.Enabled {
+		datastores = util.NewDatastores(cfg)
+	}
 
-	db := databases.NewDatabases(cfg, log, notif)
+	// Create the notifier instance
+	notifiers := notifier.NewNotifiers(cfg, log)
+
+	db := databases.NewDatabases(cfg, log, notifiers)
 
 	var rts *routes.Routes
 	if cfg.RoutesEnabled {
-		rts = routes.NewRoutes(cfg, log, db, notif, fclient, keyStore)
+		rts = routes.NewRoutes(cfg, log, db, notifiers, fclient, keyStore, datastores)
 	} else {
 		log.Info().Msg("Routes disabled")
 	}
 
 	var wrks *workers.Workers
 	if cfg.WorkersEnabled {
-		wrks = workers.NewWorkers(cfg, log, db, notif, fclient)
+		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient)
 	} else {
 		log.Info().Msg("Workers disabled")
 	}
 
 	return &Babbleserv{
-		db:       db,
-		notifier: notif,
-		routes:   rts,
-		workers:  wrks,
+		db:        db,
+		notifiers: notifiers,
+		routes:    rts,
+		workers:   wrks,
 	}
 }
 
 func (b *Babbleserv) Start() {
 	b.db.Start()
-	b.notifier.Start()
+	b.notifiers.Start()
 
 	if b.routes != nil {
 		b.routes.Start()
@@ -97,6 +103,6 @@ func (b *Babbleserv) Stop() {
 		b.workers.Stop()
 	}
 
-	b.notifier.Stop()
+	b.notifiers.Stop()
 	b.db.Stop()
 }

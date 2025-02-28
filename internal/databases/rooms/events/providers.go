@@ -3,6 +3,8 @@ package events
 import (
 	"context"
 	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
@@ -243,6 +245,9 @@ func (ap *TxnAuthEventsProvider) GetAuthEventIDsForEvent(ev *types.Event) []id.E
 			authEventIDs = append(authEventIDs, eventID)
 		}
 	}
+	slices.SortFunc(authEventIDs, func(a, b id.EventID) int {
+		return strings.Compare(a.String(), b.String())
+	})
 	return authEventIDs
 }
 

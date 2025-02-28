@@ -50,13 +50,8 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
-
-	roomID, err := c.db.Rooms.GenerateRoomID()
-	if err != nil {
-		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error creating new room ID: %w", err))
-		return
-	}
+	userID := middleware.GetRequestUserID(r)
+	roomID := c.db.Rooms.GenerateRoomID()
 
 	evs := make([]*types.PartialEvent, 0, len(req.InitialState)+5)
 	sKey := "" // blank state key to point at
@@ -155,7 +150,7 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err = c.db.Rooms.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
+	_, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error sending local events: %w", err))
 		return

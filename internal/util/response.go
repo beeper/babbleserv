@@ -23,6 +23,12 @@ var (
 	MUnauthorized = mautrix.RespError{
 		ErrCode: "M_UNAUTHORIZED",
 	}
+	MNotYetUploaded = mautrix.RespError{
+		ErrCode: "M_NOT_YET_UPLOADED",
+	}
+	MUnprocessableContent = mautrix.RespError{
+		ErrCode: "M_UNPROCESSABLE",
+	}
 )
 
 type errorMeta struct {
@@ -38,11 +44,13 @@ var errorToMeta = map[string]errorMeta{
 	mautrix.MUnknownToken.ErrCode: {401, ""},
 	MUnauthorized.ErrCode:         {401, ""},
 	mautrix.MForbidden.ErrCode:    {403, ""},
+	MUnprocessableContent.ErrCode: {422, ""},
 
 	mautrix.MNotFound.ErrCode: {404, "Nothing found here"},
 	MMethodNotAllowed.ErrCode: {405, "Wrong HTTP method"},
 
-	MUnknown.ErrCode: {500, "An unknown error occurred"},
+	MUnknown.ErrCode:        {500, "An unknown error occurred"},
+	MNotYetUploaded.ErrCode: {504, "File not yet uploaded"},
 }
 
 var EmptyJSON struct{}

@@ -28,6 +28,7 @@ type Routes struct {
 	log    zerolog.Logger
 	config config.BabbleConfig
 
+	databases  *databases.Databases
 	client     *client.ClientRoutes
 	federation *federation.FederationRoutes
 	babbleserv *debug.DebugRoutes
@@ -44,9 +45,10 @@ func NewRoutes(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
 	databases *databases.Databases,
-	notifier *notifier.Notifier,
+	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
 	keyStore *util.KeyStore,
+	dstores *util.Datastores,
 ) *Routes {
 	log := logger.With().
 		Str("component", "routes").
@@ -56,9 +58,11 @@ func NewRoutes(
 		log:    log,
 		config: cfg,
 
-		babbleserv: debug.NewDebugRoutes(cfg, logger, databases, notifier),
-		client:     client.NewClientRoutes(cfg, logger, databases, fclient, keyStore),
-		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, keyStore),
+		databases: databases,
+
+		babbleserv: debug.NewDebugRoutes(cfg, logger, databases, notifiers, dstores),
+		client:     client.NewClientRoutes(cfg, logger, databases, fclient, keyStore, dstores, notifiers),
+		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, keyStore, dstores),
 
 		servers: make([]*Server, 0),
 	}
@@ -84,7 +88,10 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 	rtr.Use(hlog.RequestIDHandler("request_id", ""))
 	rtr.Use(requestlog.AccessLogger(true))
 	rtr.Use(middleware.NewRecoveryMiddleware(r.log))
-	rtr.Use(middleware.NewUserAuthMiddleware(r.config.ServerName))
+	rtr.Use(middleware.NewUserAuthMiddleware(
+		r.config.ServerName,
+		r.databases.Accounts.GetUserDeviceForAuthToken,
+	))
 
 	for _, group := range groups {
 		switch group {
@@ -92,6 +99,7 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 			rtr.Route("/_babbleserv", r.babbleserv.AddDebugRoutes)
 		case "client":
 			rtr.Route("/_matrix/client", r.client.AddClientRoutes)
+			rtr.Route("/_matrix/media", r.client.AddClientMediaRoutes)
 		case "federation":
 			rtr.Route("/_matrix/key", r.federation.AddKeyRoutes)
 			rtr.Route("/_matrix/federation", r.federation.AddFederationRoutes)

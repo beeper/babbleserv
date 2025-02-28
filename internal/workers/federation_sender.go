@@ -2,9 +2,13 @@ package workers
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/cespare/xxhash"
+	"github.com/elastic/go-freelru"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
@@ -20,14 +24,15 @@ import (
 )
 
 type FederationSender struct {
-	log      zerolog.Logger
-	config   config.BabbleConfig
-	db       *databases.Databases
-	notifier *notifier.Notifier
-	fclient  fclient.FederationClient
+	log       zerolog.Logger
+	config    config.BabbleConfig
+	db        *databases.Databases
+	notifiers *notifier.Notifiers
+	fclient   fclient.FederationClient
 
 	// Internal map + lock of active senders we have running in this process
 	lock          sync.RWMutex
+	lockCache     *freelru.LRU[string, string]
 	serverSenders map[string]chan struct{}
 
 	wg     sync.WaitGroup
@@ -39,27 +44,44 @@ func NewFederationSender(
 	logger zerolog.Logger,
 	cfg config.BabbleConfig,
 	db *databases.Databases,
-	notif *notifier.Notifier,
+	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
 ) *FederationSender {
 	log := logger.With().
 		Str("worker", "FederationSender").
 		Logger()
 
+	lockCache, err := freelru.New[string, string](1000, func(s string) uint32 {
+		return uint32(xxhash.Sum64String(string(s)))
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	return &FederationSender{
 		log:           log,
 		config:        cfg,
 		db:            db,
-		notifier:      notif,
+		notifiers:     notifiers,
 		fclient:       fclient,
 		serverSenders: make(map[string]chan struct{}),
+		lockCache:     lockCache,
 	}
 }
 
 func (fs *FederationSender) Start() {
 	fs.ctx, fs.cancel = context.WithCancel(fs.log.WithContext(context.Background()))
-	fs.log.Info().Msg("Starting federation sender...")
-	go fs.handleServersLoop()
+
+	initialServerNames, err := fs.db.Rooms.GetServerNamesWithPositions(fs.ctx)
+	if err != nil {
+		panic(fmt.Errorf("failed to get initial servers: %w", err))
+	}
+
+	fs.log.Info().
+		Int("initial_servers", len(initialServerNames)).
+		Msg("Starting federation sender...")
+
+	go fs.handleServersLoop(initialServerNames)
 }
 
 func (fs *FederationSender) Stop() {
@@ -68,13 +90,20 @@ func (fs *FederationSender) Stop() {
 	fs.log.Info().Msg("Federation sender stopped")
 }
 
-func (fs *FederationSender) handleServersLoop() {
+func (fs *FederationSender) handleServersLoop(initialServerNames []string) {
 	fs.wg.Add(1)
 	defer fs.wg.Done()
 
 	newServersCh := make(chan any, 1000)
-	fs.notifier.Subscribe(newServersCh, notifier.Subscription{AllServers: true})
-	defer fs.notifier.Unsubscribe(newServersCh)
+	fs.notifiers.Subscribe(newServersCh, notifier.Subscription{AllServers: true})
+	defer fs.notifiers.Unsubscribe(newServersCh)
+
+	// Kick off a goroutine to push our initial servers into the queue
+	go func() {
+		for _, name := range initialServerNames {
+			newServersCh <- name
+		}
+	}()
 
 	for {
 		select {
@@ -82,6 +111,11 @@ func (fs *FederationSender) handleServersLoop() {
 			return
 		case server := <-newServersCh:
 			serverName := server.(string)
+
+			if serverName == fs.config.ServerName {
+				fs.log.Warn().Str("server", serverName).Msg("Ignoring ourselves")
+				continue
+			}
 
 			// First check our in memory map of active senders, avoid the FDB lock
 			// entirely if we're already running this sender.
@@ -107,21 +141,21 @@ func (fs *FederationSender) handleServersLoop() {
 
 const (
 	serverSenderLockNamePrefix = "FederationServerSenderLock:"
-	serverSenderLockRefresh    = time.Second * 30
+	serverSenderLockRetry      = time.Second * 30
 	serverSenderLockTimeout    = time.Second * 60
 )
 
 func (fs *FederationSender) maybeRunServerSender(serverName string) {
 	lockName := serverSenderLockNamePrefix + serverName
-	var hadLock bool
 
-	if err := lock.WithLockIfAvailable(fs.ctx, fs.db.Rooms, lockName, lock.LockOptions{
-		RefreshInterval: serverSenderLockRefresh,
-		Timeout:         serverSenderLockTimeout,
-	}, func(lock lock.Lock) {
+	lockOpts := lock.LockOptions{
+		RetryInterval: serverSenderLockRetry,
+		Timeout:       serverSenderLockTimeout,
+	}
+
+	if hadLock, err := lock.WithLockIfAvailable(fs.ctx, fs.db.Rooms, lockName, lockOpts, fs.lockCache, func(lock lock.Lock) {
 		fs.wg.Add(1)
 		defer fs.wg.Done()
-		hadLock = true
 
 		log := fs.log.With().
 			Str("server", serverName).
@@ -178,7 +212,7 @@ func (fs *FederationSender) sendEventsToServerLoop(
 			return
 		case <-wakeCh:
 			trySend()
-		case <-time.After(serverSenderLockRefresh):
+		case <-time.After(serverSenderLockRetry):
 			trySend()
 		}
 		if noSends >= 10 {
@@ -208,7 +242,7 @@ func (fs *FederationSender) sendEventsToServer(serverName string, lock lock.Lock
 			roomsVersion = types.ZeroVersionstamp
 		}
 
-		nextVersion, events, err := fs.db.Rooms.SyncRoomEventsForServer(fs.ctx, serverName, rooms.SyncOptions{
+		nextVersion, events, err := fs.db.Rooms.SyncRoomsForServer(fs.ctx, serverName, rooms.SyncOptions{
 			Limit: 50, // hardcoded spec limit
 			From:  roomsVersion,
 		})
@@ -224,42 +258,15 @@ func (fs *FederationSender) sendEventsToServer(serverName string, lock lock.Lock
 
 		allEvs := make([]*types.Event, 0, 50)
 		for _, evs := range events {
-			allEvs = append(allEvs, evs...)
+			allEvs = append(allEvs, evs.StateEvents...)
+			allEvs = append(allEvs, evs.TimelineEvents...)
 		}
-		transactionID := util.Base64EncodeURLSafe(roomsVersion.Bytes())
 
-		log.Info().
-			Int("pdus", len(allEvs)).
-			Str("transaction_id", transactionID).
-			Msg("Sending transaction to server")
-
-		if resp, err := fs.fclient.SendTransaction(fs.ctx, gomatrixserverlib.Transaction{
-			TransactionID:  gomatrixserverlib.TransactionID(transactionID),
-			Origin:         spec.ServerName(fs.config.ServerName),
-			Destination:    spec.ServerName(serverName),
-			OriginServerTS: spec.Timestamp(time.Now().UnixMilli()),
-			PDUs:           util.EventsToJSONs(allEvs),
-		}); err != nil {
-			log.Err(err).Msg("Failed to send transaction")
-			return sent
-		} else {
-			var success, error int
-			for evID, result := range resp.PDUs {
-				if result.Error == "" {
-					success++
-				} else {
-					error++
-					log.Warn().Err(err).
-						Str("event_id", evID).
-						Str("transaction_id", transactionID).
-						Msg("Event error from other server")
-				}
+		if len(allEvs) > 0 {
+			if err := fs.sendTransactionToServer(serverName, log, roomsVersion, allEvs); err != nil {
+				log.Err(err).Msg("Failed to send transaction")
+				return sent
 			}
-			log.Info().
-				Int("success", success).
-				Int("error", error).
-				Str("transaction_id", transactionID).
-				Msg("Sent transaction to server")
 		}
 
 		serverVersions[types.RoomsVersionKey] = nextVersion
@@ -270,4 +277,48 @@ func (fs *FederationSender) sendEventsToServer(serverName string, lock lock.Lock
 			return sent
 		}
 	}
+}
+
+func (fs *FederationSender) sendTransactionToServer(
+	serverName string,
+	log zerolog.Logger,
+	version tuple.Versionstamp,
+	evs []*types.Event,
+) error {
+	transactionID := util.Base64EncodeURLSafe(version.Bytes())
+
+	log.Info().
+		Int("pdus", len(evs)).
+		Str("transaction_id", transactionID).
+		Msg("Sending transaction to server")
+
+	if resp, err := fs.fclient.SendTransaction(fs.ctx, gomatrixserverlib.Transaction{
+		TransactionID:  gomatrixserverlib.TransactionID(transactionID),
+		Origin:         spec.ServerName(fs.config.ServerName),
+		Destination:    spec.ServerName(serverName),
+		OriginServerTS: spec.Timestamp(time.Now().UnixMilli()),
+		PDUs:           util.EventsToJSONs(evs),
+	}); err != nil {
+		return err
+	} else {
+		var success, error int
+		for evID, result := range resp.PDUs {
+			if result.Error == "" {
+				success++
+			} else {
+				error++
+				log.Warn().Err(err).
+					Str("event_id", evID).
+					Str("transaction_id", transactionID).
+					Msg("Event error from other server")
+			}
+		}
+		log.Info().
+			Int("success", success).
+			Int("error", error).
+			Str("transaction_id", transactionID).
+			Msg("Sent transaction to server")
+	}
+
+	return nil
 }

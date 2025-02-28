@@ -27,7 +27,15 @@ func (b *DebugRoutes) DebugSendNotifierChange(w http.ResponseWriter, r *http.Req
 		change.Servers = []string{query.Get("server")}
 	}
 
-	b.notifier.SendChange(change)
+	if b.notifiers.Rooms != nil {
+		b.notifiers.Rooms.SendChange(change)
+	}
+	if b.notifiers.Accounts != nil {
+		b.notifiers.Accounts.SendChange(change)
+	}
+	if b.notifiers.Transient != nil {
+		b.notifiers.Transient.SendChange(change)
+	}
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }

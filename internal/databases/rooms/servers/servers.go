@@ -12,7 +12,6 @@ import (
 type ServersDirectory struct {
 	log zerolog.Logger
 
-	byID,
 	joinedMembers,
 	memberships,
 	membershipChanges,
@@ -25,13 +24,13 @@ func NewServersDirectory(logger zerolog.Logger, db fdb.Database, parentDir direc
 		panic(err)
 	}
 
-	return &ServersDirectory{
-		log: logger.With().Str("directory", "servers").Logger(),
+	log := logger.With().Str("directory", "servers").Logger()
+	log.Debug().
+		Bytes("prefix", serversDir.Bytes()).
+		Msg("Init rooms/servers directory")
 
-		// Init data model subspaces, subspace prefixes are intentionally short
-		// "When using the tuple layer to encode keys (as is recommended), select short strings or small integers for tuple elements."
-		// https://apple.github.io/foundationdb/data-modeling.html#key-and-value-sizes
-		byID: serversDir.Sub("id"),
+	return &ServersDirectory{
+		log: log,
 
 		joinedMembers:     serversDir.Sub("jme"),
 		memberships:       serversDir.Sub("mem"),
@@ -41,12 +40,17 @@ func NewServersDirectory(logger zerolog.Logger, db fdb.Database, parentDir direc
 	}
 }
 
-func (s *ServersDirectory) KeyForServer(serverName string) fdb.Key {
-	return s.byID.Pack(tuple.Tuple{serverName})
-}
-
 func (s *ServersDirectory) KeyForServerPosition(serverName string) fdb.Key {
 	return s.idToPosition.Pack(tuple.Tuple{serverName})
+}
+
+func (s *ServersDirectory) PositionKeyToServer(key fdb.Key) string {
+	tup, _ := s.idToPosition.Unpack(key)
+	return tup[0].(string)
+}
+
+func (s *ServersDirectory) RangeForServerPositions() fdb.Range {
+	return s.idToPosition
 }
 
 // Server joined members (room_id, server_name, username) -> ''

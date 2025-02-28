@@ -11,9 +11,13 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+var _ json.Marshaler = (*Event)(nil)
+var _ json.Unmarshaler = (*Event)(nil)
+var _ msgpack.Marshaler = (*Event)(nil)
+
 type PartialEvent struct {
 	RoomID   id.RoomID       `msgpack:"rid" json:"room_id"`
-	Sender   id.UserID       `msgpack:"sdr" json:"sender"`
+	Sender   id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
 	StateKey *string         `msgpack:"sky" json:"state_key,omitempty"`
 	Content  json.RawMessage `msgpack:"cnt" json:"content"`
 	Redacts  id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
@@ -56,22 +60,22 @@ type Event struct {
 	Unsigned map[string]any `msgpack:"uns" json:"unsigned,omitempty"`
 }
 
-func NewEventFromBytes(b []byte, eventID id.EventID) (*Event, error) {
+func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
 	var ev Event
 	if err := msgpack.Unmarshal(b, &ev); err != nil {
 		return nil, err
 	}
-	ev.ID = eventID
+	ev.ID = id
 	ev.Type = event.NewEventType(ev.TypeStr)
 	return &ev, nil
 }
 
-func MustNewEventFromBytes(b []byte, eventID id.EventID) *Event {
-	ev, err := NewEventFromBytes(b, eventID)
-	if err != nil {
+func MustNewEventFromBytes(b []byte, id id.EventID) *Event {
+	if ev, err := NewEventFromBytes(b, id); err != nil {
 		panic(err)
+	} else {
+		return ev
 	}
-	return ev
 }
 
 func NewPartialEvent(
@@ -170,6 +174,9 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 }
 
 // Wrapper around event for the CS API where event_id is part of the JSON
+var _ json.Marshaler = (*ClientEvent)(nil)
+var _ json.Unmarshaler = (*ClientEvent)(nil)
+
 type ClientEvent struct {
 	*Event `json:",inline"`
 }

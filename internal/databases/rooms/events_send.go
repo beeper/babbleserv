@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -38,7 +39,7 @@ type RejectedEvent struct {
 	Error error
 }
 
-func newResults(
+func newSendEventsResults(
 	change notifier.Change,
 	versionstampFut fdb.FutureKey,
 	allowedEvs []*types.Event,
@@ -76,10 +77,8 @@ func partialEvents(evs []*types.Event) []*types.PartialEvent {
 	return partialEvs
 }
 
-func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerolog.Logger) {
-	if res.change.EventIDs != nil {
-		r.notifier.SendChange(res.change)
-	}
+func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerolog.Logger) (*SendEventsResult, error) {
+	r.notifiers.Rooms.SendChange(res.change)
 
 	for _, r := range res.Rejected {
 		log.Warn().Err(r.Error).Str("event_id", r.Event.ID.String()).Msg("Event rejected")
@@ -92,11 +91,14 @@ func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerol
 		rlog = rlog.Str("versionstamp", res.versionstampFut.MustGet().String())
 	}
 	rlog.Msg("Sent events")
+
+	return res, nil
 }
 
 type SendLocalEventsOptions struct {
 	PreloadProviders     []*events.TxnEventsProvider
 	StartTransactionHook func(fdb.ReadTransaction) error
+	TxnRefresh           func(fdb.Transaction)
 }
 
 // Send local events to a room, populating prev/auth events as well as authorizing
@@ -107,6 +109,10 @@ func (r *RoomsDatabase) SendLocalEvents(
 	partialEvs []*types.PartialEvent,
 	options SendLocalEventsOptions,
 ) (*SendEventsResult, error) {
+	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
+	lock.Lock()
+	defer lock.Unlock()
+
 	log := r.getTxnLogContext(ctx, "SendLocalEvents").
 		Str("room_id", roomID.String()).
 		Int("events", len(partialEvs)).
@@ -121,12 +127,16 @@ func (r *RoomsDatabase) SendLocalEvents(
 			}
 		}
 
+		if options.TxnRefresh != nil {
+			options.TxnRefresh(txn)
+		}
+
 		allowedEvs, rejectedEvs, err := r.txnPrepareLocalEvents(ctx, txn, roomID, partialEvs, options)
 		if err != nil {
 			return nil, err
 		}
 
-		return newResults(
+		return newSendEventsResults(
 			r.txnStoreEvents(ctx, txn, roomID, allowedEvs),
 			txn.GetVersionstamp(),
 			allowedEvs,
@@ -135,8 +145,7 @@ func (r *RoomsDatabase) SendLocalEvents(
 	}); err != nil {
 		return nil, err
 	} else {
-		r.handleSendEventsResults(res, log)
-		return res, nil
+		return r.handleSendEventsResults(res, log)
 	}
 }
 
@@ -211,7 +220,7 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 	var roomVersion string
 	var depth int64
 	if roomBytes != nil {
-		room := types.MustNewRoomFromBytes(roomBytes)
+		room := types.MustNewRoomFromBytes(roomBytes, roomID)
 		roomVersion = room.Version
 		depth = room.CurrentDepth
 	} else {
@@ -315,6 +324,10 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	evs []*types.Event,
 	options SendFederatedEventsOptions,
 ) (*SendEventsResult, error) {
+	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
+	lock.Lock()
+	defer lock.Unlock()
+
 	log := r.getTxnLogContext(ctx, "SendFederatedEvents").
 		Str("room_id", roomID.String()).
 		Int("events", len(evs)).
@@ -338,7 +351,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		// perform outside of the main write transaction.
 		roomBytes := txn.Get(r.KeyForRoom(roomID)).MustGet()
 		if roomBytes != nil {
-			room := types.MustNewRoomFromBytes(roomBytes)
+			room := types.MustNewRoomFromBytes(roomBytes, roomID)
 			if !room.Federated {
 				return nil, errors.New("this room is not federated")
 			}
@@ -665,7 +678,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			evLog.Debug().Msg("Event authorized for storage")
 		}
 
-		return newResults(
+		return newSendEventsResults(
 			r.txnStoreEvents(ctx, txn, roomID, allowedEvs),
 			txn.GetVersionstamp(),
 			allowedEvs,
@@ -674,8 +687,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	}); err != nil {
 		return nil, err
 	} else {
-		r.handleSendEventsResults(res, log)
-		return res, nil
+		return r.handleSendEventsResults(res, log)
 	}
 }
 
@@ -693,7 +705,7 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 		// Store user/room -> MembershipTup
 		txn.Set(
 			r.users.KeyForUserOutlierMembership(id.UserID(*ev.StateKey), ev.RoomID),
-			types.ValueForMembershipTup(ev.MembershipTup()),
+			types.MembershipTupToValue(ev.MembershipTup()),
 		)
 
 		return nil, nil
@@ -746,7 +758,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 	if roomBytes == nil {
 		room = &types.Room{}
 	} else {
-		room = types.MustNewRoomFromBytes(roomBytes)
+		room = types.MustNewRoomFromBytes(roomBytes, roomID)
 	}
 
 	changedUsers := make(map[id.UserID]struct{}, 0)
@@ -770,7 +782,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 		// Store version -> (event_id, room_id)
 		txn.SetVersionstampedKey(
 			r.events.KeyForVersion(version),
-			types.ValueForEventIDTup(ev.EventIDTup()),
+			types.EventIDTupToValue(ev.EventIDTup()),
 		)
 
 		if ev.Outlier {
@@ -788,7 +800,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 			firstPrevVersion := r.events.TxnMustLookupVersionForEventID(txn, ev.PrevEventIDs[0])
 			txn.SetVersionstampedValue(
 				r.events.KeyForIDToVersion(ev.ID),
-				types.ValueForVersionstamp(firstPrevVersion),
+				types.VersionstampToValue(firstPrevVersion),
 			)
 			// Now we've stored the event, global version index and it's own version
 			// we're done here, since soft failed events don't appear to clients.
@@ -796,16 +808,13 @@ func (r *RoomsDatabase) txnStoreEvents(
 		}
 
 		// Store event_id -> version
-		txn.SetVersionstampedValue(r.events.KeyForIDToVersion(ev.ID), types.ValueForVersionstamp(version))
+		txn.SetVersionstampedValue(r.events.KeyForIDToVersion(ev.ID), types.VersionstampToValue(version))
 
 		// Room indices
 		// room/version -> event_id, used to sync room events to clients
 		txn.SetVersionstampedKey(r.events.KeyForRoomVersion(ev.RoomID, version), eventIDBytes)
-
-		if ev.Sender.Homeserver() == r.config.ServerName {
-			// room/version -> event_id for local events
-			txn.SetVersionstampedKey(r.events.KeyForRoomLocalVersion(ev.RoomID, version), eventIDBytes)
-		}
+		// add to the room super stream
+		r.txnAddEventToSuperStream(txn, ev, version)
 
 		// State events indices
 		if ev.StateKey != nil {
@@ -816,7 +825,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 			// room/version -> StateTupWithID
 			txn.SetVersionstampedKey(
 				r.events.KeyForRoomStateVersion(ev.RoomID, version),
-				types.ValueForStateTupWithID(ev.StateTupWithID()),
+				types.StateTupWithIDToValue(ev.StateTupWithID()),
 			)
 
 			// room/type/state_key/version -> event_id
@@ -834,7 +843,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 				memberID := id.UserID(*ev.StateKey)
 				changedUsers[memberID] = struct{}{}
 
-				membershipTupValue := types.ValueForMembershipTup(ev.MembershipTup())
+				membershipTupValue := types.MembershipTupToValue(ev.MembershipTup())
 
 				// Current room/member -> MembershipTup
 				txn.Set(r.events.KeyForCurrentRoomMember(ev.RoomID, memberID), membershipTupValue)
@@ -887,7 +896,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 							r.servers.KeyForServerMembershipChange(serverName, version),
 							// Note any non-join membership is handled here so we
 							// create a new leave MembershipTup.
-							types.ValueForMembershipTup(types.MembershipTup{
+							types.MembershipTupToValue(types.MembershipTup{
 								EventID:    ev.ID,
 								RoomID:     ev.RoomID,
 								Membership: event.MembershipLeave,

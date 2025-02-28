@@ -15,11 +15,12 @@ import (
 )
 
 type FederationRoutes struct {
-	log      zerolog.Logger
-	db       *databases.Databases
-	config   config.BabbleConfig
-	fclient  fclient.FederationClient
-	keyStore *util.KeyStore
+	log        zerolog.Logger
+	db         *databases.Databases
+	config     config.BabbleConfig
+	fclient    fclient.FederationClient
+	keyStore   *util.KeyStore
+	datastores *util.Datastores
 }
 
 func NewFederationRoutes(
@@ -28,17 +29,19 @@ func NewFederationRoutes(
 	db *databases.Databases,
 	fclient fclient.FederationClient,
 	keyStore *util.KeyStore,
+	datastores *util.Datastores,
 ) *FederationRoutes {
 	log := log.With().
 		Str("routes", "federation").
 		Logger()
 
 	return &FederationRoutes{
-		log:      log,
-		db:       db,
-		config:   cfg,
-		fclient:  fclient,
-		keyStore: keyStore,
+		log:        log,
+		db:         db,
+		config:     cfg,
+		fclient:    fclient,
+		keyStore:   keyStore,
+		datastores: datastores,
 	}
 }
 
@@ -53,21 +56,36 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 
 	requireServerAuth := middleware.NewServerAuthMiddleware(f.config.ServerName, f.keyStore)
 
-	rtr.MethodFunc(http.MethodPut, "/v1/send/{tnxID}", requireServerAuth(f.SendTransaction))
+	if f.config.Rooms.Enabled {
+		rtr.MethodFunc(http.MethodPut, "/v1/send/{tnxID}", requireServerAuth(f.SendTransaction))
 
-	rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
-	rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
+		rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
+		rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
 
-	rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
-	rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))
+		rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
+		rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))
 
-	rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
+		rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
 
-	rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
+		rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
 
-	rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
-	rtr.MethodFunc(http.MethodGet, "/v1/make_join/{roomID}/{userID}", requireServerAuth(f.MakeJoin))
-	rtr.MethodFunc(http.MethodPut, "/v2/send_join/{roomID}/{userID}", requireServerAuth(f.SendJoin))
+		rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
+		rtr.MethodFunc(http.MethodGet, "/v1/make_join/{roomID}/{userID}", requireServerAuth(f.MakeJoin))
+		rtr.MethodFunc(http.MethodPut, "/v2/send_join/{roomID}/{eventID}", requireServerAuth(f.SendJoin))
+	}
+
+	if f.config.Accounts.Enabled {
+
+	}
+
+	if f.config.Transient.Enabled {
+
+	}
+
+	if f.config.Media.Enabled {
+		rtr.MethodFunc(http.MethodGet, "/v1/media/download/{mediaID}", requireServerAuth(f.DownloadMedia))
+		rtr.MethodFunc(http.MethodGet, "/v1/media/thumbnail/{mediaID}", requireServerAuth(f.DownloadThumbnail))
+	}
 }
 
 func (f *FederationRoutes) GetVersion(w http.ResponseWriter, r *http.Request) {

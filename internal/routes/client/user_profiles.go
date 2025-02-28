@@ -57,10 +57,10 @@ func (c *ClientRoutes) PutProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	userIDParam := chi.URLParam(r, "userID")
 	if userIDParam != userID.String() {
-		util.ResponseErrorJSON(w, r, mautrix.MInvalidParam)
+		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
 		return
 	}
 

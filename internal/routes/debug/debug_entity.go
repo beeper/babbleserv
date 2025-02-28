@@ -13,6 +13,18 @@ import (
 func (b *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 	userID := id.UserID(chi.URLParam(r, "userID"))
 
+	user, err := b.db.Accounts.GetLocalUserForUsername(r.Context(), userID.Localpart())
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+
+	tokens, err := b.db.Accounts.GetUserDeviceTokenPrefixes(r.Context(), userID)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+
 	profile, err := b.db.Rooms.GetUserProfile(r.Context(), userID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
@@ -32,10 +44,14 @@ func (b *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, struct {
-		Profile            *types.UserProfile `json:"profile"`
-		Memberships        types.Memberships  `json:"memberships"`
-		OutlierMemberships types.Memberships  `json:"outlier_memberships"`
-	}{profile, memberships, outlierMemberships})
+		User          *types.User              `json:"accounts_user"`
+		AuthTokens    map[id.DeviceID][]string `json:"accounts_device_auth_tokens"`
+		RefreshTokens map[id.DeviceID][]string `json:"accounts_device_refresh_tokens"`
+
+		Profile            *types.UserProfile `json:"rooms_profile"`
+		Memberships        types.Memberships  `json:"rooms_memberships"`
+		OutlierMemberships types.Memberships  `json:"rooms_outlier_memberships"`
+	}{user, tokens.AuthTokens, tokens.RefreshTokens, profile, memberships, outlierMemberships})
 }
 
 func (b *DebugRoutes) DebugGetServer(w http.ResponseWriter, r *http.Request) {

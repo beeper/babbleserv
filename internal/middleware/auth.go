@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -21,41 +22,59 @@ const requestServerKey contextKey = "server"
 // User auth (CS API)
 //
 
-func NewUserAuthMiddleware(serverName string) func(http.Handler) http.Handler {
+func NewUserAuthMiddleware(
+	serverName string,
+	getUserDeviceForAuthToken func(context.Context, string) (types.UserDevice, error),
+) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			authHeader := r.Header.Get("Authorization")
 			ctx := r.Context()
-			if authHeader != "" && len(authHeader) > 7 {
-				user := types.User{Username: authHeader[7:], ServerName: serverName}
-				ctx = context.WithValue(ctx, requestUserKey, &user)
+			authHeader := r.Header.Get("Authorization")
+
+			if len(authHeader) > 7 {
+				token := authHeader[7:]
+				userDevice, err := getUserDeviceForAuthToken(ctx, token)
+				if err == nil {
+					ctx = context.WithValue(ctx, requestUserKey, &userDevice)
+				}
 			}
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-func GetRequestUser(r *http.Request) *types.User {
+func getRequestUserDevice(r *http.Request) *types.UserDevice {
 	u := r.Context().Value(requestUserKey)
 	if u == nil {
 		return nil
 	}
-	return u.(*types.User)
+	return u.(*types.UserDevice)
 }
 
 func RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u := GetRequestUser(r)
+		u := getRequestUserDevice(r)
 		if u == nil {
 			util.ResponseErrorJSON(w, r, mautrix.MMissingToken)
 			return
 		}
 		log := hlog.FromRequest(r)
 		log.UpdateContext(func(c zerolog.Context) zerolog.Context {
-			return c.Str("user", u.Username)
+			return c.Str("user_id", u.UserID.String())
 		})
 		next(w, r)
 	}
+}
+
+// Panics if there's no request user
+func GetRequestUserID(r *http.Request) id.UserID {
+	return getRequestUserDevice(r).UserID
+}
+
+// Panics if there's no request user
+func GetRequestDeviceID(r *http.Request) id.DeviceID {
+	return getRequestUserDevice(r).DeviceID
 }
 
 // Server auth (SS API)

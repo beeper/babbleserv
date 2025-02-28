@@ -21,9 +21,9 @@ func TestVersionstamp(t *testing.T) {
 	incompleteVersion := tuple.IncompleteVersionstamp(1)
 
 	// Check we can do version -> bytes -> same version
-	b := types.ValueForVersionstamp(incompleteVersion)
+	b := types.VersionstampToValue(incompleteVersion)
 	versionFromBytes, err := types.ValueToVersionstamp(b)
-	require.NoError(t, err)
+	require.NoError(t, err, string(b))
 	assert.Equal(t, incompleteVersion, versionFromBytes)
 
 	// Now check we can put it through base64 and still get the same result
@@ -58,8 +58,8 @@ func TestVersionMap(t *testing.T) {
 
 	// Check that our custom encoding using bytes (vs. reflection on vstamp struct fields)
 	rawMap := map[string][]byte{
-		string(types.RoomsVersionKey):    types.ValueForVersionstamp(incompleteVersionstamp),
-		string(types.AccountsVersionKey): types.ValueForVersionstamp(otherVersionstamp),
+		string(types.RoomsVersionKey):    types.VersionstampToValue(incompleteVersionstamp),
+		string(types.AccountsVersionKey): types.VersionstampToValue(otherVersionstamp),
 	}
 	rawB, err := msgpack.Marshal(rawMap)
 	require.NoError(t, err)

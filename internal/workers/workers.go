@@ -18,8 +18,8 @@ type Workers struct {
 	log    zerolog.Logger
 	config config.BabbleConfig
 
-	db       *databases.Databases
-	notifier *notifier.Notifier
+	db        *databases.Databases
+	notifiers *notifier.Notifiers
 
 	workers []Worker
 }
@@ -28,24 +28,28 @@ func NewWorkers(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
 	db *databases.Databases,
-	notif *notifier.Notifier,
+	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
 ) *Workers {
 	log := logger.With().
 		Str("component", "workers").
 		Logger()
 
-	workers := []Worker{
-		NewEventsIterator(log, cfg, db, notif),
-		NewFederationSender(log, cfg, db, notif, fclient),
+	workers := []Worker{}
+
+	if cfg.Rooms.Enabled {
+		workers = append(workers,
+			NewEventsIterator(log, cfg, db, notifiers),
+			NewFederationSender(log, cfg, db, notifiers, fclient),
+		)
 	}
 
 	return &Workers{
-		log:      log,
-		config:   cfg,
-		db:       db,
-		notifier: notif,
-		workers:  workers,
+		log:       log,
+		config:    cfg,
+		db:        db,
+		notifiers: notifiers,
+		workers:   workers,
 	}
 }
 

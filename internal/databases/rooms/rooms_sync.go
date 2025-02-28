@@ -7,6 +7,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -22,11 +23,11 @@ type SyncOptions struct {
 	Limit int
 }
 
-func (r *RoomsDatabase) SyncRoomEventsForUser(
+func (r *RoomsDatabase) SyncRoomsForUser(
 	ctx context.Context,
 	userID id.UserID,
 	options SyncOptions,
-) (tuple.Versionstamp, map[types.MembershipTup][]*types.Event, error) {
+) (tuple.Versionstamp, map[types.MembershipTup]*types.SyncRoom, error) {
 	return r.syncRoomEvents(
 		ctx,
 		options,
@@ -36,17 +37,17 @@ func (r *RoomsDatabase) SyncRoomEventsForUser(
 		func(txn fdb.ReadTransaction, fromVersion, toVersion tuple.Versionstamp) (types.MembershipChanges, error) {
 			return r.users.TxnLookupUserMembershipChanges(txn, userID, fromVersion, toVersion)
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, fromVersion, toVersion tuple.Versionstamp, eventsProvider *events.TxnEventsProvider) ([]types.EventIDTupWithVersion, error) {
-			return r.events.TxnPaginateRoomEventIDTups(txn, roomID, fromVersion, toVersion, options.Limit, eventsProvider)
+		func(txn fdb.ReadTransaction, roomID id.RoomID, fromVersion, toVersion tuple.Versionstamp, eventsProvider *events.TxnEventsProvider) ([]SuperStreamItem, error) {
+			return r.txnPaginateRoomSuperStream(txn, roomID, fromVersion, toVersion, options.Limit, eventsProvider)
 		},
 	)
 }
 
-func (r *RoomsDatabase) SyncRoomEventsForServer(
+func (r *RoomsDatabase) SyncRoomsForServer(
 	ctx context.Context,
 	serverName string,
 	options SyncOptions,
-) (tuple.Versionstamp, map[types.MembershipTup][]*types.Event, error) {
+) (tuple.Versionstamp, map[types.MembershipTup]*types.SyncRoom, error) {
 	return r.syncRoomEvents(
 		ctx,
 		options,
@@ -56,28 +57,28 @@ func (r *RoomsDatabase) SyncRoomEventsForServer(
 		func(txn fdb.ReadTransaction, fromVersion, toVersion tuple.Versionstamp) (types.MembershipChanges, error) {
 			return r.servers.TxnLookupServerMembershipChanges(txn, serverName, fromVersion, types.ZeroVersionstamp)
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, fromVersion, toVersion tuple.Versionstamp, eventsProvider *events.TxnEventsProvider) ([]types.EventIDTupWithVersion, error) {
-			return r.events.TxnPaginateLocalRoomEventIDTups(txn, roomID, fromVersion, toVersion, options.Limit, eventsProvider)
+		func(txn fdb.ReadTransaction, roomID id.RoomID, fromVersion, toVersion tuple.Versionstamp, eventsProvider *events.TxnEventsProvider) ([]SuperStreamItem, error) {
+			return r.txnPaginateRoomLocalSuperStream(txn, roomID, fromVersion, toVersion, options.Limit, eventsProvider)
 		},
 	)
 }
 
+// Implements rooms sync for events and read receipts
 func (r *RoomsDatabase) syncRoomEvents(
 	ctx context.Context,
 	options SyncOptions,
 	getCurrentMembershipsFunc func(fdb.ReadTransaction) (types.Memberships, error),
 	getMembershipChanges func(fdb.ReadTransaction, tuple.Versionstamp, tuple.Versionstamp) (types.MembershipChanges, error),
-	paginateRoomEventIDs func(fdb.ReadTransaction, id.RoomID, tuple.Versionstamp, tuple.Versionstamp, *events.TxnEventsProvider) ([]types.EventIDTupWithVersion, error),
-) (tuple.Versionstamp, map[types.MembershipTup][]*types.Event, error) {
-	// Bump the from version, FDB ranges are inclusive but we want events *after* the from version
+	paginateRoomSuperStream func(fdb.ReadTransaction, id.RoomID, tuple.Versionstamp, tuple.Versionstamp, *events.TxnEventsProvider) ([]SuperStreamItem, error),
+) (tuple.Versionstamp, map[types.MembershipTup]*types.SyncRoom, error) {
+	// Bump the from version, FDB range starts are inclusive but we want events *after* the version
 	options.From.UserVersion += 1
 
 	// Get current memberships and latest event version in transaction, this means the memberships
-	// are validate at that version and we can thus fetch events up to that version for each room.
+	// are valid at that version and we can thus fetch events up to that version for each room.
 	var latestVersion tuple.Versionstamp
 	memberships, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Memberships, error) {
-		latestVersion = r.events.TxnGetLatestEventVersion(txn)
-		latestVersion.UserVersion += 1 // FDB range ends are exclusive
+		latestVersion = util.TxnGetLatestWriteVersion(ctx, txn)
 		return getCurrentMembershipsFunc(txn)
 	})
 	if err != nil {
@@ -116,15 +117,15 @@ func (r *RoomsDatabase) syncRoomEvents(
 	}
 
 	// Now we're going to fetch up to the limit event ID/version tups in each room
-	type membershipAndEvents struct {
-		membership  types.MembershipTup
-		eventIDTups []types.EventIDTupWithVersion
+	type membershipAndItems struct {
+		membership types.MembershipTup
+		items      []SuperStreamItem
 	}
 
 	var wg sync.WaitGroup
 	doneCh := make(chan struct{})
-	resultsCh := make(chan membershipAndEvents)
-	allResults := make([]membershipAndEvents, 0, len(membershipsWithRanges))
+	resultsCh := make(chan membershipAndItems)
+	allResults := make([]membershipAndItems, 0, len(membershipsWithRanges))
 
 	go func() {
 		for results := range resultsCh {
@@ -137,17 +138,21 @@ func (r *RoomsDatabase) syncRoomEvents(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if evIDTups, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]types.EventIDTupWithVersion, error) {
-				evIDTups, err := paginateRoomEventIDs(txn, membershipTup.RoomID, vRange.from, vRange.to, nil)
-				if err != nil {
-					return nil, err
-				}
-				return evIDTups, nil
-			}); err != nil {
+
+			zerolog.Ctx(ctx).Debug().
+				Str("room_id", membershipTup.RoomID.String()).
+				Str("version_from", vRange.from.String()).
+				Str("version_to", vRange.to.String()).
+				Msg("Paginating room super stream")
+
+			items, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]SuperStreamItem, error) {
+				return paginateRoomSuperStream(txn, membershipTup.RoomID, vRange.from, vRange.to, nil)
+			})
+			if err != nil {
 				panic(err)
-			} else {
-				resultsCh <- membershipAndEvents{membershipTup, evIDTups}
 			}
+
+			resultsCh <- membershipAndItems{membershipTup, items}
 		}()
 	}
 
@@ -158,50 +163,58 @@ func (r *RoomsDatabase) syncRoomEvents(
 	// Now we have all our event IDs / versions, we need to combine into a single slice and select
 	// the first up to our limit, discarding the rest. We'll also need a room -> membership map.
 	roomIDToMembership := make(map[id.RoomID]types.MembershipTup, len(membershipsWithRanges))
-	allEvTups := make([]types.EventIDTupWithVersion, 0, len(membershipsWithRanges)*options.Limit)
+	allItems := make([]SuperStreamItem, 0, len(membershipsWithRanges)*options.Limit)
 	for _, memAndEvs := range allResults {
 		roomIDToMembership[memAndEvs.membership.RoomID] = memAndEvs.membership
-		allEvTups = append(allEvTups, memAndEvs.eventIDTups...)
+		allItems = append(allItems, memAndEvs.items...)
 	}
 
 	// Sort and grab the first events up to our limit (or the entire slice)
-	types.SortEventIDTupWithVersions(allEvTups)
-	selectCount := options.Limit
-	if len(allEvTups) < selectCount {
-		selectCount = len(allEvTups)
-	}
-	chosenEvIDTups := allEvTups[:selectCount]
+	types.SortVersioners(allItems)
+	items := allItems[:util.MinInt(options.Limit, len(allItems))]
 
-	if len(chosenEvIDTups) > 0 {
-		// If we have more than one event in this batch, we must now override the token we return
-		// as the next batch position with the greatest in this batch.
-		latestVersion = chosenEvIDTups[len(chosenEvIDTups)-1].Version
+	if len(items) == options.Limit {
+		// If our batch is full override the next batch to the greatest of this one as we're not
+		// up to date with latestVersion.
+		latestVersion = items[len(items)-1].Version
 	}
 
 	// We finally have the events we need, now let's fetch them!
-	eventsByRoom := make(map[types.MembershipTup][]*types.Event, len(membershipsWithRanges))
+	rooms := make(map[types.MembershipTup]*types.SyncRoom, len(membershipsWithRanges))
 	now := time.Now()
+
+	getSyncRoom := func(roomID id.RoomID) *types.SyncRoom {
+		membershipTup := roomIDToMembership[roomID]
+		if _, found := rooms[membershipTup]; !found {
+			rooms[membershipTup] = &types.SyncRoom{}
+		}
+		return rooms[membershipTup]
+	}
 
 	if _, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
 
-		for _, evIDTup := range chosenEvIDTups {
-			ev := eventsProvider.MustGet(evIDTup.EventID)
-			ev.Unsigned = map[string]any{
-				"age":      now.UnixMilli() - ev.Timestamp,
-				"hs.order": util.Base64EncodeURLSafe(types.ValueForVersionstamp(evIDTup.Version)),
+		for _, item := range items {
+			switch item.Type {
+			case SuperStreamReceipt:
+				room := getSyncRoom(item.Receipt.RoomID)
+				room.Receipts = append(room.Receipts, item.Receipt)
+			case SuperStreamEvent:
+				evIDTup := item.EventIDTup
+				ev := eventsProvider.MustGet(evIDTup.EventID)
+				ev.Unsigned = map[string]any{
+					"age":      now.UnixMilli() - ev.Timestamp,
+					"hs.order": util.Base64EncodeURLSafe(types.VersionstampToValue(item.Version)),
+				}
+				room := getSyncRoom(evIDTup.RoomID)
+				room.TimelineEvents = append(room.TimelineEvents, ev)
 			}
-
-			membershipTup := roomIDToMembership[evIDTup.RoomID]
-			if _, found := eventsByRoom[membershipTup]; !found {
-				eventsByRoom[membershipTup] = make([]*types.Event, 0, options.Limit)
-			}
-			eventsByRoom[membershipTup] = append(eventsByRoom[membershipTup], ev)
 		}
+
 		return nil, nil
 	}); err != nil {
 		return types.ZeroVersionstamp, nil, err
 	}
 
-	return latestVersion, eventsByRoom, nil
+	return latestVersion, rooms, nil
 }

@@ -26,7 +26,7 @@ func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	ev := types.NewPartialEvent(roomID, evType, &stateKey, userID, content)
 	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 		return map[string]id.EventID{
@@ -48,7 +48,7 @@ func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	ev := types.NewPartialEvent(roomID, evType, nil, userID, content)
 	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 		return map[string]id.EventID{

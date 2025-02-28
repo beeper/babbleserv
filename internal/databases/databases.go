@@ -13,28 +13,47 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/config"
+	"github.com/beeper/babbleserv/internal/databases/accounts"
+	"github.com/beeper/babbleserv/internal/databases/media"
 	"github.com/beeper/babbleserv/internal/databases/rooms"
+	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/notifier"
 )
 
 type Databases struct {
-	log   zerolog.Logger
-	Rooms *rooms.RoomsDatabase
+	log zerolog.Logger
+
+	Rooms     *rooms.RoomsDatabase
+	Accounts  *accounts.AccountsDatabase
+	Transient *transient.TransientDatabase
+	Media     *media.MediaDatabase
 }
 
 func NewDatabases(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
-	notifier *notifier.Notifier,
+	notifiers *notifier.Notifiers,
 ) *Databases {
 	log := logger.With().
 		Str("component", "databases").
 		Logger()
 
-	return &Databases{
-		log:   log,
-		Rooms: rooms.NewRoomsDatabase(cfg, log, notifier),
+	dbs := Databases{log: log}
+
+	if cfg.Rooms.Enabled {
+		dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers)
 	}
+	if cfg.Accounts.Enabled {
+		dbs.Accounts = accounts.NewAccountsDatabase(cfg, log)
+	}
+	if cfg.Transient.Enabled {
+		dbs.Transient = transient.NewTransientDatabase(cfg, log)
+	}
+	if cfg.Media.Enabled {
+		dbs.Media = media.NewMediaDatabase(cfg, log)
+	}
+
+	return &dbs
 }
 
 func (d *Databases) Start() {
@@ -43,5 +62,17 @@ func (d *Databases) Start() {
 
 func (d *Databases) Stop() {
 	d.log.Info().Msg("Stopping databases...")
-	d.Rooms.Stop()
+
+	if d.Rooms != nil {
+		d.Rooms.Stop()
+	}
+	if d.Accounts != nil {
+		d.Accounts.Stop()
+	}
+	if d.Transient != nil {
+		d.Transient.Stop()
+	}
+	if d.Media != nil {
+		d.Media.Stop()
+	}
 }

@@ -6,12 +6,13 @@ import (
 )
 
 type Room struct {
-	ID id.RoomID `json:"room_id" msgpack:"rid"`
+	// Populated at fetch time from the FDB key
+	ID id.RoomID `json:"room_id" msgpack:"-"`
 
+	// Matrix room version
 	Version string `json:"version" msgpack:"ver"`
 
-	CurrentDepth       int64 `msgpack:"dpt"`
-	CurrentStreamDepth int64 `msgpack:"sdp"`
+	CurrentDepth int64 `msgpack:"dpt"`
 
 	Name      string `json:"name" msgpack:"nme"`
 	Type      string `json:"type"`
@@ -26,20 +27,21 @@ type Room struct {
 	Federated bool `json:"is_federated" msgpack:"fed"`
 }
 
-func NewRoomFromBytes(b []byte) (*Room, error) {
+func NewRoomFromBytes(b []byte, id id.RoomID) (*Room, error) {
 	var rm Room
 	if err := msgpack.Unmarshal(b, &rm); err != nil {
 		return nil, err
 	}
+	rm.ID = id
 	return &rm, nil
 }
 
-func MustNewRoomFromBytes(b []byte) *Room {
-	r, err := NewRoomFromBytes(b)
-	if err != nil {
+func MustNewRoomFromBytes(b []byte, id id.RoomID) *Room {
+	if r, err := NewRoomFromBytes(b, id); err != nil {
 		panic(err)
+	} else {
+		return r
 	}
-	return r
 }
 
 func (r *Room) ToMsgpack() []byte {

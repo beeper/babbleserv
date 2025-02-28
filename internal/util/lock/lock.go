@@ -11,6 +11,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/elastic/go-freelru"
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -23,8 +24,8 @@ type lockingDatabase interface {
 }
 
 type LockOptions struct {
-	RefreshInterval time.Duration
-	Timeout         time.Duration
+	RetryInterval time.Duration
+	Timeout       time.Duration
 }
 
 type Lock struct {
@@ -38,16 +39,29 @@ func WithLockIfAvailable(
 	database lockingDatabase,
 	name string,
 	options LockOptions,
+	cache *freelru.LRU[string, string],
 	handler func(Lock),
-) error {
+) (bool, error) {
+	if cache != nil {
+		if _, found := cache.Get(name); found {
+			return false, nil
+		}
+	}
+
 	token, err := acquireLockOnce(ctx, database, name, options)
 	if err == errIsLocked {
-		return nil
+		return false, nil
 	} else if err != nil {
-		return err
+		return false, err
 	}
 	handler(makeLock(ctx, database, name, options, token))
-	return nil
+
+	if cache != nil {
+		// Cache the lock for 75% of the timeout
+		cache.AddWithLifetime(name, "", options.Timeout*(3/4))
+	}
+
+	return true, nil
 }
 
 func WithLock(
@@ -67,6 +81,23 @@ func WithLock(
 	handler(makeLock(ctx, database, name, options, token))
 }
 
+func GetLock(
+	ctx context.Context,
+	database lockingDatabase,
+	name string,
+	options LockOptions,
+) *Lock {
+	token := acquireLock(ctx, database, name, options)
+	if token == nil {
+		if ctx.Err() == context.Canceled {
+			return nil
+		}
+		panic("acquired lock with no token")
+	}
+	lock := makeLock(ctx, database, name, options, token)
+	return &lock
+}
+
 func acquireLock(ctx context.Context, database lockingDatabase, name string, options LockOptions) []byte {
 	log := zerolog.Ctx(ctx).With().Str("name", name).Logger()
 	log.Debug().Msg("Acquiring lock...")
@@ -76,7 +107,7 @@ func acquireLock(ctx context.Context, database lockingDatabase, name string, opt
 		// write a time -> version every attempt.
 		if token, err := acquireLockOnce(ctx, database, name, options); err == errIsLocked {
 			log.Trace().
-				Dur("retry", options.RefreshInterval/2).
+				Dur("retry", options.RetryInterval/2).
 				Msg("Lock is currently locked, retrying in")
 		} else if err != nil {
 			log.Err(err).Msg("Error trying to acquire lock, retrying in 1s")
@@ -85,7 +116,7 @@ func acquireLock(ctx context.Context, database lockingDatabase, name string, opt
 			return token
 		}
 		select {
-		case <-time.After(options.RefreshInterval / 2):
+		case <-time.After(options.RetryInterval / 2):
 		case <-ctx.Done():
 			return nil
 		}
@@ -167,13 +198,6 @@ func makeLock(
 	}
 }
 
-func makeUpdateLockFunc(database lockingDatabase, name string, options LockOptions) func(fdb.Transaction) {
-	_, prefix := database.GetLockPrimitives()
-	return func(txn fdb.Transaction) {
-		txnUpdateLock(txn, prefix, name, options.Timeout)
-	}
-}
-
 func keyForLock(prefix subspace.Subspace, name string) fdb.Key {
 	return prefix.Sub("lck").Pack(tuple.Tuple{name})
 }
@@ -213,7 +237,7 @@ func txnCreateLock(txn fdb.Transaction, prefix subspace.Subspace, name string, t
 	// Create the lock with the versionstamp as the fencing token
 	txn.SetVersionstampedValue(
 		keyForLock(prefix, name),
-		types.ValueForVersionstamp(tuple.IncompleteVersionstamp(0)),
+		types.VersionstampToValue(tuple.IncompleteVersionstamp(0)),
 	)
 
 	// Set the hostname (purely for informational display)

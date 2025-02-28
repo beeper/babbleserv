@@ -29,8 +29,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
 		if err != nil {
 			return nil, err
 		}
-		_, eventID := e.KeyToRoomExtrem(kv.Key)
-		ids = append(ids, eventID)
+		ids = append(ids, e.RoomExtremKeyToEventID(kv.Key))
 	}
 	return ids, nil
 }
@@ -42,7 +41,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomStateMap(
 	eventsProvider *TxnEventsProvider,
 ) (types.StateMap, error) {
 	iter := txn.GetRange(
-		e.RangeForCurrentRoomState(roomID),
+		e.RangeForRoomCurrentState(roomID),
 		fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		},
@@ -54,13 +53,11 @@ func (e *EventsDirectory) TxnLookupCurrentRoomStateMap(
 		if err != nil {
 			return nil, err
 		}
-		_, evType, _ := e.KeyToRoomCurrentStateTup(kv.Key)
+		stateTup := e.CurrentRoomStateKeyValueToStateTup(kv)
+		ids[stateTup.StateTup] = id.EventID(kv.Value)
 		if eventsProvider != nil {
-			eventsProvider.WillGet(id.EventID(kv.Value))
+			eventsProvider.WillGet(stateTup.EventID)
 		}
-		ids[types.StateTup{
-			Type: evType,
-		}] = id.EventID(kv.Value)
 	}
 	return ids, nil
 }
@@ -107,15 +104,11 @@ func (e *EventsDirectory) TxnLookupCurrentRoomMemberStateMap(
 		if err != nil {
 			return nil, err
 		}
-		_, userID := e.KeyToCurrentRoomMember(kv.Key)
-		membershipTup := types.ValueToMembershipTup(kv.Value)
+		stateTup, membershipTup := e.CurrentRoomMemberKeyValueToTups(kv)
 		if eventsProvider != nil {
 			eventsProvider.WillGet(membershipTup.EventID)
 		}
-		ids[types.StateTup{
-			Type:     event.StateMember,
-			StateKey: userID.String(),
-		}] = membershipTup.EventID
+		ids[stateTup.StateTup] = membershipTup.EventID
 	}
 
 	return ids, nil
@@ -138,8 +131,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomServers(
 		if err != nil {
 			return nil, err
 		}
-		_, serverName := e.KeyToCurrentRoomServer(kv.Key)
-		serverNames = append(serverNames, serverName)
+		serverNames = append(serverNames, e.CurrentRoomServerKeyToServer(kv.Key))
 	}
 
 	return serverNames, nil

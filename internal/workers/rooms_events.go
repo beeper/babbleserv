@@ -17,7 +17,7 @@ import (
 
 const (
 	eventsIteratorLockName    = "EventsIteratorLock"
-	eventsIteratorLockRefresh = time.Second * 5
+	eventsIteratorLockRetry   = time.Second * 5
 	eventsIteratorLockTimeout = time.Second * 10
 	eventsIteratorBatchSize   = 10
 )
@@ -26,10 +26,10 @@ const (
 // events ever stored by Babbleserv and triggers other things. Currently this
 // is just waking up federation senders.
 type EventsIterator struct {
-	log      zerolog.Logger
-	config   config.BabbleConfig
-	db       *databases.Databases
-	notifier *notifier.Notifier
+	log       zerolog.Logger
+	config    config.BabbleConfig
+	db        *databases.Databases
+	notifiers *notifier.Notifiers
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -40,29 +40,29 @@ func NewEventsIterator(
 	logger zerolog.Logger,
 	cfg config.BabbleConfig,
 	db *databases.Databases,
-	notif *notifier.Notifier,
+	notifiers *notifier.Notifiers,
 ) *EventsIterator {
 	log := logger.With().
 		Str("worker", "EventsIterator").
 		Logger()
 
 	return &EventsIterator{
-		log:      log,
-		config:   cfg,
-		db:       db,
-		notifier: notif,
+		log:       log,
+		config:    cfg,
+		db:        db,
+		notifiers: notifiers,
 	}
 }
 
 func (ei *EventsIterator) Start() {
 	ei.ctx, ei.cancel = context.WithCancel(ei.log.WithContext(context.Background()))
 
+	ei.wg.Add(1)
 	go func() {
-		ei.wg.Add(1)
 		defer ei.wg.Done()
 		lock.WithLock(ei.ctx, ei.db.Rooms, eventsIteratorLockName, lock.LockOptions{
-			RefreshInterval: eventsIteratorLockRefresh,
-			Timeout:         eventsIteratorLockTimeout,
+			RetryInterval: eventsIteratorLockRetry,
+			Timeout:       eventsIteratorLockTimeout,
 		}, ei.handleNewEventsLoop)
 	}()
 }
@@ -75,8 +75,8 @@ func (ei *EventsIterator) Stop() {
 
 func (ei *EventsIterator) handleNewEventsLoop(lock lock.Lock) {
 	newEventsCh := make(chan any, 1)
-	ei.notifier.Subscribe(newEventsCh, notifier.Subscription{AllEvents: true})
-	defer ei.notifier.Unsubscribe(newEventsCh)
+	ei.notifiers.Rooms.Subscribe(newEventsCh, notifier.Subscription{AllEvents: true})
+	defer ei.notifiers.Rooms.Unsubscribe(newEventsCh)
 
 	// Cold start case: handle anything waiting right away
 	ei.handleNewEvents(lock)
@@ -88,7 +88,7 @@ func (ei *EventsIterator) handleNewEventsLoop(lock lock.Lock) {
 			return
 		case <-newEventsCh:
 			ei.handleNewEvents(lock)
-		case <-time.After(eventsIteratorLockRefresh):
+		case <-time.After(eventsIteratorLockRetry):
 			lock.Refresh()
 		}
 	}
@@ -179,7 +179,7 @@ func (ei *EventsIterator) notifyFederationSenders(tups []types.EventIDTupWithVer
 		servers = append(servers, server)
 	}
 
-	ei.notifier.SendChange(notifier.Change{
+	ei.notifiers.Rooms.SendChange(notifier.Change{
 		Servers: servers,
 	})
 	return nil

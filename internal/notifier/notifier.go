@@ -15,8 +15,6 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-const changeChannel = "chg"
-
 type Subscription struct {
 	// Subscribe by user IDs or room IDs
 	UserIDs []id.UserID
@@ -24,7 +22,8 @@ type Subscription struct {
 
 	// Subscribe by type
 	AllEvents,
-	AllServers bool
+	AllServers,
+	AllUsers bool
 }
 
 type subscription struct {
@@ -50,8 +49,9 @@ type Change struct {
 type Notifier struct {
 	log zerolog.Logger
 
-	redis      *redis.Client
-	instanceID string
+	redis        *redis.Client
+	redisChannel string
+	instanceID   string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -72,15 +72,16 @@ type Notifier struct {
 	// Map channels for all event/server subscribers
 	eventChs  map[chan any]struct{}
 	serverChs map[chan any]struct{}
+	userChs   map[chan any]struct{}
 }
 
-func NewNotifier(cfg config.BabbleConfig, logger zerolog.Logger) *Notifier {
+func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) *Notifier {
 	log := logger.With().
-		Str("component", "notifier").
+		Str("notifier", name).
 		Logger()
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.Notifier.RedisAddr,
+		Addr: cfg.RedisAddr,
 	})
 
 	// Generate a small and process specific instance ID from XID's machine ID + PID
@@ -88,9 +89,10 @@ func NewNotifier(cfg config.BabbleConfig, logger zerolog.Logger) *Notifier {
 	instanceID := util.Base64Encode(uid.Machine()) + strconv.Itoa(int(uid.Pid()))
 
 	return &Notifier{
-		log:        log,
-		redis:      rdb,
-		instanceID: instanceID,
+		log:          log,
+		redis:        rdb,
+		redisChannel: cfg.RedisChannel,
+		instanceID:   instanceID,
 
 		subscribeCh:    make(chan subscription),
 		unsubscribeCh:  make(chan chan any),
@@ -158,13 +160,13 @@ func (n *Notifier) sendRedisChange(change Change) {
 	if err != nil {
 		panic(fmt.Errorf("failed to msgpack change: %w", err))
 	}
-	if err := n.redis.Publish(n.ctx, changeChannel, data).Err(); err != nil {
+	if err := n.redis.Publish(n.ctx, n.redisChannel, data).Err(); err != nil {
 		n.log.Err(err).Msg("Failed to publish Redis message")
 	}
 }
 
 func (n *Notifier) redisLoop() {
-	pubsub := n.redis.Subscribe(n.ctx, changeChannel)
+	pubsub := n.redis.Subscribe(n.ctx, n.redisChannel)
 	defer pubsub.Close()
 
 	for msg := range pubsub.Channel() {
@@ -188,28 +190,33 @@ func (n *Notifier) internalLoop() {
 			return
 		// Handle subscription/unsubscription
 		case sub := <-n.subscribeCh:
-			n.unsafeSubscribe(sub)
+			n.unlockedSubscribe(sub)
 		case ch := <-n.unsubscribeCh:
-			n.unsafeUnusbscribe(ch)
-		// Handle subscribe to all change notifications
+			n.unlockedUnusbscribe(ch)
+		// Handle subscriptions
 		case eventID := <-n.eventsChangeCh:
-			n.unsafeSendChanges(n.eventChs, eventID)
+			// All event subscribers
+			n.unlockedSendChanges(n.eventChs, eventID)
 		case server := <-n.serverChangeCh:
-			n.unsafeSendChanges(n.serverChs, server)
-		// Handle specific subscription changes
+			// All server subscribers
+			n.unlockedSendChanges(n.serverChs, server)
 		case userID := <-n.userChangeCh:
+			// All user subscribers
+			n.unlockedSendChanges(n.userChs, userID)
+			// Per-user subscribers
 			if chs, found := n.userIDToChan[userID]; found {
-				n.unsafeSendChanges(chs, userID)
+				n.unlockedSendChanges(chs, userID)
 			}
 		case roomID := <-n.roomChangeCh:
+			// Per-room subscribers
 			if chs, found := n.roomIDToChan[roomID]; found {
-				n.unsafeSendChanges(chs, roomID)
+				n.unlockedSendChanges(chs, roomID)
 			}
 		}
 	}
 }
 
-func (n *Notifier) unsafeSendChanges(chs map[chan any]struct{}, item any) {
+func (n *Notifier) unlockedSendChanges(chs map[chan any]struct{}, item any) {
 	for ch := range chs {
 		select {
 		case ch <- item:
@@ -219,7 +226,7 @@ func (n *Notifier) unsafeSendChanges(chs map[chan any]struct{}, item any) {
 	}
 }
 
-func (n *Notifier) unsafeSubscribe(sub subscription) {
+func (n *Notifier) unlockedSubscribe(sub subscription) {
 	// Unsubscribe using channel reference
 	n.chanToSubscription[sub.channel] = sub
 
@@ -229,6 +236,9 @@ func (n *Notifier) unsafeSubscribe(sub subscription) {
 	}
 	if sub.AllServers {
 		n.serverChs[sub.channel] = struct{}{}
+	}
+	if sub.AllUsers {
+		n.userChs[sub.channel] = struct{}{}
 	}
 
 	// Add specific subscription channels
@@ -246,7 +256,7 @@ func (n *Notifier) unsafeSubscribe(sub subscription) {
 	}
 }
 
-func (n *Notifier) unsafeUnusbscribe(ch chan any) {
+func (n *Notifier) unlockedUnusbscribe(ch chan any) {
 	sub, found := n.chanToSubscription[ch]
 	if !found {
 		n.log.Warn().Msg("Unsubscribe using non-existent channel")
@@ -258,6 +268,9 @@ func (n *Notifier) unsafeUnusbscribe(ch chan any) {
 	}
 	if sub.AllServers {
 		delete(n.serverChs, ch)
+	}
+	if sub.AllUsers {
+		delete(n.userChs, ch)
 	}
 
 	for _, userID := range sub.UserIDs {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/matrix-org/gomatrixserverlib"
@@ -122,7 +123,10 @@ func VerifyJSON(b []byte, signingName, keyID string, pubKey ed25519.PublicKey) e
 		return err
 	}
 
-	if !ed25519.Verify(pubKey, b, signatureBytes) {
+	if len(pubKey) != ed25519.PublicKeySize {
+		// Guard against ed25519.Panic: "It will panic if len(publicKey) is not PublicKeySize."
+		return errors.New("invalid public key size")
+	} else if !ed25519.Verify(pubKey, b, signatureBytes) {
 		return fmt.Errorf("Bad signature from %q with ID %q", signingName, keyID)
 	}
 

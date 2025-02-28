@@ -1,6 +1,11 @@
 package types
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"slices"
+
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
@@ -10,10 +15,13 @@ import (
 var (
 	ZeroVersionstamp  = tuple.Versionstamp{}
 	incompleteVersion = [10]uint8{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	ErrInvalidVersion = errors.New("invalid versionstamp tuple")
 )
 
-func ValueForVersionstamp(version tuple.Versionstamp) []byte {
+func VersionstampToValue(version tuple.Versionstamp) []byte {
 	if version.TransactionVersion == incompleteVersion {
+		// Note that this seems to result in bytes that unpack to 4 tuple values (v, nil, nil, nil)
+		// Not managed to figure out why.
 		val, err := tuple.Tuple{version}.PackWithVersionstamp(nil)
 		if err != nil {
 			panic(err)
@@ -27,16 +35,30 @@ func ValueForVersionstamp(version tuple.Versionstamp) []byte {
 func ValueToVersionstamp(value []byte) (tuple.Versionstamp, error) {
 	tup, err := tuple.Unpack(value)
 	if err != nil {
-		return ZeroVersionstamp, err
+		return ZeroVersionstamp, fmt.Errorf("%w: %w", ErrInvalidVersion, err)
+	} else if len(tup) == 0 {
+		// As above only check for 0 here since these might have 3 nil elements appended(?)
+		return ZeroVersionstamp, ErrInvalidVersion
+	} else if v, ok := tup[0].(tuple.Versionstamp); !ok {
+		return ZeroVersionstamp, ErrInvalidVersion
+	} else {
+		return v, nil
 	}
-	return tup[0].(tuple.Versionstamp), nil
+}
+
+func MustValueToVersionstamp(value []byte) tuple.Versionstamp {
+	if v, err := ValueToVersionstamp(value); err != nil {
+		panic(err)
+	} else {
+		return v
+	}
 }
 
 func GetVersionRange(
 	sub subspace.Subspace,
 	fromVersion, toVersion tuple.Versionstamp,
 	args ...tuple.TupleElement,
-) fdb.Range {
+) fdb.ExactRange {
 	var begin, end fdb.KeyConvertible
 	if fromVersion == ZeroVersionstamp {
 		begin = fdb.Key(append(sub.Pack(args), byte(0x00)))
@@ -66,7 +88,7 @@ type VersionMap map[VersionKey]tuple.Versionstamp
 func (vm VersionMap) MarshalMsgpack() ([]byte, error) {
 	rawMap := make(map[string][]byte, len(vm))
 	for k, v := range vm {
-		rawMap[string(k)] = ValueForVersionstamp(v)
+		rawMap[string(k)] = VersionstampToValue(v)
 	}
 	return msgpack.Marshal(rawMap)
 }
@@ -90,4 +112,14 @@ func (vm *VersionMap) UnmarshalMsgpack(b []byte) error {
 	}
 	*vm = vMap
 	return nil
+}
+
+type Versioner interface {
+	GetVersion() tuple.Versionstamp
+}
+
+func SortVersioners[T Versioner](versions []T) {
+	slices.SortFunc(versions, func(a, b T) int {
+		return bytes.Compare(a.GetVersion().Bytes(), b.GetVersion().Bytes())
+	})
 }

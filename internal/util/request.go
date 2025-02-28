@@ -48,6 +48,19 @@ func EventIDFromRequestURLParam(r *http.Request, field string) id.EventID {
 	}
 }
 
+func UserIDFromRequestURLParam(r *http.Request, field string) id.UserID {
+	p := chi.URLParam(r, field)
+
+	if strings.HasSuffix(p, "!") {
+		return id.UserID(p)
+	}
+	if parsed, err := url.PathUnescape(p); err != nil {
+		return id.UserID("")
+	} else {
+		return id.UserID(parsed)
+	}
+}
+
 func IntFromRequestQuery(r *http.Request, field string, def int) (int, error) {
 	str := r.URL.Query().Get(field)
 	if str == "" {
@@ -56,9 +69,26 @@ func IntFromRequestQuery(r *http.Request, field string, def int) (int, error) {
 	return strconv.Atoi(str)
 }
 
-func VersionMapFromRequestQuery(r *http.Request, field types.VersionKey) (types.VersionMap, error) {
-	parts := strings.Split(r.URL.Query().Get(string(field)), ".")
+func VersionMapToString(vMap types.VersionMap) string {
+	tokens := make([]string, 0, len(vMap))
+
+	for key, version := range vMap {
+		b := types.VersionstampToValue(version)
+		token := string(key) + Base64EncodeURLSafe(b)
+		tokens = append(tokens, token)
+	}
+
+	return strings.Join(tokens, ".")
+}
+
+func StringToVersionMap(s string) (types.VersionMap, error) {
 	versions := make(types.VersionMap, 3) // we currently have 3 known versions (above)
+
+	parts := strings.Split(s, ".")
+
+	if parts[0] == "" {
+		return versions, nil
+	}
 
 	for _, part := range parts {
 		key, value := part[0], part[1:]
@@ -67,10 +97,7 @@ func VersionMapFromRequestQuery(r *http.Request, field types.VersionKey) (types.
 		if err != nil {
 			return nil, err
 		}
-		version, err := types.ValueToVersionstamp(bytes)
-		if err != nil {
-			return nil, err
-		}
+		version := types.MustValueToVersionstamp(bytes)
 
 		vKey := types.VersionKey(key)
 		switch vKey {
@@ -81,11 +108,15 @@ func VersionMapFromRequestQuery(r *http.Request, field types.VersionKey) (types.
 		case types.DevicesVersionKey:
 			versions[vKey] = version
 		default:
-			return nil, fmt.Errorf("invalid key in %s parameter: %s", field, string(key))
+			return nil, fmt.Errorf("invalid versions key: %s", string(key))
 		}
 	}
 
-	return nil, nil
+	return versions, nil
+}
+
+func VersionMapFromRequestQuery(r *http.Request, field types.VersionKey) (types.VersionMap, error) {
+	return StringToVersionMap(r.URL.Query().Get(string(field)))
 }
 
 func VersionFromRequestQuery(r *http.Request, field, versionKey types.VersionKey) (tuple.Versionstamp, error) {

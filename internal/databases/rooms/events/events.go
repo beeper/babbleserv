@@ -21,7 +21,6 @@ type EventsDirectory struct {
 	idToVersion,
 	byRoomVersion,
 	byRoomStateVersion,
-	byRoomLocalVersion,
 	byRoomExtrem,
 	byRoomVersionStateTup,
 	byRoomCurrentStateTup,
@@ -39,7 +38,7 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 	}
 
 	log := logger.With().Str("directory", "events").Logger()
-	log.Trace().
+	log.Debug().
 		Bytes("prefix", eventsDir.Bytes()).
 		Msg("Init rooms/events directory")
 
@@ -56,10 +55,10 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 
 		byRoomVersion:      eventsDir.Sub("rmv"), // event by room/version
 		byRoomStateVersion: eventsDir.Sub("rsv"), // state event by room/verstion
-		byRoomLocalVersion: eventsDir.Sub("rlv"), // local event by room/version
 		byRoomExtrem:       eventsDir.Sub("rex"), // current room extremeties
 
 		byRoomVersionStateTup: eventsDir.Sub("rvs"), // state event by room/type/version
+
 		byRoomCurrentStateTup: eventsDir.Sub("rcs"), // current state event by room/type
 		byRoomCurrentMembers:  eventsDir.Sub("rmb"), // current members by room
 		byRoomCurrentServers:  eventsDir.Sub("rsr"), // current servers by room
@@ -121,28 +120,6 @@ func (e *EventsDirectory) RangeForRoomVersion(
 	return types.GetVersionRange(e.byRoomVersion, fromVersion, toVersion, roomID.String())
 }
 
-func (e *EventsDirectory) KeyForRoomLocalVersion(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
-	if key, err := e.byRoomLocalVersion.PackWithVersionstamp(tuple.Tuple{
-		roomID.String(), version,
-	}); err != nil {
-		panic(err)
-	} else {
-		return key
-	}
-}
-
-func (e *EventsDirectory) KeyToRoomLocalVersion(key fdb.Key) tuple.Versionstamp {
-	tup, _ := e.byRoomLocalVersion.Unpack(key)
-	return tup[1].(tuple.Versionstamp)
-}
-
-func (e *EventsDirectory) RangeForRoomLocalVersion(
-	roomID id.RoomID,
-	fromVersion, toVersion tuple.Versionstamp,
-) fdb.Range {
-	return types.GetVersionRange(e.byRoomLocalVersion, fromVersion, toVersion, roomID.String())
-}
-
 // Room state versions (room_id, versionstamp) -> (event_id, type, state_key)
 //
 
@@ -154,11 +131,6 @@ func (e *EventsDirectory) KeyForRoomStateVersion(roomID id.RoomID, version tuple
 	} else {
 		return key
 	}
-}
-
-func (e *EventsDirectory) KeyToRoomStateVersion(key fdb.Key) (id.RoomID, tuple.Versionstamp) {
-	tup, _ := e.byRoomStateVersion.Unpack(key)
-	return id.RoomID(tup[0].(string)), tup[1].(tuple.Versionstamp)
 }
 
 func (e *EventsDirectory) RangeForRoomStateVersion(roomID id.RoomID, version tuple.Versionstamp) fdb.Range {
@@ -175,9 +147,17 @@ func (e *EventsDirectory) KeyForCurrentRoomMember(roomID id.RoomID, userID id.Us
 	return e.byRoomCurrentMembers.Pack(tuple.Tuple{roomID.String(), userID.String()})
 }
 
-func (e *EventsDirectory) KeyToCurrentRoomMember(key fdb.Key) (id.RoomID, id.UserID) {
-	tup, _ := e.byRoomCurrentMembers.Unpack(key)
-	return id.RoomID(tup[0].(string)), id.UserID(tup[1].(string))
+func (e *EventsDirectory) CurrentRoomMemberKeyValueToTups(kv fdb.KeyValue) (types.StateTupWithID, types.MembershipTup) {
+	tup, _ := e.byRoomCurrentMembers.Unpack(kv.Key)
+	membershipTup := types.ValueToMembershipTup(kv.Value)
+
+	return types.StateTupWithID{
+		EventID: membershipTup.EventID,
+		StateTup: types.StateTup{
+			Type:     event.StateMember,
+			StateKey: tup[1].(string),
+		},
+	}, membershipTup
 }
 
 func (e *EventsDirectory) RangeForCurrentRoomMembers(roomID id.RoomID) fdb.Range {
@@ -191,9 +171,9 @@ func (e *EventsDirectory) KeyForCurrentRoomServer(roomID id.RoomID, serverName s
 	return e.byRoomCurrentServers.Pack(tuple.Tuple{roomID.String(), serverName})
 }
 
-func (e *EventsDirectory) KeyToCurrentRoomServer(key fdb.Key) (id.RoomID, string) {
+func (e *EventsDirectory) CurrentRoomServerKeyToServer(key fdb.Key) string {
 	tup, _ := e.byRoomCurrentServers.Unpack(key)
-	return id.RoomID(tup[0].(string)), tup[1].(string)
+	return tup[1].(string)
 }
 
 func (e *EventsDirectory) RangeForCurrentRoomServers(roomID id.RoomID) fdb.Range {
@@ -207,9 +187,9 @@ func (e *EventsDirectory) KeyForRoomExtrem(roomID id.RoomID, eventID id.EventID)
 	return e.byRoomExtrem.Pack(tuple.Tuple{roomID.String(), eventID.String()})
 }
 
-func (e *EventsDirectory) KeyToRoomExtrem(key fdb.Key) (id.RoomID, id.EventID) {
+func (e *EventsDirectory) RoomExtremKeyToEventID(key fdb.Key) id.EventID {
 	tup, _ := e.byRoomExtrem.Unpack(key)
-	return id.RoomID(tup[0].(string)), id.EventID(tup[1].(string))
+	return id.EventID(tup[1].(string))
 }
 
 func (e *EventsDirectory) RangeForRoomExtrems(roomID id.RoomID) fdb.Range {
@@ -225,13 +205,18 @@ func (e *EventsDirectory) KeyForRoomCurrentStateTup(roomID id.RoomID, evType eve
 	})
 }
 
-func (e *EventsDirectory) KeyToRoomCurrentStateTup(key fdb.Key) (id.RoomID, event.Type, *string) {
-	tup, _ := e.byRoomCurrentStateTup.Unpack(key)
-	sKey := tup[2].(string)
-	return id.RoomID(tup[0].(string)), event.NewEventType(tup[1].(string)), &sKey
+func (e *EventsDirectory) CurrentRoomStateKeyValueToStateTup(kv fdb.KeyValue) types.StateTupWithID {
+	tup, _ := e.byRoomCurrentStateTup.Unpack(kv.Key)
+	return types.StateTupWithID{
+		EventID: id.EventID(kv.Value),
+		StateTup: types.StateTup{
+			Type:     event.NewEventType(tup[1].(string)),
+			StateKey: tup[2].(string),
+		},
+	}
 }
 
-func (e *EventsDirectory) RangeForCurrentRoomState(roomID id.RoomID) fdb.Range {
+func (e *EventsDirectory) RangeForRoomCurrentState(roomID id.RoomID) fdb.Range {
 	return e.byRoomCurrentStateTup.Sub(roomID.String())
 }
 

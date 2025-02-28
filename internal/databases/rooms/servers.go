@@ -23,6 +23,35 @@ func (r *RoomsDatabase) GetServerMemberships(ctx context.Context, serverName str
 	})
 }
 
+func (r *RoomsDatabase) GetCurrentRoomServers(ctx context.Context, roomID id.RoomID) ([]string, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]string, error) {
+		return r.events.TxnLookupCurrentRoomServers(txn, roomID)
+	})
+}
+
+func (r *RoomsDatabase) GetServerNamesWithPositions(ctx context.Context) ([]string, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]string, error) {
+		iter := txn.GetRange(
+			r.servers.RangeForServerPositions(),
+			fdb.RangeOptions{
+				Mode: fdb.StreamingModeWantAll,
+			},
+		).Iterator()
+
+		serverNames := make([]string, 0)
+
+		for iter.Advance() {
+			kv, err := iter.Get()
+			if err != nil {
+				return nil, err
+			}
+			serverNames = append(serverNames, r.servers.PositionKeyToServer(kv.Key))
+		}
+
+		return serverNames, nil
+	})
+}
+
 func (r *RoomsDatabase) GetServerPositions(ctx context.Context, serverName string) (types.VersionMap, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.VersionMap, error) {
 		key := r.servers.KeyForServerPosition(serverName)

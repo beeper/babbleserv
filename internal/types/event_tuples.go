@@ -13,12 +13,13 @@ type EventIDTup struct {
 	EventID id.EventID
 	RoomID  id.RoomID
 }
+
 type EventIDTupWithVersion struct {
 	EventIDTup
 	Version tuple.Versionstamp
 }
 
-func ValueForEventIDTup(tup EventIDTup) []byte {
+func EventIDTupToValue(tup EventIDTup) []byte {
 	return tuple.Tuple{tup.EventID.String(), tup.RoomID.String()}.Pack()
 }
 
@@ -56,7 +57,7 @@ type StateTupWithID struct {
 
 type StateMap map[StateTup]id.EventID
 
-func ValueForStateTupWithID(tup StateTupWithID) []byte {
+func StateTupWithIDToValue(tup StateTupWithID) []byte {
 	return tuple.Tuple{tup.EventID.String(), tup.Type.String(), tup.StateKey}.Pack()
 }
 
@@ -89,7 +90,7 @@ func (tup MembershipTup) MarshalText() ([]byte, error) {
 type Memberships map[id.RoomID]MembershipTup
 type MembershipChanges []MembershipTupWithVersion
 
-func ValueForMembershipTup(tup MembershipTup) []byte {
+func MembershipTupToValue(tup MembershipTup) []byte {
 	return tuple.Tuple{tup.EventID.String(), tup.RoomID.String(), string(tup.Membership)}.Pack()
 }
 

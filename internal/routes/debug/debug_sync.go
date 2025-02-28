@@ -7,15 +7,26 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/beeper/babbleserv/internal/databases/rooms"
-	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/util"
 )
+
+func (b *DebugRoutes) DebugInitUser(w http.ResponseWriter, r *http.Request) {
+	userID := id.UserID(chi.URLParam(r, "userID"))
+
+	if sync, err := b.db.InitForUser(r.Context(), userID); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	} else {
+		util.ResponseJSON(w, r, http.StatusOK, sync)
+		return
+	}
+}
 
 func (b *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
 	userID := id.UserID(chi.URLParam(r, "userID"))
 
-	from, err := util.VersionFromRequestQuery(r, "since", "r")
+	versions, err := util.VersionMapFromRequestQuery(r, "since")
 	if err != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
 		return
@@ -25,28 +36,22 @@ func (b *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
 		return
 	}
-	options := rooms.SyncOptions{
-		From:  from,
-		Limit: limit,
-	}
 
-	nextVersion, rooms, err := b.db.Rooms.SyncRoomEventsForUser(r.Context(), userID, options)
-	if err != nil {
+	if sync, err := b.db.SyncForUser(r.Context(), userID, versions, databases.SyncOptions{
+		Limit: limit,
+	}); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
+	} else {
+		util.ResponseJSON(w, r, http.StatusOK, sync)
+		return
 	}
-	nextBatch := util.Base64EncodeURLSafe(types.ValueForVersionstamp(nextVersion))
-
-	util.ResponseJSON(w, r, http.StatusOK, struct {
-		NextBatch string
-		Rooms     map[types.MembershipTup][]*types.Event
-	}{nextBatch, rooms})
 }
 
 func (b *DebugRoutes) DebugSyncServer(w http.ResponseWriter, r *http.Request) {
 	serverName := chi.URLParam(r, "serverName")
 
-	from, err := util.VersionFromRequestQuery(r, "since", "r")
+	versions, err := util.VersionMapFromRequestQuery(r, "since")
 	if err != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
 		return
@@ -56,20 +61,14 @@ func (b *DebugRoutes) DebugSyncServer(w http.ResponseWriter, r *http.Request) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
 		return
 	}
-	options := rooms.SyncOptions{
-		From:  from,
-		Limit: limit,
-	}
 
-	nextVersion, rooms, err := b.db.Rooms.SyncRoomEventsForServer(r.Context(), serverName, options)
-	if err != nil {
+	if sync, err := b.db.SyncForServer(r.Context(), serverName, versions, databases.SyncOptions{
+		Limit: limit,
+	}); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
+	} else {
+		util.ResponseJSON(w, r, http.StatusOK, sync)
+		return
 	}
-	nextBatch := util.Base64EncodeURLSafe(types.ValueForVersionstamp(nextVersion))
-
-	util.ResponseJSON(w, r, http.StatusOK, struct {
-		NextBatch string
-		Rooms     map[types.MembershipTup][]*types.Event
-	}{nextBatch, rooms})
 }

@@ -26,7 +26,7 @@ func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directo
 	}
 
 	log := logger.With().Str("directory", "users").Logger()
-	log.Trace().
+	log.Debug().
 		Bytes("prefix", usersDir.Bytes()).
 		Msg("Init rooms/users directory")
 

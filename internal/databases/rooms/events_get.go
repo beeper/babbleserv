@@ -81,6 +81,22 @@ func (r *RoomsDatabase) GetRoomSpecificRoomMemberStateMapAtEvent(ctx context.Con
 	})
 }
 
+func (r *RoomsDatabase) GetCurrentRoomInviteStateEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
+		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+		stateMap, err := r.events.TxnLookupCurrentRoomInviteStateMap(txn, roomID, eventsProvider)
+		if err != nil {
+			return nil, err
+		}
+		evs := make([]*types.Event, 0, len(stateMap))
+		for _, evID := range stateMap {
+			evs = append(evs, eventsProvider.MustGet(evID))
+		}
+		util.SortEventList(evs)
+		return evs, nil
+	})
+}
+
 func (r *RoomsDatabase) GetCurrentRoomMemberEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
 	if memberEvs, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
@@ -108,8 +124,15 @@ func (r *RoomsDatabase) GetCurrentRoomStateEvents(ctx context.Context, roomID id
 		if err != nil {
 			return nil, err
 		}
-		evs := make([]*types.Event, 0, len(stateMap))
+		memberMap, err := r.events.TxnLookupCurrentRoomMemberStateMap(txn, roomID, eventsProvider)
+		if err != nil {
+			return nil, err
+		}
+		evs := make([]*types.Event, 0, len(stateMap)+len(memberMap))
 		for _, evID := range stateMap {
+			evs = append(evs, eventsProvider.MustGet(evID))
+		}
+		for _, evID := range memberMap {
 			evs = append(evs, eventsProvider.MustGet(evID))
 		}
 		return evs, nil
@@ -118,41 +141,39 @@ func (r *RoomsDatabase) GetCurrentRoomStateEvents(ctx context.Context, roomID id
 		return nil, err
 	}
 
-	memberEvs, err := r.GetCurrentRoomMemberEvents(ctx, roomID)
-	if err != nil {
-		return nil, err
-	}
-
-	stateEvs = append(stateEvs, memberEvs...)
 	util.SortEventList(stateEvs)
 	return stateEvs, nil
 }
 
-func (r *RoomsDatabase) GetCurrentRoomServers(ctx context.Context, roomID id.RoomID) ([]string, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]string, error) {
-		return r.events.TxnLookupCurrentRoomServers(txn, roomID)
-	})
-}
-
-func (r *RoomsDatabase) GetCurrentRoomInviteStateEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
-		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		stateMap, err := r.events.TxnLookupCurrentRoomInviteStateMap(txn, roomID, eventsProvider)
-		if err != nil {
-			return nil, err
-		}
-		evs := make([]*types.Event, 0, len(stateMap))
-		for _, evID := range stateMap {
-			evs = append(evs, eventsProvider.MustGet(evID))
-		}
-		util.SortEventList(evs)
-		return evs, nil
-	})
-}
-
-type roomStateAtEvent struct {
+type stateWithAuthChain struct {
 	StateEvents []*types.Event
 	AuthChain   []*types.Event
+}
+
+func (r *RoomsDatabase) GetCurrentRoomStateEventsWithAuthChain(ctx context.Context, roomID id.RoomID) (stateWithAuthChain, error) {
+	var res stateWithAuthChain
+	var err error
+
+	res.StateEvents, err = r.GetCurrentRoomStateEvents(ctx, roomID)
+	if err != nil {
+		return res, err
+	}
+
+	if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
+		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn).WithEvents(res.StateEvents...)
+		if authChain, err := r.events.TxnGetAuthChainForEvents(txn, res.StateEvents, eventsProvider); err != nil {
+			return nil, err
+		} else {
+			res.AuthChain = authChain
+		}
+		return nil, nil
+	}); err != nil {
+		return res, err
+	}
+
+	util.SortEventList(res.StateEvents)
+	util.SortEventList(res.AuthChain)
+	return res, nil
 }
 
 // Get room state (state events + their auth chain) at a given event. This is broken
@@ -162,8 +183,8 @@ func (r *RoomsDatabase) GetRoomStateWithAuthChainAtEvent(
 	ctx context.Context,
 	roomID id.RoomID,
 	eventID id.EventID,
-) (roomStateAtEvent, error) {
-	var res roomStateAtEvent
+) (stateWithAuthChain, error) {
+	var res stateWithAuthChain
 
 	if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
@@ -197,7 +218,7 @@ func (r *RoomsDatabase) GetRoomStateWithAuthChainAtEvent(
 	return res, nil
 }
 
-type roomStateIDsAtEvent struct {
+type stateWithAuthChainIDs struct {
 	StateEventIDs []id.EventID
 	AuthChainIDs  []id.EventID
 }
@@ -206,8 +227,8 @@ func (r *RoomsDatabase) GetRoomStateWithAuthChainIDsAtEvent(
 	ctx context.Context,
 	roomID id.RoomID,
 	eventID id.EventID,
-) (roomStateIDsAtEvent, error) {
-	var res roomStateIDsAtEvent
+) (stateWithAuthChainIDs, error) {
+	var res stateWithAuthChainIDs
 
 	roomStateAtEvent, err := r.GetRoomStateWithAuthChainAtEvent(ctx, roomID, eventID)
 	if err != nil {

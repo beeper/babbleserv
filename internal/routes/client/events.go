@@ -15,8 +15,8 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 	eventID := id.EventID(chi.URLParam(r, "eventID"))
 
-	user := middleware.GetRequestUser(r)
-	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), user.UserID(), roomID); err != nil {
+	userID := middleware.GetRequestUserID(r)
+	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), userID, roomID); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if !inRoom {
@@ -39,8 +39,8 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) GetRoomState(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 
-	user := middleware.GetRequestUser(r)
-	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), user.UserID(), roomID); err != nil {
+	userID := middleware.GetRequestUserID(r)
+	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), userID, roomID); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if !inRoom {
@@ -60,8 +60,8 @@ func (c *ClientRoutes) GetRoomState(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) GetRoomMembers(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 
-	user := middleware.GetRequestUser(r)
-	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), user.UserID(), roomID); err != nil {
+	userID := middleware.GetRequestUserID(r)
+	if inRoom, err := c.db.Rooms.IsUserInRoom(r.Context(), userID, roomID); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if !inRoom {

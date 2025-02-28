@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -57,7 +58,7 @@ func makeMembershipContent(membership event.Membership, reason string) map[strin
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3joined_rooms
 func (c *ClientRoutes) GetJoinedRooms(w http.ResponseWriter, r *http.Request) {
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	memberships, err := c.db.Rooms.GetUserMemberships(r.Context(), userID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
@@ -84,7 +85,7 @@ func (c *ClientRoutes) SendRoomInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	otherUserID := req.UserID
 	sKey := otherUserID.String()
 	content := makeMembershipContent(event.MembershipInvite, req.Reason)
@@ -132,7 +133,7 @@ func (c *ClientRoutes) SendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 
 	if serverInRoom {
 		// The easy path - we're already in the room, so just send the join. We
@@ -165,10 +166,12 @@ func (c *ClientRoutes) SendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		roomVersion := string(makeJoinResp.RoomVersion)
 
 		ev := types.EventFromProtoEvent(makeJoinResp.JoinEvent)
-		if err := c.prepareEventFromOtherHomeserver(ev, roomVersion); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
+		ev.Timestamp = time.Now().UTC().UnixMilli()
+		ev.Origin = c.config.ServerName
+		ev.RoomVersion = roomVersion
+
+		keyID, key := c.config.MustGetActiveSigningKey()
+		util.HashAndSignEvent(ev, c.config.ServerName, keyID, key)
 
 		// Switch to a background context here - if the client drops the request
 		// we should still send/receive the join so the state on the remote HS
@@ -279,7 +282,7 @@ func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
 		// The easy path - we're (the server) in the room, we can just send the
 		// leave. Note that this might also mean the server is no longer in the
 		// room once sent.
-		userID := middleware.GetRequestUser(r).UserID()
+		userID := middleware.GetRequestUserID(r)
 		sKey := userID.String()
 		content := makeMembershipContent(event.MembershipLeave, req.Reason)
 		ev := types.NewPartialEvent(roomID, event.StateMember, &sKey, userID, content)
@@ -313,7 +316,7 @@ func (c *ClientRoutes) sendOtherUserMemberEvent(w http.ResponseWriter, r *http.R
 	}
 
 	sKey := req.UserID.String()
-	userID := middleware.GetRequestUser(r).UserID()
+	userID := middleware.GetRequestUserID(r)
 	content := makeMembershipContent(membership, req.Reason)
 	ev := types.NewPartialEvent(roomID, event.StateMember, &sKey, userID, content)
 	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {

@@ -35,7 +35,7 @@ func (r *RoomsDatabase) UpdateEventsIteratorPosition(
 		checkUpdateLock(txn)
 
 		key := r.root.Pack(tuple.Tuple{eventsIteratorPositionKey})
-		txn.Set(key, types.ValueForVersionstamp(version))
+		txn.Set(key, types.VersionstampToValue(version))
 		return nil, nil
 	})
 	return err

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strings"
-	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
@@ -27,31 +26,19 @@ func (c *ClientRoutes) sendLocalEventHandleResults(
 	partialEv *types.PartialEvent,
 	responseGen func(ev *types.Event) any,
 ) {
-	results, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, rooms.SendLocalEventsOptions{})
+	res, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, rooms.SendLocalEventsOptions{})
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
-	}
-
-	if len(results.Rejected) > 0 {
-		err := results.Rejected[0].Error
+	} else if len(res.Rejected) > 0 {
+		err := res.Rejected[0].Error
 		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
 		return
 	} else {
-		ev := results.Allowed[0]
+		ev := res.Allowed[0]
 		util.ResponseJSON(w, r, http.StatusOK, responseGen(ev))
+		return
 	}
-}
-
-func (c *ClientRoutes) prepareEventFromOtherHomeserver(ev *types.Event, roomVersion string) error {
-	ev.Timestamp = time.Now().UTC().UnixMilli()
-	ev.Origin = c.config.ServerName
-	ev.RoomVersion = roomVersion
-
-	keyID, key := c.config.MustGetActiveSigningKey()
-	util.HashAndSignEvent(ev, c.config.ServerName, keyID, key)
-
-	return nil
 }
 
 // https://spec.matrix.org/v1.11/server-server-api/#inviting-to-a-room

@@ -24,23 +24,45 @@ type keyConfig struct {
 	ExpiredTimestamp int64  `yaml:"expiredTimestamp"`
 }
 
+type NotifierConfig struct {
+	RedisAddr    string `yaml:"redisAddr"`
+	RedisChannel string `yaml:"redisChannel"`
+}
+
 type BabbleConfig struct {
 	ServerName string `yaml:"serverName"`
 
 	SigningKeys               map[string]keyConfig `yaml:"signingKeys"`
 	SigningKeyRefreshInterval time.Duration        `yaml:"signingKeyRefreshInterval"`
 
-	Databases struct {
-		Rooms databaseConfig `yaml:"rooms"`
-	} `yaml:"databases"`
-
 	Rooms struct {
-		DefaultVersion string `yaml:"defaultVersion"`
+		Enabled        bool           `yaml:"enabled"`
+		Database       databaseConfig `yaml:"database"`
+		Notifier       NotifierConfig `yaml:"notifier"`
+		DefaultVersion string         `yaml:"defaultVersion"`
 	} `yaml:"rooms"`
 
-	Notifier struct {
-		RedisAddr string `yaml:"redisAddr"`
-	} `yaml:"notifier"`
+	Accounts struct {
+		Enabled  bool           `yaml:"enabled"`
+		Database databaseConfig `yaml:"database"`
+		Notifier NotifierConfig `yaml:"notifier"`
+
+		RefreshAccessTokenExpire time.Duration `yaml:"refreshAccessTokenExpire"`
+	}
+
+	Transient struct {
+		Enabled  bool           `yaml:"enabled"`
+		Database databaseConfig `yaml:"database"`
+		Notifier NotifierConfig `yaml:"notifier"`
+	}
+
+	Media struct {
+		Enabled             bool                      `yaml:"enabled"`
+		Database            databaseConfig            `yaml:"database"`
+		Notifier            NotifierConfig            `yaml:"notifier"`
+		Datastores          map[string]map[string]any `yaml:"datastores"`
+		PresignedURLTimeout time.Duration             `yaml:"presignedURLTimeout"`
+	}
 
 	Routes struct {
 		Servers []serverConfig `yaml:"servers"`
@@ -63,6 +85,8 @@ type BabbleConfig struct {
 		// Allow sending create events over federation transactions, should NOT
 		// be enabled in production, but very useful for testing.
 		EnableFederatedSendRoomCreate bool `yaml:"enableFederatedSendRoomCreate"`
+		// Create datastore buckets that don't exist
+		AutoCreateDatastoreBuckets bool `yaml:"autoCreateDatastoreBuckets"`
 	} `yaml:"secretSwitches"`
 
 	// Provided via caller (added at build time)
