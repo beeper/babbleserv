@@ -1,13 +1,12 @@
 package accounts
 
 import (
-	"sync"
-
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/config"
+	"github.com/beeper/babbleserv/internal/databases/accounts/accountdata"
 	"github.com/beeper/babbleserv/internal/databases/accounts/devices"
 	"github.com/beeper/babbleserv/internal/databases/accounts/tokens"
 	"github.com/beeper/babbleserv/internal/databases/accounts/users"
@@ -17,16 +16,15 @@ import (
 const API_VERSION = 710
 
 type AccountsDatabase struct {
-	backgroundWg sync.WaitGroup
-
 	log      zerolog.Logger
 	db       fdb.Database
 	config   config.BabbleConfig
 	notifier *notifier.Notifier
 
-	users   *users.UsersDirectory
-	tokens  *tokens.TokensDirectory
-	devices *devices.DevicesDirectory
+	users       *users.UsersDirectory
+	tokens      *tokens.TokensDirectory
+	devices     *devices.DevicesDirectory
+	accountdata *accountdata.AccountDataDirectory
 }
 
 func NewAccountsDatabase(
@@ -39,9 +37,9 @@ func NewAccountsDatabase(
 
 	fdb.MustAPIVersion(API_VERSION)
 	db := fdb.MustOpenDatabase(cfg.Accounts.Database.ClusterFilePath)
-	log.Debug().
+	log.Info().
 		Str("cluster_file", cfg.Accounts.Database.ClusterFilePath).
-		Msg("Connected to FoundationDB")
+		Msg("Connecting to FoundationDB")
 
 	db.Options().SetTransactionTimeout(cfg.Accounts.Database.TransactionTimeout)
 	db.Options().SetTransactionRetryLimit(cfg.Accounts.Database.TransactionRetryLimit)
@@ -60,13 +58,12 @@ func NewAccountsDatabase(
 		db:     db,
 		config: cfg,
 
-		users:   users.NewUsersDirectory(log, db, accountsDir),
-		tokens:  tokens.NewTokensDirectory(log, db, accountsDir),
-		devices: devices.NewDevicesDirectory(log, db, accountsDir),
+		users:       users.NewUsersDirectory(log, db, accountsDir),
+		tokens:      tokens.NewTokensDirectory(log, db, accountsDir),
+		devices:     devices.NewDevicesDirectory(log, db, accountsDir),
+		accountdata: accountdata.NewAccountDataDirectory(log, db, accountsDir),
 	}
 }
 
 func (a *AccountsDatabase) Stop() {
-	a.log.Debug().Msg("Waiting for any background jobs to complete...")
-	a.backgroundWg.Wait()
 }

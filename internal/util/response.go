@@ -2,6 +2,7 @@ package util
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -37,8 +38,10 @@ type errorMeta struct {
 }
 
 var errorToMeta = map[string]errorMeta{
-	mautrix.MNotJSON.ErrCode:      {400, "Request body is not valid JSON"},
-	mautrix.MInvalidParam.ErrCode: {400, ""},
+	mautrix.MNotJSON.ErrCode:                {400, "Request body is not valid JSON"},
+	mautrix.MBadJSON.ErrCode:                {400, "Request body is JSON but not match schema"},
+	mautrix.MInvalidParam.ErrCode:           {400, ""},
+	mautrix.MUnsupportedRoomVersion.ErrCode: {400, "Room version not supported"},
 
 	mautrix.MMissingToken.ErrCode: {401, ""},
 	mautrix.MUnknownToken.ErrCode: {401, ""},
@@ -66,12 +69,18 @@ func MakeMatrixError(error mautrix.RespError, message string) mautrix.RespError 
 }
 
 func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error) {
-	if httpErr, ok := err.(gomatrix.HTTPError); ok {
-		hlog.FromRequest(r).Err(httpErr.WrappedError).Msg("Matrix error processing request")
+	var httpErr gomatrix.HTTPError
+	if errors.As(err, &httpErr) {
+		hlog.FromRequest(r).Error().
+			Err(httpErr.WrappedError).
+			Int("code", httpErr.Code).
+			Str("message", httpErr.Message).
+			Str("contents", string(httpErr.Contents)).
+			Msg("Matrix error processing request")
 		ResponseRawJSON(w, r, httpErr.Code, httpErr.Contents)
 		return
 	}
-	hlog.FromRequest(r).Err(err).Msg("Unknown error processing request")
+	hlog.FromRequest(r).Err(err).Type("type", err).Msg("Unknown error processing request")
 	ResponseErrorJSON(w, r, MUnknown)
 }
 
@@ -87,7 +96,11 @@ func ResponseErrorMessageJSON(w http.ResponseWriter, r *http.Request, error maut
 	if message == "" {
 		message = meta.defaultMsg
 	}
-	hlog.FromRequest(r).Error().
+	logEv := hlog.FromRequest(r).Error()
+	if meta.statusCode < 500 {
+		logEv = hlog.FromRequest(r).Warn()
+	}
+	logEv.
 		Str("error_code", error.ErrCode).
 		Str("error_message", message).
 		Msg("Send response error")

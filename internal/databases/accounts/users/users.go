@@ -14,15 +14,32 @@ type UsersDirectory struct {
 	log zerolog.Logger
 	db  fdb.Database
 
-	byVersion,
-	byUsername,
+	/// version -> username
+	byVersion subspace.Subspace
+
+	/// username -> *types.User
+	//
+	// key: (Username)
+	// value: types.User (as msgpack []byte)
+	byUsername subspace.Subspace
+
+	// username -> password hash
 	userPasswordHashes subspace.Subspace
 
 	// Device signing keys
 	// https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3keysdevice_signingupload
-	userMasterKeys,
-	userSelfSigningKeys,
+	// username -> CrossSigningKey JSON (CSAPI)
+	userMasterKeys subspace.Subspace
+
+	// username -> CrossSigningKey JSON (CSAPI)
+	userSelfSigningKeys subspace.Subspace
+
+	// username -> CrossSigningKey JSON (CSAPI)
 	userUserSigningKeys subspace.Subspace
+
+	// Username/version -> filter bytes, version returned to the user as the filter ID. PUT requests
+	// will then update the filter in-place. Meaning filters aren't stored as an immutableish stream.
+	userFilters subspace.Subspace
 }
 
 func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *UsersDirectory {
@@ -40,13 +57,13 @@ func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directo
 		log: log,
 		db:  db,
 
-		byVersion:          usersDir.Sub("ver"), // version -> username
-		byUsername:         usersDir.Sub("unm"), // username -> *types.User
-		userPasswordHashes: usersDir.Sub("uph"), // username -> password hash
-
-		userMasterKeys:      usersDir.Sub("key"), // username -> CrossSigningKey JSON (CSAPI)
-		userSelfSigningKeys: usersDir.Sub("ssk"), // username -> CrossSigningKey JSON (CSAPI)
-		userUserSigningKeys: usersDir.Sub("usk"), // username -> CrossSigningKey JSON (CSAPI)
+		byVersion:           usersDir.Sub("ver"),
+		byUsername:          usersDir.Sub("unm"),
+		userPasswordHashes:  usersDir.Sub("uph"),
+		userMasterKeys:      usersDir.Sub("key"),
+		userSelfSigningKeys: usersDir.Sub("ssk"),
+		userUserSigningKeys: usersDir.Sub("usk"),
+		userFilters:         usersDir.Sub("ufl"),
 	}
 }
 
@@ -67,10 +84,10 @@ func (u *UsersDirectory) TxnGetLocalUser(txn fdb.ReadTransaction, username, serv
 	if err != nil {
 		return nil, err
 	} else if b == nil {
-		return nil, types.ErrUserNotFound
-	} else {
-		return types.MustNewUserFromBytes(b, username, serverName), nil
+		return nil, nil
 	}
+
+	return types.NewUserFromBytes(b, username, serverName)
 }
 
 func (u *UsersDirectory) TxnCreateUser(txn fdb.Transaction, user *types.User, hashedPassword []byte) error {
@@ -101,9 +118,21 @@ func (u *UsersDirectory) keyForUser(username string) fdb.Key {
 }
 
 func (u *UsersDirectory) keyForUserVersion(version tuple.Versionstamp) fdb.Key {
-	if key, err := u.byVersion.PackWithVersionstamp(tuple.Tuple{version}); err != nil {
+	key, err := u.byVersion.PackWithVersionstamp(tuple.Tuple{version})
+	if err != nil {
 		panic(err)
-	} else {
-		return key
 	}
+	return key
+}
+
+func (u *UsersDirectory) KeyForNewUserFilter(username string, version tuple.Versionstamp) fdb.Key {
+	key, err := u.userFilters.PackWithVersionstamp(tuple.Tuple{username, version})
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+func (u *UsersDirectory) KeyForUserFilter(username string, version tuple.Versionstamp) fdb.Key {
+	return u.userFilters.Pack(tuple.Tuple{username, version})
 }

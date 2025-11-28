@@ -5,9 +5,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	deflog "github.com/rs/zerolog/log"
 
 	"github.com/beeper/babbleserv/internal"
 	"github.com/beeper/babbleserv/internal/config"
@@ -39,9 +40,15 @@ func main() {
 
 	flag.Parse()
 
+	var logWriter zerolog.ConsoleWriter
 	if *prettyLogs {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+		logWriter = zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
 	}
+	log := zerolog.New(logWriter).With().Timestamp().Logger()
+
+	deflog.Logger = log.With().Str("component", "default_logger").Logger()
+	ctxLog := log.With().Caller().Str("component", "default_context_logger").Logger()
+	zerolog.DefaultContextLogger = &ctxLog
 
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	if *trace {

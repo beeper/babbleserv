@@ -39,6 +39,8 @@ type Routes struct {
 type Server struct {
 	http.Server
 	ServiceGroups []string
+	TLSCertPath   string
+	TLSKeyPath    string
 }
 
 func NewRoutes(
@@ -74,6 +76,8 @@ func NewRoutes(
 				Handler: r.MakeHandler(serverCfg.ServiceGroups),
 			},
 			ServiceGroups: serverCfg.ServiceGroups,
+			TLSCertPath:   serverCfg.TLSCertPath,
+			TLSKeyPath:    serverCfg.TLSKeyPath,
 		}
 		r.servers = append(r.servers, server)
 	}
@@ -124,6 +128,12 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 		rtr.MethodFunc(http.MethodGet, "/.well-known/matrix/server", r.WellKnownServer)
 	}
 
+	rtr.MethodFunc(http.MethodGet, "/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`<pre style="margin:100px auto;text-align:center;">Babble</pre>`))
+	})
+
 	return rtr
 }
 
@@ -132,12 +142,14 @@ func (r *Routes) Start() {
 
 	for _, server := range r.servers {
 		go func() {
-			r.log.Info().Msgf(
-				"Start listen on: %s (groups=%s)",
-				server.Addr,
-				server.ServiceGroups,
-			)
-			if err := server.ListenAndServeTLS("cert.pem", "key.pem"); err != nil && err != http.ErrServerClosed {
+			r.log.Info().Msgf("Start listen on: %s (groups=%s)", server.Addr, server.ServiceGroups)
+			var err error
+			if server.TLSCertPath == "" {
+				err = server.ListenAndServe()
+			} else {
+				err = server.ListenAndServeTLS(server.TLSCertPath, server.TLSKeyPath)
+			}
+			if err != nil && err != http.ErrServerClosed {
 				r.log.Panic().Err(err).Msg("Error in server listener")
 			}
 		}()

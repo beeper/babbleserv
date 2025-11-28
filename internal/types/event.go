@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -15,8 +16,9 @@ var _ json.Marshaler = (*Event)(nil)
 var _ json.Unmarshaler = (*Event)(nil)
 var _ msgpack.Marshaler = (*Event)(nil)
 
+// A partial event before hashing, signatures and prev/auth events are added
 type PartialEvent struct {
-	RoomID   id.RoomID       `msgpack:"rid" json:"room_id"`
+	RoomID   id.RoomID       `msgpack:"rid" json:"room_id,omitempty"`
 	Sender   id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
 	StateKey *string         `msgpack:"sky" json:"state_key,omitempty"`
 	Content  json.RawMessage `msgpack:"cnt" json:"content"`
@@ -27,28 +29,43 @@ type PartialEvent struct {
 	Type    event.Type `msgpack:"-" json:"type"`
 }
 
-type Event struct {
+// The CSAPI ClientEvent type, described here:
+// https://spec.matrix.org/v1.11/client-server-api/#room-event-format
+type ClientEvent struct {
 	PartialEvent `msgpack:",inline" json:",inline"`
 
 	// Event ID is not part of the (S2S) event JSON, populated at fetch (from key)
-	ID id.EventID `msgpack:"-" json:"-"`
+	ID id.EventID `msgpack:"-" json:"event_id"`
 
+	Timestamp int64 `msgpack:"ots" json:"origin_server_ts"`
+
+	// Unsigned itself is not stored as mostly contains generated content
+	Unsigned map[string]any `msgpack:"-" json:"unsigned,omitempty"`
+}
+
+// The S2SAPI PDU type, described here (varies slightly by room version):
+// https://spec.matrix.org/v1.11/rooms/v11/#event-format-1
+type Event struct {
+	ClientEvent `msgpack:",inline" json:",inline"`
+
+	// Internal flag to indicate whether this event was generated locally
+	Local bool `msgpack:"loc" json:"-"`
 	// Internal copy of the room version so we don't need to look it up
 	RoomVersion string `msgpack:"rmv" json:"-"`
 	// Internal indicators of whether an event is soft failed or an outlier,
 	// if so it should not appear in any indices or user facing responses.
 	SoftFailed bool `msgpack:"sfd" json:"-"`
 	Outlier    bool `msgpack:"out" json:"-"`
+	Rejected   bool `msgpack:"rej" json:"-"`
 	// Internal indicator of whether the event has been redacted - note the
 	// actual content will not be redacted in the DB.
 	Redacted bool `msgpack:"red" json:"-"`
 
-	Origin    string `msgpack:"ori" json:"origin"`
-	Timestamp int64  `msgpack:"ots" json:"origin_server_ts"`
+	Origin string `msgpack:"ori" json:"origin"`
 
 	Depth int64 `msgpack:"dpt" json:"depth"`
 
-	// Only here for backwards compat
+	// Only here for backwards compat ???
 	PrevState []id.EventID `msgpack:"pst" json:"prev_state,omitempty"`
 
 	PrevEventIDs []id.EventID `msgpack:"pid" json:"prev_events"`
@@ -57,7 +74,9 @@ type Event struct {
 	Hashes     map[string]string            `msgpack:"hsh" json:"hashes"`
 	Signatures map[string]map[string]string `msgpack:"sig" json:"signatures"`
 
-	Unsigned map[string]any `msgpack:"uns" json:"unsigned,omitempty"`
+	// Internal, in-memory only flags used for the lifetime of a request/background job
+	IsForClientAPI    bool               `msgpack:"-" json:"-"`
+	IncompleteVersion tuple.Versionstamp `msgpack:"-" json:"-"`
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
@@ -67,6 +86,9 @@ func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
 	}
 	ev.ID = id
 	ev.Type = event.NewEventType(ev.TypeStr)
+	if ev.Unsigned == nil {
+		ev.Unsigned = make(map[string]any)
+	}
 	return &ev, nil
 }
 
@@ -110,14 +132,16 @@ func eventIDsFromProtoEvent(input any) []id.EventID {
 
 func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) *Event {
 	return &Event{
-		PartialEvent: PartialEvent{
-			RoomID:   id.RoomID(protoEv.RoomID),
-			Sender:   id.UserID(protoEv.SenderID),
-			TypeStr:  protoEv.Type,
-			Type:     event.NewEventType(protoEv.Type),
-			StateKey: protoEv.StateKey,
-			Content:  []byte(protoEv.Content),
-			Redacts:  id.EventID(protoEv.Redacts),
+		ClientEvent: ClientEvent{
+			PartialEvent: PartialEvent{
+				RoomID:   id.RoomID(protoEv.RoomID),
+				Sender:   id.UserID(protoEv.SenderID),
+				TypeStr:  protoEv.Type,
+				Type:     event.NewEventType(protoEv.Type),
+				StateKey: protoEv.StateKey,
+				Content:  []byte(protoEv.Content),
+				Redacts:  id.EventID(protoEv.Redacts),
+			},
 		},
 		Depth:        protoEv.Depth,
 		AuthEventIDs: eventIDsFromProtoEvent(protoEv.AuthEvents),
@@ -142,6 +166,9 @@ func (ev *Event) ToMsgpack() []byte {
 }
 
 func (ev Event) MarshalJSON() ([]byte, error) {
+	if ev.IsForClientAPI {
+		return json.Marshal(ev.ClientEvent)
+	}
 	if ev.AuthEventIDs == nil {
 		ev.AuthEventIDs = make([]id.EventID, 0)
 	}
@@ -149,14 +176,18 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 		ev.PrevEventIDs = make([]id.EventID, 0)
 	}
 	b, err := json.Marshal((marshalEvent)(ev))
-	if ev.PrevState != nil {
-		// Work around no omitnil in Go's JSON marshaller
-		b, err = sjson.SetBytes(b, "prev_state", []string{})
-	}
 	if err != nil {
 		return nil, err
 	}
-	return b, nil
+	if ev.PrevState != nil {
+		// Work around no omitnil in Go's JSON marshaller
+		b, err = sjson.SetBytes(b, "prev_state", []string{})
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Remove event_id, which is only included in the CS API
+	return sjson.DeleteBytes(b, "event_id")
 }
 
 func (ev *Event) UnmarshalJSON(b []byte) error {
@@ -173,40 +204,20 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Wrapper around event for the CS API where event_id is part of the JSON
-var _ json.Marshaler = (*ClientEvent)(nil)
-var _ json.Unmarshaler = (*ClientEvent)(nil)
-
-type ClientEvent struct {
-	*Event `json:",inline"`
-}
-
-func (ev *Event) ClientEvent() ClientEvent {
-	return ClientEvent{ev}
-}
-
-type marshalClientEvent ClientEvent
-
-func (ev ClientEvent) MarshalJSON() ([]byte, error) {
-	b, err := json.Marshal((marshalClientEvent)(ev))
-	if err != nil {
-		return nil, err
-	}
-	return sjson.SetBytes(b, "event_id", ev.ID)
-}
-
-func (ev *Event) EventIDTup() EventIDTup {
-	return EventIDTup{
+func (ev *Event) EventTup() EventTup {
+	return EventTup{
 		EventID: ev.ID,
 		RoomID:  ev.RoomID,
+		Sender:  ev.Sender,
+		Type:    ev.Type,
 	}
 }
 
-func (ev *Event) StateTupWithID() StateTupWithID {
+func (ev *Event) EventStateTup() EventStateTup {
 	if ev.StateKey == nil {
 		panic("not a state event")
 	}
-	return StateTupWithID{
+	return EventStateTup{
 		EventID: ev.ID,
 		StateTup: StateTup{
 			Type:     ev.Type,

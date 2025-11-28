@@ -29,7 +29,7 @@ func TxnIterAllRange(txn fdb.ReadTransaction, rng fdb.Range, f func(fdb.KeyValue
 	return nil
 }
 
-func TxnGetLatestWriteVersion(ctx context.Context, txn fdb.ReadTransaction) tuple.Versionstamp {
+func TxnGetLatestWriteVersion(txn fdb.ReadTransaction) tuple.Versionstamp {
 	kvs := txn.GetRange(
 		tuple.Tuple{timeToVersionPrefix},
 		fdb.RangeOptions{
@@ -37,7 +37,10 @@ func TxnGetLatestWriteVersion(ctx context.Context, txn fdb.ReadTransaction) tupl
 			Limit:   1,
 		},
 	).GetSliceOrPanic()
-	return types.MustValueToVersionstamp(kvs[0].Value)
+	if len(kvs) == 0 {
+		return types.ZeroVersionstamp
+	}
+	return types.MustBytesToVersionstamp(kvs[0].Value)
 }
 
 func DoReadTransaction[T any](
@@ -50,17 +53,20 @@ func DoReadTransaction[T any](
 		return res, ctx.Err()
 	}
 
-	_, file, no, _ := runtime.Caller(1)
-	src := filepath.Base(file) + ":" + strconv.Itoa(no)
-	log := zerolog.Ctx(ctx).With().
-		Str("src", src).
-		Logger()
+	log := zerolog.Nop()
+	if zerolog.GlobalLevel() == zerolog.TraceLevel {
+		_, file, no, _ := runtime.Caller(1)
+		src := file + ":" + strconv.Itoa(no)
+		log = zerolog.Ctx(ctx).With().
+			Str("src", src).
+			Logger()
+	}
 
 	if res, err := db.ReadTransact(func(txn fdb.ReadTransaction) (any, error) {
 		log.Trace().Msg("Start read transaction")
 		start := time.Now()
 		// Use a snapshot for the transaction since we're read-only, this means changes to the keys
-		// we read won't conflict (we still read a consistent view of the DB).
+		// we read won't conflict (we still see a consistent view of the DB).
 		res, err := fn(txn.Snapshot())
 		log.Trace().
 			Err(err).
@@ -76,6 +82,43 @@ func DoReadTransaction[T any](
 }
 
 func DoWriteTransaction[T any](
+	ctx context.Context,
+	db fdb.Database,
+	fn func(txn fdb.Transaction) (T, error),
+) (T, error) {
+	if ctx.Err() != nil {
+		var res T
+		return res, ctx.Err()
+	}
+
+	log := zerolog.Nop()
+	if zerolog.GlobalLevel() == zerolog.TraceLevel {
+		_, file, no, _ := runtime.Caller(1)
+		src := file + ":" + strconv.Itoa(no)
+		log = zerolog.Ctx(ctx).With().
+			Str("src", src).
+			Logger()
+	}
+
+	if res, err := db.Transact(func(txn fdb.Transaction) (any, error) {
+		log.Trace().Msg("Start write transaction")
+		start := time.Now()
+		res, err := fn(txn)
+		log.Trace().
+			Err(err).
+			Str("duration", time.Since(start).String()).
+			Int64("size", txn.GetApproximateSize().MustGet()).
+			Msg("End write transaction")
+		return res, err
+	}); err != nil {
+		var res T // return empty T
+		return res, err
+	} else {
+		return res.(T), nil
+	}
+}
+
+func DoWriteTransactionWithVersion[T any](
 	ctx context.Context,
 	db fdb.Database,
 	fn func(txn fdb.Transaction) (T, error),
@@ -105,7 +148,7 @@ func DoWriteTransaction[T any](
 			// the transaction. Means we have a hard insert limit batch size of 65533 per txn. We
 			// minus one so we can use this value as a "from" which should not include itself, we
 			// add one to the UserVersion at query location to achieve this.
-			types.VersionstampToValue(tuple.IncompleteVersionstamp(math.MaxUint16-1)),
+			types.MustVersionstampToBytes(tuple.IncompleteVersionstamp(math.MaxUint16-1)),
 		)
 
 		log.Trace().

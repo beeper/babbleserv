@@ -1,6 +1,7 @@
 package types
 
 import (
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/vmihailenco/msgpack/v5"
 	"maunium.net/go/mautrix/id"
 )
@@ -12,12 +13,10 @@ type Room struct {
 	// Matrix room version
 	Version string `json:"version" msgpack:"ver"`
 
-	CurrentDepth int64 `msgpack:"dpt"`
-
-	Name      string `json:"name" msgpack:"nme"`
-	Type      string `json:"type"`
-	Topic     string `json:"topic" msgpack:"tpc"`
-	AvatarURL string `json:"avatar_url" msgpack:"aul"`
+	Name      string `msgpack:"nme" json:"name" `
+	Type      string `msgpack:"typ" json:"type"`
+	Topic     string `msgpack:"tpc" json:"topic"`
+	AvatarURL string `msgpack:"aul" json:"avatar_url"`
 
 	CanonicalAlias string `json:"canonical_alias" msgpack:"cas"`
 
@@ -50,4 +49,16 @@ func (r *Room) ToMsgpack() []byte {
 	} else {
 		return b
 	}
+}
+
+func RoomDepthToBytes(depth int64) []byte {
+	return tuple.Tuple{depth}.Pack()
+}
+
+func BytesToRoomDepth(b []byte) int64 {
+	if len(b) == 0 {
+		return 0
+	}
+	tup, _ := tuple.Unpack(b)
+	return tup[0].(int64)
 }

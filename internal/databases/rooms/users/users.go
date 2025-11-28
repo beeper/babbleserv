@@ -7,6 +7,8 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 type UsersDirectory struct {
@@ -17,6 +19,9 @@ type UsersDirectory struct {
 	memberships,
 	membershipChanges,
 	outlierMemberships subspace.Subspace
+
+	// UserID/DeviceID/ConnID/RoomID to rooms versions (events-vstamp, receipts-vstamp)
+	deviceConnRoomPositions subspace.Subspace
 }
 
 func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *UsersDirectory {
@@ -44,25 +49,33 @@ func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directo
 	}
 }
 
-func (u *UsersDirectory) KeyForUserProfile(userID id.UserID) fdb.Key {
+func (u *UsersDirectory) KeyForProfile(userID id.UserID) fdb.Key {
 	return u.profiles.Pack(tuple.Tuple{userID.String()})
 }
 
 // User memberships (user_id, room_id) -> membership
 //
 
-func (u *UsersDirectory) KeyForUserMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
+func (u *UsersDirectory) KeyForMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
 	return u.memberships.Pack(tuple.Tuple{userID.String(), roomID.String()})
 }
 
-func (u *UsersDirectory) RangeForUserMemberships(userID id.UserID) fdb.Range {
+func (u *UsersDirectory) RangeForMemberships(userID id.UserID) fdb.Range {
 	return u.memberships.Sub(userID.String())
 }
 
 // User membership changes (user_id, version) -> (room_id, membership)
 //
 
-func (u *UsersDirectory) KeyForUserMembershipChange(userID id.UserID, version tuple.Versionstamp) fdb.Key {
+func (u *UsersDirectory) KeyToMembershipChangeVersion(key fdb.Key) tuple.Versionstamp {
+	tup, err := u.membershipChanges.Unpack(key)
+	if err != nil {
+		panic(err)
+	}
+	return tup[1].(tuple.Versionstamp)
+}
+
+func (u *UsersDirectory) KeyForMembershipChange(userID id.UserID, version tuple.Versionstamp) fdb.Key {
 	key, err := u.membershipChanges.PackWithVersionstamp(tuple.Tuple{
 		userID.String(), version,
 	})
@@ -72,13 +85,20 @@ func (u *UsersDirectory) KeyForUserMembershipChange(userID id.UserID, version tu
 	return key
 }
 
+func (u *UsersDirectory) RangeForMembershipChanges(
+	userID id.UserID,
+	fromVersion, toVersion tuple.Versionstamp,
+) fdb.Range {
+	return types.GetVersionRange(u.membershipChanges, fromVersion, toVersion, userID.String())
+}
+
 // User outlier memberships (user_id, room_id) -> event_id
 //
 
-func (u *UsersDirectory) KeyForUserOutlierMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
+func (u *UsersDirectory) KeyForOutlierMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
 	return u.outlierMemberships.Pack(tuple.Tuple{userID.String(), roomID.String()})
 }
 
-func (u *UsersDirectory) RangeForUserOutlierMemberships(userID id.UserID) fdb.Range {
+func (u *UsersDirectory) RangeForOutlierMemberships(userID id.UserID) fdb.Range {
 	return u.outlierMemberships.Sub(userID.String())
 }

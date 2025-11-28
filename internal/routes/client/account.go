@@ -8,6 +8,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
@@ -18,6 +19,15 @@ func (c *ClientRoutes) GetLogin(w http.ResponseWriter, r *http.Request) {
 		Flows: []mautrix.LoginFlow{
 			{Type: "m.login.password"},
 		},
+	})
+}
+
+// https://spec.matrix.org/v1.14/client-server-api/#get_matrixclientv3accountwhoami
+func (c *ClientRoutes) GetWhoami(w http.ResponseWriter, r *http.Request) {
+	userDevice := middleware.GetRequestUserDevice(r)
+	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespWhoami{
+		UserID:   userDevice.UserID,
+		DeviceID: userDevice.DeviceID,
 	})
 }
 

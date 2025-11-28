@@ -1,6 +1,8 @@
 package events
 
 import (
+	"fmt"
+
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"maunium.net/go/mautrix/id"
 
@@ -14,44 +16,48 @@ func (e *EventsDirectory) TxnGetAuthChainForEvents(
 	evs []*types.Event,
 	eventsProvider *TxnEventsProvider,
 ) ([]*types.Event, error) {
-	eventIDToFut := make(map[id.EventID]fdb.FutureByteSlice, len(evs))
+	eventIDsToFetch := make(map[id.EventID]struct{}, len(evs))
 	authEvs := make(map[id.EventID]*types.Event, len(evs))
 
 	// Start fetching each direct auth event from each input event
 	for _, reqEv := range evs {
 		for _, evID := range reqEv.AuthEventIDs {
-			if _, found := eventIDToFut[evID]; !found {
-				eventIDToFut[evID] = eventsProvider.WillGet(evID)
+			if _, found := eventIDsToFetch[evID]; !found {
+				eventsProvider.WillGet(evID)
+				eventIDsToFetch[evID] = struct{}{}
 			}
 		}
 	}
 
 	for {
 		// Exit once we've no more futures to process
-		if len(eventIDToFut) == 0 {
+		if len(eventIDsToFetch) == 0 {
 			break
 		}
 
-		for evID := range eventIDToFut {
+		for evID := range eventIDsToFetch {
 			ev, err := eventsProvider.Get(evID)
 			if err != nil {
 				return nil, err
+			} else if ev == nil {
+				return nil, fmt.Errorf("failed to get auth chain: %w: %s", types.ErrEventNotFound, evID)
 			}
 
 			// Add to fetched, remove from futures
 			authEvs[evID] = ev
-			delete(eventIDToFut, evID)
+			delete(eventIDsToFetch, evID)
 
 			// Now loop through the auth events auth events, if we're not fetching
 			// or have fetched it, start fetching it in another future and continue.
 			for _, evID := range ev.AuthEventIDs {
-				if _, found := eventIDToFut[evID]; found {
+				if _, found := eventIDsToFetch[evID]; found {
 					continue
 				}
 				if _, found := authEvs[evID]; found {
 					continue
 				}
-				eventIDToFut[evID] = eventsProvider.WillGet(evID)
+				eventsProvider.WillGet(evID)
+				eventIDsToFetch[evID] = struct{}{}
 			}
 		}
 	}

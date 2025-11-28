@@ -21,15 +21,15 @@ func TestVersionstamp(t *testing.T) {
 	incompleteVersion := tuple.IncompleteVersionstamp(1)
 
 	// Check we can do version -> bytes -> same version
-	b := types.VersionstampToValue(incompleteVersion)
-	versionFromBytes, err := types.ValueToVersionstamp(b)
+	b := types.VersionstampToBytes(incompleteVersion)
+	versionFromBytes, err := types.BytesToVersionstamp(b)
 	require.NoError(t, err, string(b))
 	assert.Equal(t, incompleteVersion, versionFromBytes)
 
 	// Now check we can put it through base64 and still get the same result
 	b, err = util.Base64Decode(util.Base64Encode(b))
 	require.NoError(t, err)
-	versionFromBytes, err = types.ValueToVersionstamp(b)
+	versionFromBytes, err = types.BytesToVersionstamp(b)
 	require.NoError(t, err)
 	assert.Equal(t, incompleteVersion, versionFromBytes)
 }
@@ -56,14 +56,17 @@ func TestVersionMap(t *testing.T) {
 	assert.Equal(t, incompleteVersionstamp, newVersions[types.RoomsVersionKey])
 	assert.Equal(t, otherVersionstamp, newVersions[types.AccountsVersionKey])
 
-	// Check that our custom encoding using bytes (vs. reflection on vstamp struct fields)
+	// Check that our custom msgpack encoding using bytes (vs. reflection on vstamp struct fields)
 	rawMap := map[string][]byte{
-		string(types.RoomsVersionKey):    types.VersionstampToValue(incompleteVersionstamp),
-		string(types.AccountsVersionKey): types.VersionstampToValue(otherVersionstamp),
+		string(types.RoomsVersionKey):    types.VersionstampToBytes(incompleteVersionstamp),
+		string(types.AccountsVersionKey): types.VersionstampToBytes(otherVersionstamp),
 	}
 	rawB, err := msgpack.Marshal(rawMap)
 	require.NoError(t, err)
-	assert.Equal(t, b, rawB)
+	var rawMapDecoded map[string][]byte
+	err = msgpack.Unmarshal(rawB, &rawMapDecoded)
+	require.NoError(t, err)
+	assert.Equal(t, rawMap[string(types.RoomsVersionKey)], rawMapDecoded[string(types.RoomsVersionKey)])
 
 	// Check that we can unmarshal into a partially filled map without clobbering it
 	partialVersions := types.VersionMap{

@@ -11,7 +11,6 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/elastic/go-freelru"
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -19,7 +18,7 @@ import (
 
 var errIsLocked = errors.New("lock is locked")
 
-type lockingDatabase interface {
+type LockingDatabase interface {
 	GetLockPrimitives() (fdb.Database, subspace.Subspace)
 }
 
@@ -36,18 +35,11 @@ type Lock struct {
 
 func WithLockIfAvailable(
 	ctx context.Context,
-	database lockingDatabase,
+	database LockingDatabase,
 	name string,
 	options LockOptions,
-	cache *freelru.LRU[string, string],
 	handler func(Lock),
 ) (bool, error) {
-	if cache != nil {
-		if _, found := cache.Get(name); found {
-			return false, nil
-		}
-	}
-
 	token, err := acquireLockOnce(ctx, database, name, options)
 	if err == errIsLocked {
 		return false, nil
@@ -55,18 +47,12 @@ func WithLockIfAvailable(
 		return false, err
 	}
 	handler(makeLock(ctx, database, name, options, token))
-
-	if cache != nil {
-		// Cache the lock for 75% of the timeout
-		cache.AddWithLifetime(name, "", options.Timeout*(3/4))
-	}
-
 	return true, nil
 }
 
 func WithLock(
 	ctx context.Context,
-	database lockingDatabase,
+	database LockingDatabase,
 	name string,
 	options LockOptions,
 	handler func(Lock),
@@ -83,7 +69,7 @@ func WithLock(
 
 func GetLock(
 	ctx context.Context,
-	database lockingDatabase,
+	database LockingDatabase,
 	name string,
 	options LockOptions,
 ) *Lock {
@@ -98,7 +84,7 @@ func GetLock(
 	return &lock
 }
 
-func acquireLock(ctx context.Context, database lockingDatabase, name string, options LockOptions) []byte {
+func acquireLock(ctx context.Context, database LockingDatabase, name string, options LockOptions) []byte {
 	log := zerolog.Ctx(ctx).With().Str("name", name).Logger()
 	log.Debug().Msg("Acquiring lock...")
 
@@ -123,7 +109,7 @@ func acquireLock(ctx context.Context, database lockingDatabase, name string, opt
 	}
 }
 
-func acquireLockOnce(ctx context.Context, database lockingDatabase, name string, options LockOptions) ([]byte, error) {
+func acquireLockOnce(ctx context.Context, database LockingDatabase, name string, options LockOptions) ([]byte, error) {
 	zerolog.Ctx(ctx).Trace().Str("name", name).Msg("Attempting to acquire lock...")
 
 	db, prefix := database.GetLockPrimitives()
@@ -144,7 +130,7 @@ func acquireLockOnce(ctx context.Context, database lockingDatabase, name string,
 
 func makeLock(
 	ctx context.Context,
-	database lockingDatabase,
+	database LockingDatabase,
 	name string,
 	options LockOptions,
 	token []byte,
@@ -237,7 +223,7 @@ func txnCreateLock(txn fdb.Transaction, prefix subspace.Subspace, name string, t
 	// Create the lock with the versionstamp as the fencing token
 	txn.SetVersionstampedValue(
 		keyForLock(prefix, name),
-		types.VersionstampToValue(tuple.IncompleteVersionstamp(0)),
+		types.MustVersionstampToBytes(tuple.IncompleteVersionstamp(0)),
 	)
 
 	// Set the hostname (purely for informational display)

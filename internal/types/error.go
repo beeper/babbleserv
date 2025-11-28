@@ -13,4 +13,6 @@ var (
 	ErrUserAlreadyExists = errors.New("username already exists")
 	ErrProfileNotChanged = errors.New("profile is unchanged")
 	ErrInvalidPassword   = errors.New("invalid password")
+
+	ErrRoomNotFound = errors.New("room not found")
 )

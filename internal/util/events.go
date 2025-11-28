@@ -15,6 +15,26 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
+func EventForClientAPI(ev *types.Event) *types.Event {
+	ev.IsForClientAPI = true
+	return ev
+}
+
+func EventsForClientAPI(evs []*types.Event) []*types.Event {
+	for _, ev := range evs {
+		ev.IsForClientAPI = true
+	}
+	return evs
+}
+
+func EventsToPartialEvents(evs []*types.Event) []*types.PartialEvent {
+	partEvs := make([]*types.PartialEvent, len(evs))
+	for i, ev := range evs {
+		partEvs[i] = &ev.PartialEvent
+	}
+	return partEvs
+}
+
 func SortEventList(evs []*types.Event) {
 	slices.SortFunc(evs, func(a, b *types.Event) int {
 		// TODO: this is probably not enough
@@ -28,30 +48,22 @@ func SortEventList(evs []*types.Event) {
 	})
 }
 
-func EventsToClientEvents(evs []*types.Event) []types.ClientEvent {
-	cevs := make([]types.ClientEvent, 0, len(evs))
-	for _, ev := range evs {
-		cevs = append(cevs, ev.ClientEvent())
-	}
-	return cevs
-}
-
 func EventsToPDUs(evs []*types.Event) []gomatrixserverlib.PDU {
-	pdus := make([]gomatrixserverlib.PDU, 0, len(evs))
-	for _, ev := range evs {
-		pdus = append(pdus, ev.PDU())
+	pdus := make([]gomatrixserverlib.PDU, len(evs))
+	for i, ev := range evs {
+		pdus[i] = ev.PDU()
 	}
 	return pdus
 }
 
 func EventsToJSONs(evs []*types.Event) []json.RawMessage {
-	jsons := make([]json.RawMessage, 0, len(evs))
-	for _, ev := range evs {
-		json, err := ev.MarshalJSON()
+	jsons := make([]json.RawMessage, len(evs))
+	for i, ev := range evs {
+		json, err := json.Marshal(ev)
 		if err != nil {
 			panic(err)
 		}
-		jsons = append(jsons, json)
+		jsons[i] = json
 	}
 	return jsons
 }
@@ -185,7 +197,7 @@ func GetRefHashForRedactedBytes(b []byte, roomVersion gomatrixserverlib.RoomVers
 
 	switch eventFormat {
 	case gomatrixserverlib.EventFormatV1:
-		panic("this server does not support creating events using format v1")
+		return "", gomatrixserverlib.UnsupportedRoomVersionError{Version: roomVersion}
 	case gomatrixserverlib.EventFormatV2:
 		switch eventIDFormat {
 		case gomatrixserverlib.EventIDFormatV2:
@@ -212,12 +224,15 @@ func HashAndSignEvent(ev *types.Event, serverName, keyID string, key ed25519.Pri
 
 	// Calculate the signature & ID/reference hash
 	signature, refHash, err := GetEventSignatureAndRefrerenceHash(ev, key)
+	if err != nil {
+		return err
+	}
 	ev.Signatures = map[string]map[string]string{
 		serverName: {
 			keyID: signature,
 		},
 	}
-	ev.ID = refHash
+	ev.ClientEvent.ID = refHash
 
 	return nil
 }

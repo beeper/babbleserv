@@ -12,22 +12,6 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func Base64Encode(b []byte) string {
-	return base64.RawStdEncoding.EncodeToString(b)
-}
-
-func Base64Decode(s string) ([]byte, error) {
-	return base64.RawStdEncoding.DecodeString(s)
-}
-
-func Base64EncodeURLSafe(b []byte) string {
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func Base64DecodeURLSafe(s string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(s)
-}
-
 func GetJSONSignature(b []byte, key ed25519.PrivateKey) (string, error) {
 	var err error
 	if b, err = sjson.DeleteBytes(b, "signatures"); err != nil {

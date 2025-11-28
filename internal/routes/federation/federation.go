@@ -70,8 +70,14 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 		rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
 
 		rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
+
 		rtr.MethodFunc(http.MethodGet, "/v1/make_join/{roomID}/{userID}", requireServerAuth(f.MakeJoin))
+		rtr.MethodFunc(http.MethodGet, "/v1/make_leave/{roomID}/{userID}", requireServerAuth(f.MakeLeave))
+		rtr.MethodFunc(http.MethodGet, "/v1/make_knock/{roomID}/{userID}", requireServerAuth(f.MakeKnock))
+
 		rtr.MethodFunc(http.MethodPut, "/v2/send_join/{roomID}/{eventID}", requireServerAuth(f.SendJoin))
+		rtr.MethodFunc(http.MethodPut, "/v2/send_leave/{roomID}/{eventID}", requireServerAuth(f.SendLeave))
+		rtr.MethodFunc(http.MethodPut, "/v1/send_knock/{roomID}/{eventID}", requireServerAuth(f.SendKnock))
 	}
 
 	if f.config.Accounts.Enabled {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/xid"
@@ -43,18 +44,34 @@ type Change struct {
 	Servers  []string     `msgpack:"s,omitempty"`
 }
 
-// The notifier allows components to subscribe to and receive change notifications
-// from each other, both within a single Babbleserv process and across multiple
-// as changes as propagated over Redis pubsub.
+func (c Change) MarshalZerologObject(ev *zerolog.Event) {
+	for _, eventID := range c.EventIDs {
+		ev.Str("even_id", eventID.String())
+	}
+	for _, roomID := range c.RoomIDs {
+		ev.Str("room_id", roomID.String())
+	}
+	for _, userID := range c.UserIDs {
+		ev.Str("user_id", userID.String())
+	}
+	for _, serverName := range c.Servers {
+		ev.Str("server", serverName)
+	}
+}
+
+// The notifier allows components to subscribe to and receive change notifications from each other,
+// both within a single Babbleserv process and across multiple as changes as propagated over Redis
+// pubsub. Pubsub means some updates might get missed, but it shouldn't have major impact.
 type Notifier struct {
 	log zerolog.Logger
 
 	redis        *redis.Client
+	redisPubSub  *redis.PubSub
 	redisChannel string
 	instanceID   string
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	wg        sync.WaitGroup
+	cancelCtx context.CancelFunc
 
 	// Subscribe/unsubscribe channels
 	subscribeCh   chan subscription
@@ -111,14 +128,30 @@ func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) 
 
 func (n *Notifier) Start() {
 	n.log.Info().Msg("Starting notifier...")
-	n.ctx, n.cancel = context.WithCancel(n.log.WithContext(context.Background()))
-	go n.internalLoop()
-	go n.redisLoop()
+
+	ctx, cancel := context.WithCancel(n.log.WithContext(context.Background()))
+	n.cancelCtx = cancel
+
+	n.wg.Add(1)
+	go func() {
+		n.internalLoop(ctx)
+		n.wg.Done()
+	}()
+
+	n.wg.Add(1)
+	go func() {
+		n.redisLoop(ctx)
+		n.wg.Done()
+	}()
 }
 
 func (n *Notifier) Stop() {
 	n.log.Info().Msg("Stopping notifier...")
-	n.cancel()
+	n.cancelCtx()
+	if n.redisPubSub != nil {
+		n.redisPubSub.Close()
+	}
+	n.wg.Wait()
 }
 
 // Subscribe for notifier changes, which will be sent to the channel provided,
@@ -135,8 +168,9 @@ func (n *Notifier) Unsubscribe(ch chan any) {
 
 func (n *Notifier) SendChange(change Change) {
 	n.log.Trace().Any("change", change).Msg("Sending change")
-	go n.sendRedisChange(change)
 	n.sendInternalChange(change)
+	// Fire of the Redis change asynchronously, as pubsub is best-effort + unordered
+	go n.sendRedisChange(n.log.WithContext(context.Background()), change)
 }
 
 func (n *Notifier) sendInternalChange(change Change) {
@@ -154,22 +188,22 @@ func (n *Notifier) sendInternalChange(change Change) {
 	}
 }
 
-func (n *Notifier) sendRedisChange(change Change) {
+func (n *Notifier) sendRedisChange(ctx context.Context, change Change) {
 	change.InstanceID = n.instanceID
 	data, err := msgpack.Marshal(change)
 	if err != nil {
 		panic(fmt.Errorf("failed to msgpack change: %w", err))
 	}
-	if err := n.redis.Publish(n.ctx, n.redisChannel, data).Err(); err != nil {
+	if err := n.redis.Publish(ctx, n.redisChannel, data).Err(); err != nil {
 		n.log.Err(err).Msg("Failed to publish Redis message")
 	}
 }
 
-func (n *Notifier) redisLoop() {
-	pubsub := n.redis.Subscribe(n.ctx, n.redisChannel)
-	defer pubsub.Close()
+func (n *Notifier) redisLoop(ctx context.Context) {
+	n.redisPubSub = n.redis.Subscribe(ctx, n.redisChannel)
+	defer n.redisPubSub.Close()
 
-	for msg := range pubsub.Channel() {
+	for msg := range n.redisPubSub.Channel() {
 		var change Change
 		if err := msgpack.Unmarshal([]byte(msg.Payload), &change); err != nil {
 			n.log.Err(err).Str("payload", msg.Payload).Msg("Invalid msgpack data over pubsub")
@@ -183,10 +217,10 @@ func (n *Notifier) redisLoop() {
 	}
 }
 
-func (n *Notifier) internalLoop() {
+func (n *Notifier) internalLoop(ctx context.Context) {
 	for {
 		select {
-		case <-n.ctx.Done():
+		case <-ctx.Done():
 			return
 		// Handle subscription/unsubscription
 		case sub := <-n.subscribeCh:

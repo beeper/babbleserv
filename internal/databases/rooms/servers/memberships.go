@@ -2,7 +2,6 @@ package servers
 
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -13,7 +12,7 @@ func (s *ServersDirectory) TxnIsServerInRoom(
 	serverName string,
 	roomID id.RoomID,
 ) (bool, error) {
-	if value, err := txn.Get(s.KeyForServerMembership(serverName, roomID)).Get(); err != nil {
+	if value, err := txn.Get(s.KeyForMembership(serverName, roomID)).Get(); err != nil {
 		return false, err
 	} else {
 		return value != nil, nil
@@ -37,7 +36,7 @@ func (s *ServersDirectory) TxnLookupServerMemberships(
 	serverName string,
 ) (types.Memberships, error) {
 	iter := txn.GetRange(
-		s.RangeForServerMemberships(serverName),
+		s.RangeForMemberships(serverName),
 		fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		},
@@ -49,7 +48,7 @@ func (s *ServersDirectory) TxnLookupServerMemberships(
 		if err != nil {
 			return nil, err
 		}
-		membershipTup := types.ValueToMembershipTup(kv.Value)
+		membershipTup := types.BytesToMembershipTup(kv.Value)
 		memberships[membershipTup.RoomID] = membershipTup
 	}
 
@@ -59,7 +58,26 @@ func (s *ServersDirectory) TxnLookupServerMemberships(
 func (s *ServersDirectory) TxnLookupServerMembershipChanges(
 	txn fdb.ReadTransaction,
 	serverName string,
-	fromVersion, toVersion tuple.Versionstamp,
+	options types.PaginationOptions,
 ) (types.MembershipChanges, error) {
-	return nil, nil
+	iter := txn.GetRange(
+		s.RangeForMembershipChanges(serverName, options.From, options.To),
+		options.RangeOptions(),
+	).Iterator()
+
+	changes := make(types.MembershipChanges, 0)
+	for iter.Advance() {
+		kv, err := iter.Get()
+		if err != nil {
+			return nil, err
+		}
+		membershipTup := types.BytesToMembershipTup(kv.Value)
+		version := s.KeyToMembershipChangeVersion(kv.Key)
+		changes = append(changes, types.MembershipTupWithVersion{
+			MembershipTup: membershipTup,
+			Version:       version,
+		})
+	}
+
+	return changes, nil
 }

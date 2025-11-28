@@ -4,14 +4,13 @@ package rooms
 
 import (
 	"context"
-	"crypto/md5"
+	"fmt"
 	"sync"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
 	"maunium.net/go/mautrix/id"
@@ -29,30 +28,27 @@ import (
 const API_VERSION = 710
 
 type RoomsDatabase struct {
-	backgroundWg sync.WaitGroup
-
-	log       zerolog.Logger
-	db        fdb.Database
-	config    config.BabbleConfig
-	notifiers *notifier.Notifiers
+	log      zerolog.Logger
+	db       fdb.Database
+	config   config.BabbleConfig
+	notifier *notifier.Notifier
 
 	events   *events.EventsDirectory
 	users    *users.UsersDirectory
 	servers  *servers.ServersDirectory
 	receipts *receipts.ReceiptsDirectory
 
-	root  subspace.Subspace
-	locks subspace.Subspace
+	// Room ID to bytes we decode to `*types.Room` items
+	idToRoom subspace.Subspace
 
-	byID,
-	byAlias,
-	byPublic,
+	// Room ID to depth int64
 	idToDepth subspace.Subspace
 
-	// The super stream combines, by room, events and receipts
-	superStream,
-	localSuperStream,
-	superStreamReceiptVersions subspace.Subspace
+	// Room ID to tuple.Versionstamp of the most recent receipt or event in the room
+	idToVersion subspace.Subspace
+
+	// Aliases to room IDs
+	aliasToID subspace.Subspace
 
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
@@ -62,7 +58,7 @@ type RoomsDatabase struct {
 func NewRoomsDatabase(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
-	notifiers *notifier.Notifiers,
+	notifier *notifier.Notifier,
 ) *RoomsDatabase {
 	log := logger.With().
 		Str("database", "rooms").
@@ -70,9 +66,9 @@ func NewRoomsDatabase(
 
 	fdb.MustAPIVersion(API_VERSION)
 	db := fdb.MustOpenDatabase(cfg.Rooms.Database.ClusterFilePath)
-	log.Debug().
+	log.Info().
 		Str("cluster_file", cfg.Rooms.Database.ClusterFilePath).
-		Msg("Connected to FoundationDB")
+		Msg("Connecting to FoundationDB")
 
 	db.Options().SetTransactionTimeout(cfg.Rooms.Database.TransactionTimeout)
 	db.Options().SetTransactionRetryLimit(cfg.Rooms.Database.TransactionRetryLimit)
@@ -87,36 +83,25 @@ func NewRoomsDatabase(
 		Msg("Init rooms directory")
 
 	return &RoomsDatabase{
-		log:       log,
-		db:        db,
-		config:    cfg,
-		notifiers: notifiers,
-
-		root:  roomsDir,
-		locks: roomsDir.Sub("lck"),
+		log:      log,
+		db:       db,
+		config:   cfg,
+		notifier: notifier,
 
 		events:   events.NewEventsDirectory(log, db, roomsDir),
 		users:    users.NewUsersDirectory(log, db, roomsDir),
 		servers:  servers.NewServersDirectory(log, db, roomsDir),
 		receipts: receipts.NewReceiptsDirectory(log, db, roomsDir),
 
-		byID:     roomsDir.Sub("id"),
-		byAlias:  roomsDir.Sub("as"),
-		byPublic: roomsDir.Sub("pb"),
+		idToRoom:    roomsDir.Sub("id"),
+		idToDepth:   roomsDir.Sub("idd"),
+		idToVersion: roomsDir.Sub("iev"),
 
-		superStream:                roomsDir.Sub("ss"),
-		localSuperStream:           roomsDir.Sub("ls"),
-		superStreamReceiptVersions: roomsDir.Sub("ssrv"), // superstream receipt versions by user/room/type
+		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
 	}
 }
 
 func (r *RoomsDatabase) Stop() {
-	r.log.Debug().Msg("Waiting for any background jobs to complete...")
-	r.backgroundWg.Wait()
-}
-
-func (r *RoomsDatabase) GetLockPrimitives() (fdb.Database, subspace.Subspace) {
-	return r.db, r.locks
 }
 
 func (r *RoomsDatabase) getTxnLogContext(ctx context.Context, name string) zerolog.Context {
@@ -126,13 +111,22 @@ func (r *RoomsDatabase) getTxnLogContext(ctx context.Context, name string) zerol
 		Str("transaction", name)
 }
 
-func (r *RoomsDatabase) GenerateRoomID() id.RoomID {
-	// RoomID's don't need to be cryptographically secure, so we use xid, but
-	// to make them easier to identify (clearly distinct strings) we md5 the
-	// xid and base64 the result.
-	sum := md5.Sum([]byte(xid.New().Bytes()))
-	rid := util.Base64EncodeURLSafe(sum[:])
-	return id.RoomID("!" + rid + ":" + r.config.ServerName)
+func (r *RoomsDatabase) GenerateRoomID(ctx context.Context) id.RoomID {
+	for {
+		rid := util.GenerateRandomStringBase32Hex(16)
+		roomID := id.RoomID("!" + rid + ":" + r.config.ServerName)
+
+		// Extremely unlikely but check the room ID isn't taken, the chance of this is incredibly
+		// small but nice to be sure.
+		if existing, err := r.GetRoom(ctx, roomID); err != nil {
+			panic(fmt.Errorf("failed to check for existing room: %w", err))
+		} else if existing != nil {
+			zerolog.Ctx(ctx).Warn().Stringer("room_id", roomID).Msg("Generated duplicate roomID!")
+			continue
+		}
+
+		return roomID
+	}
 }
 
 func (r *RoomsDatabase) GetRoom(ctx context.Context, roomID id.RoomID) (*types.Room, error) {
@@ -154,31 +148,13 @@ func (r *RoomsDatabase) GetRoomCurrentExtremEventIDs(ctx context.Context, roomID
 }
 
 func (r *RoomsDatabase) KeyForRoom(roomID id.RoomID) fdb.Key {
-	return r.byID.Pack(tuple.Tuple{roomID.String()})
+	return r.idToRoom.Pack(tuple.Tuple{roomID.String()})
 }
 
-func (r *RoomsDatabase) KeyForIDToDepth(roomID id.RoomID) fdb.Key {
+func (r *RoomsDatabase) KeyForRoomVersion(roomID id.RoomID) fdb.Key {
+	return r.idToVersion.Pack(tuple.Tuple{roomID.String()})
+}
+
+func (r *RoomsDatabase) KeyForRoomDepth(roomID id.RoomID) fdb.Key {
 	return r.idToDepth.Pack(tuple.Tuple{roomID.String()})
-}
-
-func (r *RoomsDatabase) KeyForRoomSuperStreamVersion(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
-	if key, err := r.superStream.PackWithVersionstamp(tuple.Tuple{
-		roomID.String(), version,
-	}); err != nil {
-		panic(err)
-	} else {
-		return key
-	}
-}
-
-func (r *RoomsDatabase) KeyToRoomSuperStreamVersion(key fdb.Key) tuple.Versionstamp {
-	tup, _ := r.superStream.Unpack(key)
-	return tup[1].(tuple.Versionstamp)
-}
-
-func (r *RoomsDatabase) RangeForRoomSuperStream(
-	roomID id.RoomID,
-	fromVersion, toVersion tuple.Versionstamp,
-) fdb.Range {
-	return types.GetVersionRange(r.superStream, fromVersion, toVersion, roomID.String())
 }

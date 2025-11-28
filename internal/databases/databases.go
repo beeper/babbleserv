@@ -16,6 +16,7 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/accounts"
 	"github.com/beeper/babbleserv/internal/databases/media"
 	"github.com/beeper/babbleserv/internal/databases/rooms"
+	"github.com/beeper/babbleserv/internal/databases/system"
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/notifier"
 )
@@ -27,6 +28,7 @@ type Databases struct {
 	Accounts  *accounts.AccountsDatabase
 	Transient *transient.TransientDatabase
 	Media     *media.MediaDatabase
+	System    *system.SystemDatabase
 }
 
 func NewDatabases(
@@ -38,16 +40,20 @@ func NewDatabases(
 		Str("component", "databases").
 		Logger()
 
-	dbs := Databases{log: log}
+	dbs := Databases{
+		log: log,
+
+		System: system.NewSystemDatabase(cfg, log),
+	}
 
 	if cfg.Rooms.Enabled {
-		dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers)
+		dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers.Rooms)
 	}
 	if cfg.Accounts.Enabled {
 		dbs.Accounts = accounts.NewAccountsDatabase(cfg, log)
 	}
 	if cfg.Transient.Enabled {
-		dbs.Transient = transient.NewTransientDatabase(cfg, log)
+		dbs.Transient = transient.NewTransientDatabase(cfg, log, notifiers.Transient)
 	}
 	if cfg.Media.Enabled {
 		dbs.Media = media.NewMediaDatabase(cfg, log)

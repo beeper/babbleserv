@@ -2,6 +2,7 @@ package client
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
@@ -19,11 +20,13 @@ func (c *ClientRoutes) SendRoomReadReceipt(w http.ResponseWriter, r *http.Reques
 	receiptType := chi.URLParam(r, "receiptType")
 
 	rc := types.Receipt{
-		UserID:  middleware.GetRequestUserID(r),
-		RoomID:  roomID,
-		Type:    event.ReceiptType(receiptType),
-		EventID: eventID,
-		// TODO: data
+		ReceiptTup: types.ReceiptTup{
+			UserID: middleware.GetRequestUserID(r),
+			RoomID: roomID,
+			Type:   event.ReceiptType(receiptType),
+		},
+		EventID:   eventID,
+		Timestamp: time.Now().UTC().UnixMilli(),
 	}
 
 	if res, err := c.db.Rooms.SendReceipts(r.Context(), roomID, []*types.Receipt{&rc}); err != nil {
@@ -33,10 +36,9 @@ func (c *ClientRoutes) SendRoomReadReceipt(w http.ResponseWriter, r *http.Reques
 		err := res.Rejected[0].Error
 		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
 		return
-	} else {
-		util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
-		return
 	}
+
+	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidread_markers

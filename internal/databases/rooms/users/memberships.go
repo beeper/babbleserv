@@ -2,34 +2,33 @@ package users
 
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-func (u *UsersDirectory) TxnIsUserInRoom(
+func (u *UsersDirectory) TxnIsUserJoinedRoom(
 	txn fdb.ReadTransaction,
 	userID id.UserID,
 	roomID id.RoomID,
 ) (bool, error) {
-	value, err := txn.Get(u.KeyForUserMembership(userID, roomID)).Get()
+	value, err := txn.Get(u.KeyForMembership(userID, roomID)).Get()
 	if err != nil {
 		return false, err
 	} else if value == nil {
 		return false, nil
 	}
-	membershipTup := types.ValueToMembershipTup(value)
+	membershipTup := types.BytesToMembershipTup(value)
 	return membershipTup.Membership == event.MembershipJoin, nil
 }
 
-func (u *UsersDirectory) TxnMustIsUserInRoom(
+func (u *UsersDirectory) TxnMustIsUserJoinedRoom(
 	txn fdb.ReadTransaction,
 	userID id.UserID,
 	roomID id.RoomID,
 ) bool {
-	if ret, err := u.TxnIsUserInRoom(txn, userID, roomID); err != nil {
+	if ret, err := u.TxnIsUserJoinedRoom(txn, userID, roomID); err != nil {
 		panic(err)
 	} else {
 		return ret
@@ -41,7 +40,7 @@ func (u *UsersDirectory) TxnLookupUserMemberships(
 	userID id.UserID,
 ) (types.Memberships, error) {
 	iter := txn.GetRange(
-		u.RangeForUserMemberships(userID),
+		u.RangeForMemberships(userID),
 		fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		},
@@ -53,7 +52,7 @@ func (u *UsersDirectory) TxnLookupUserMemberships(
 		if err != nil {
 			return nil, err
 		}
-		membershipTup := types.ValueToMembershipTup(kv.Value)
+		membershipTup := types.BytesToMembershipTup(kv.Value)
 		memberships[membershipTup.RoomID] = membershipTup
 	}
 
@@ -65,7 +64,7 @@ func (u *UsersDirectory) TxnLookupUserOutlierMemberships(
 	userID id.UserID,
 ) (types.Memberships, error) {
 	iter := txn.GetRange(
-		u.RangeForUserOutlierMemberships(userID),
+		u.RangeForOutlierMemberships(userID),
 		fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		},
@@ -77,7 +76,7 @@ func (u *UsersDirectory) TxnLookupUserOutlierMemberships(
 		if err != nil {
 			return nil, err
 		}
-		membershipTup := types.ValueToMembershipTup(kv.Value)
+		membershipTup := types.BytesToMembershipTup(kv.Value)
 		memberships[membershipTup.RoomID] = membershipTup
 	}
 
@@ -87,7 +86,26 @@ func (u *UsersDirectory) TxnLookupUserOutlierMemberships(
 func (u *UsersDirectory) TxnLookupUserMembershipChanges(
 	txn fdb.ReadTransaction,
 	userID id.UserID,
-	fromVersion, toVersion tuple.Versionstamp,
+	options types.PaginationOptions,
 ) (types.MembershipChanges, error) {
-	return nil, nil
+	iter := txn.GetRange(
+		u.RangeForMembershipChanges(userID, options.From, options.To),
+		options.RangeOptions(),
+	).Iterator()
+
+	changes := make(types.MembershipChanges, 0)
+	for iter.Advance() {
+		kv, err := iter.Get()
+		if err != nil {
+			return nil, err
+		}
+		membershipTup := types.BytesToMembershipTup(kv.Value)
+		version := u.KeyToMembershipChangeVersion(kv.Key)
+		changes = append(changes, types.MembershipTupWithVersion{
+			MembershipTup: membershipTup,
+			Version:       version,
+		})
+	}
+
+	return changes, nil
 }

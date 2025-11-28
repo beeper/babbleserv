@@ -6,9 +6,8 @@ import (
 )
 
 type Device struct {
-	ID id.DeviceID
-
-	DisplayName string
+	ID          id.DeviceID `msgpack:"id"`
+	DisplayName string      `msgpack:"dn"`
 }
 
 func NewDevice(id id.DeviceID, displayName string) *Device {
@@ -18,17 +17,16 @@ func NewDevice(id id.DeviceID, displayName string) *Device {
 	}
 }
 
-func NewDeviceFromBytes(b []byte, id id.DeviceID) (*Device, error) {
+func NewDeviceFromBytes(b []byte) (*Device, error) {
 	var d Device
 	if err := msgpack.Unmarshal(b, &d); err != nil {
 		return nil, err
 	}
-	d.ID = id
 	return &d, nil
 }
 
-func MustNewDeviceFromBytes(b []byte, id id.DeviceID) *Device {
-	if d, err := NewDeviceFromBytes(b, id); err != nil {
+func MustNewDeviceFromBytes(b []byte) *Device {
+	if d, err := NewDeviceFromBytes(b); err != nil {
 		panic(err)
 	} else {
 		return d

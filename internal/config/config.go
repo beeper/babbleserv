@@ -17,6 +17,8 @@ type databaseConfig struct {
 type serverConfig struct {
 	ListenAddr    string   `yaml:"listenAddr"`
 	ServiceGroups []string `yaml:"serviceGroups"`
+	TLSCertPath   string   `yaml:"tlsCertPath"`
+	TLSKeyPath    string   `yaml:"tlsKeyPath"`
 }
 
 type keyConfig struct {
@@ -48,13 +50,13 @@ type BabbleConfig struct {
 		Notifier NotifierConfig `yaml:"notifier"`
 
 		RefreshAccessTokenExpire time.Duration `yaml:"refreshAccessTokenExpire"`
-	}
+	} `yaml:"accounts"`
 
 	Transient struct {
 		Enabled  bool           `yaml:"enabled"`
 		Database databaseConfig `yaml:"database"`
 		Notifier NotifierConfig `yaml:"notifier"`
-	}
+	} `yaml:"transient"`
 
 	Media struct {
 		Enabled             bool                      `yaml:"enabled"`
@@ -62,7 +64,11 @@ type BabbleConfig struct {
 		Notifier            NotifierConfig            `yaml:"notifier"`
 		Datastores          map[string]map[string]any `yaml:"datastores"`
 		PresignedURLTimeout time.Duration             `yaml:"presignedURLTimeout"`
-	}
+	} `yaml:"media"`
+
+	System struct {
+		Database databaseConfig `yaml:"database"`
+	} `yaml:"system"`
 
 	Routes struct {
 		Servers []serverConfig `yaml:"servers"`

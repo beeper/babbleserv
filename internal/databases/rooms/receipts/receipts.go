@@ -6,17 +6,40 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
 type ReceiptsDirectory struct {
-	log zerolog.Logger
-	db  fdb.Database
+	log    zerolog.Logger
+	db     fdb.Database
+	config config.BabbleConfig
 
-	byRoomTypeThread subspace.Subspace
+	// ReceiptTup (user, room, thread, type) to version, used to clear previous keys when new ones are appended.
+	//
+	// key: (UserID, RoomID, Type, ThreadID)
+	// value: tuple.Versionstamp
+	receiptTupToVersion subspace.Subspace
+
+	// Sparse stream of public receipts stored by room/version for pagination
+	//
+	// key: (RoomID, Versionstamp)
+	// value: types.Receipt
+	roomVersionToReceipt subspace.Subspace
+
+	// Sparse stream of public receipts sent by local users, stored by room/version
+	//
+	// key: (RoomID, Versionstamp)
+	// value: types.Receipt
+	localRoomVersionToReceipt subspace.Subspace
+
+	// Sparse stream of private receipts send by local users, stored by user/version
+	//
+	// key: (UserID, Versionstamp)
+	// value: types.Receipt
+	userVersionToReceipt subspace.Subspace
 }
 
 func NewReceiptsDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *ReceiptsDirectory {
@@ -34,57 +57,105 @@ func NewReceiptsDirectory(logger zerolog.Logger, db fdb.Database, parentDir dire
 		log: log,
 		db:  db,
 
-		byRoomTypeThread: receiptsDir.Sub("rt"),
+		receiptTupToVersion:       receiptsDir.Sub("rtv"),
+		roomVersionToReceipt:      receiptsDir.Sub("prv"),
+		localRoomVersionToReceipt: receiptsDir.Sub("lrv"),
+		userVersionToReceipt:      receiptsDir.Sub("puv"),
 	}
 }
 
-func (r *ReceiptsDirectory) KeyValueForReceipt(rc *types.Receipt) fdb.KeyValue {
-	return fdb.KeyValue{
-		Key:   r.byRoomTypeThread.Pack(tuple.Tuple{rc.RoomID.String(), string(rc.Type), rc.ThreadID, rc.UserID.String()}),
-		Value: tuple.Tuple{rc.EventID.String(), rc.Data}.Pack(),
+func (r *ReceiptsDirectory) KeyForReceiptVersion(rc *types.Receipt) fdb.Key {
+	return r.receiptTupToVersion.Pack(tuple.Tuple{
+		rc.UserID.String(),
+		rc.RoomID.String(),
+		string(rc.Type),
+		rc.ThreadID,
+	})
+}
+
+// Room version
+
+func (r *ReceiptsDirectory) KeyToRoomVersion(key fdb.Key) tuple.Versionstamp {
+	tup, err := r.roomVersionToReceipt.Unpack(key)
+	if err != nil {
+		panic(err)
 	}
+	return tup[1].(tuple.Versionstamp)
 }
 
-func (r *ReceiptsDirectory) KeyValueToReceipt(kv fdb.KeyValue) *types.Receipt {
-	keyTup, _ := r.byRoomTypeThread.Unpack(kv.Key)
-	valTup, _ := tuple.Unpack(kv.Value)
-
-	return &types.Receipt{
-		RoomID:   id.RoomID(keyTup[0].(string)),
-		Type:     event.ReceiptType(keyTup[1].(string)),
-		ThreadID: keyTup[2].(string),
-		UserID:   id.UserID(keyTup[3].(string)),
-
-		EventID: id.EventID(valTup[0].(string)),
-		Data:    valTup[1].([]byte),
-	}
-}
-
-func (r *ReceiptsDirectory) rangeForRoomReceipts(roomID id.RoomID, rType event.ReceiptType) fdb.ExactRange {
-	return r.byRoomTypeThread.Sub(roomID.String(), string(rType))
-}
-
-func (r *ReceiptsDirectory) TxnGetCurrentReceiptsForRoom(
-	txn fdb.ReadTransaction,
-	roomID id.RoomID,
-	rType event.ReceiptType,
-) ([]*types.Receipt, error) {
-	iter := txn.GetRange(
-		r.rangeForRoomReceipts(roomID, rType),
-		fdb.RangeOptions{
-			Mode: fdb.StreamingModeWantAll,
-		},
-	).Iterator()
-
-	receipts := make([]*types.Receipt, 0)
-
-	for iter.Advance() {
-		kv, err := iter.Get()
+func (r *ReceiptsDirectory) KeyForRoomVersion(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
+	tup := tuple.Tuple{roomID.String(), version}
+	if types.IsIncompleteVersionstamp(version) {
+		key, err := r.roomVersionToReceipt.PackWithVersionstamp(tup)
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
-		receipts = append(receipts, r.KeyValueToReceipt(kv))
+		return key
 	}
+	return r.roomVersionToReceipt.Pack(tup)
+}
 
-	return receipts, nil
+func (r *ReceiptsDirectory) RangeForRoomVersion(
+	roomID id.RoomID,
+	fromVersion, toVersion tuple.Versionstamp,
+) fdb.Range {
+	return types.GetVersionRange(r.roomVersionToReceipt, fromVersion, toVersion, roomID.String())
+}
+
+// Local room version
+
+func (r *ReceiptsDirectory) KeyToLocalRoomVersion(key fdb.Key) tuple.Versionstamp {
+	tup, err := r.localRoomVersionToReceipt.Unpack(key)
+	if err != nil {
+		panic(err)
+	}
+	return tup[1].(tuple.Versionstamp)
+}
+
+func (r *ReceiptsDirectory) KeyForLocalRoomVersion(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
+	tup := tuple.Tuple{roomID.String(), version}
+	if types.IsIncompleteVersionstamp(version) {
+		key, err := r.localRoomVersionToReceipt.PackWithVersionstamp(tuple.Tuple{roomID.String(), version})
+		if err != nil {
+			panic(err)
+		}
+		return key
+	}
+	return r.localRoomVersionToReceipt.Pack(tup)
+}
+
+func (r *ReceiptsDirectory) RangeForLocalRoomVersion(
+	roomID id.RoomID,
+	fromVersion, toVersion tuple.Versionstamp,
+) fdb.Range {
+	return types.GetVersionRange(r.localRoomVersionToReceipt, fromVersion, toVersion, roomID.String())
+}
+
+// User version
+
+func (r *ReceiptsDirectory) KeyToUserVersion(key fdb.Key) tuple.Versionstamp {
+	tup, err := r.userVersionToReceipt.Unpack(key)
+	if err != nil {
+		panic(err)
+	}
+	return tup[1].(tuple.Versionstamp)
+}
+
+func (r *ReceiptsDirectory) KeyForUserVersion(userID id.UserID, version tuple.Versionstamp) fdb.Key {
+	tup := tuple.Tuple{userID.String(), version}
+	if types.IsIncompleteVersionstamp(version) {
+		key, err := r.userVersionToReceipt.PackWithVersionstamp(tuple.Tuple{userID.String(), version})
+		if err != nil {
+			panic(err)
+		}
+		return key
+	}
+	return r.userVersionToReceipt.Pack(tup)
+}
+
+func (r *ReceiptsDirectory) RangeForUserVersion(
+	userID id.UserID,
+	fromVersion, toVersion tuple.Versionstamp,
+) fdb.Range {
+	return types.GetVersionRange(r.userVersionToReceipt, fromVersion, toVersion, userID.String())
 }

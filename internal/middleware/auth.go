@@ -44,7 +44,7 @@ func NewUserAuthMiddleware(
 	}
 }
 
-func getRequestUserDevice(r *http.Request) *types.UserDevice {
+func GetRequestUserDevice(r *http.Request) *types.UserDevice {
 	u := r.Context().Value(requestUserKey)
 	if u == nil {
 		return nil
@@ -54,9 +54,13 @@ func getRequestUserDevice(r *http.Request) *types.UserDevice {
 
 func RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u := getRequestUserDevice(r)
+		u := GetRequestUserDevice(r)
 		if u == nil {
-			util.ResponseErrorJSON(w, r, mautrix.MMissingToken)
+			if r.Header.Get("Authorization") != "" {
+				util.ResponseErrorJSON(w, r, mautrix.MUnknownToken)
+			} else {
+				util.ResponseErrorJSON(w, r, mautrix.MMissingToken)
+			}
 			return
 		}
 		log := hlog.FromRequest(r)
@@ -69,12 +73,12 @@ func RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // Panics if there's no request user
 func GetRequestUserID(r *http.Request) id.UserID {
-	return getRequestUserDevice(r).UserID
+	return GetRequestUserDevice(r).UserID
 }
 
 // Panics if there's no request user
 func GetRequestDeviceID(r *http.Request) id.DeviceID {
-	return getRequestUserDevice(r).DeviceID
+	return GetRequestUserDevice(r).DeviceID
 }
 
 // Server auth (SS API)

@@ -17,10 +17,13 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 )
+
+// Chi URL params
 
 func RoomIDFromRequestURLParam(r *http.Request, field string) id.RoomID {
 	p := chi.URLParam(r, field)
@@ -32,6 +35,19 @@ func RoomIDFromRequestURLParam(r *http.Request, field string) id.RoomID {
 		return id.RoomID("")
 	} else {
 		return id.RoomID(parsed)
+	}
+}
+
+func RoomAliasFromRequestURLParam(r *http.Request, field string) id.RoomAlias {
+	p := chi.URLParam(r, field)
+
+	if strings.HasSuffix(p, "#") {
+		return id.RoomAlias(p)
+	}
+	if parsed, err := url.PathUnescape(p); err != nil {
+		return id.RoomAlias("")
+	} else {
+		return id.RoomAlias(parsed)
 	}
 }
 
@@ -61,6 +77,8 @@ func UserIDFromRequestURLParam(r *http.Request, field string) id.UserID {
 	}
 }
 
+// Query string
+
 func IntFromRequestQuery(r *http.Request, field string, def int) (int, error) {
 	str := r.URL.Query().Get(field)
 	if str == "" {
@@ -73,8 +91,8 @@ func VersionMapToString(vMap types.VersionMap) string {
 	tokens := make([]string, 0, len(vMap))
 
 	for key, version := range vMap {
-		b := types.VersionstampToValue(version)
-		token := string(key) + Base64EncodeURLSafe(b)
+		b := types.MustVersionstampToBytes(version)
+		token := string(key) + Base32HexEncode(b)
 		tokens = append(tokens, token)
 	}
 
@@ -93,11 +111,11 @@ func StringToVersionMap(s string) (types.VersionMap, error) {
 	for _, part := range parts {
 		key, value := part[0], part[1:]
 
-		bytes, err := Base64DecodeURLSafe(value)
+		bytes, err := Base32HexDecode(value)
 		if err != nil {
 			return nil, err
 		}
-		version := types.MustValueToVersionstamp(bytes)
+		version := types.MustBytesToVersionstamp(bytes)
 
 		vKey := types.VersionKey(key)
 		switch vKey {
@@ -105,7 +123,7 @@ func StringToVersionMap(s string) (types.VersionMap, error) {
 			versions[vKey] = version
 		case types.AccountsVersionKey:
 			versions[vKey] = version
-		case types.DevicesVersionKey:
+		case types.TransientVersionKey:
 			versions[vKey] = version
 		default:
 			return nil, fmt.Errorf("invalid versions key: %s", string(key))
@@ -127,7 +145,23 @@ func VersionFromRequestQuery(r *http.Request, field, versionKey types.VersionKey
 	}
 }
 
+// Request body
+
+func ParseRequestJSON[T any](r *http.Request) (T, *mautrix.RespError) {
+	var req T
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var sErr *json.SyntaxError
+		if errors.As(err, &sErr) {
+			return req, &mautrix.MNotJSON
+		}
+		return req, &mautrix.MBadJSON
+	}
+	return req, nil
+}
+
+// Federation request authentication
 // https://matrix.org/docs/spec/server_server/unstable.html#request-authentication
+
 type federationRequest struct {
 	Method  string          `json:"method"`
 	URI     string          `json:"uri"`
@@ -146,7 +180,7 @@ func VerifyFederatonRequest(
 	r *http.Request,
 ) (string, error) {
 	if r.Host == "localhost:5000" {
-		return "beeper.com", nil
+		return "babbleserv-dev.fizzadar.com", nil
 	}
 
 	b, err := io.ReadAll(r.Body)

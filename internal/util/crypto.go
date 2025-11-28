@@ -2,7 +2,6 @@ package util
 
 import (
 	"crypto/rand"
-	"encoding/base32"
 )
 
 func GenerateRandomBytes(n int) []byte {
@@ -23,5 +22,5 @@ func GenerateRandomString(n int) string {
 
 // As above but encoding using base32hex which is more human readable, ie for device IDs
 func GenerateRandomStringBase32Hex(n int) string {
-	return base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(GenerateRandomBytes(n))
+	return Base32HexEncode(GenerateRandomBytes(n))
 }

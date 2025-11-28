@@ -18,11 +18,12 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// TxnEventsProvider is a per-txn singleton that handles all reading of full
-// event objects from FoundationDB.
-// NOTE: provider is *not* concurrency safe and maintains no internal locking
-// mechanism. FDB transactions should not be fed into goroutines which means
-// this shouldn't ever be an issue.
+// TxnEventsProvider is a per-txn singleton that handles pulling event objects from FoundationDB.
+// Designed to be passed into each other over multiple transactions sharing the same event cache,
+// and many pagination methods take it to kick off event fetches before they are needed.
+//
+// NOTE: provider is *not* concurrency safe and maintains no internal locking mechanism. FDB txns
+// should not be fed into goroutines which means this shouldn't ever be an issue.
 type TxnEventsProvider struct {
 	log  zerolog.Logger
 	txn  fdb.ReadTransaction
@@ -41,14 +42,18 @@ func (e *EventsDirectory) NewTxnEventsProvider(ctx context.Context, txn fdb.Read
 	provider := &TxnEventsProvider{
 		log:     log,
 		txn:     txn,
-		byID:    e.byID,
+		byID:    e.idToEvent,
 		futures: make(map[id.EventID]fdb.FutureByteSlice, 10),
 		events:  make(map[id.EventID]*types.Event, 10),
 	}
 
 	runtime.SetFinalizer(provider, func(ep *TxnEventsProvider) {
-		for eventID := range ep.futures {
-			ep.log.Warn().Stringer("event_id", eventID).Msg("Unused fut in finalized TxnEventsProvider")
+		for eventID, fut := range ep.futures {
+			if fut.IsReady() {
+				ep.log.Warn().Stringer("event_id", eventID).Msg("Unused ready fut in finalized TxnEventsProvider")
+			} else {
+				ep.log.Warn().Stringer("event_id", eventID).Msg("Never ready fut in finalized TxnEventsProvider")
+			}
 		}
 	})
 
@@ -64,25 +69,40 @@ func (ep *TxnEventsProvider) WithEvents(evs ...*types.Event) *TxnEventsProvider 
 
 func (ep *TxnEventsProvider) WithProviderEvents(providers ...*TxnEventsProvider) *TxnEventsProvider {
 	for _, provider := range providers {
+		// Pull any fetched events
 		for _, ev := range provider.events {
 			ep.Add(ev)
+		}
+		// Now check for any unclaimed futures that are ready, and get those events too (if exist)
+		for evID, evFut := range provider.futures {
+			if evFut.IsReady() {
+				ev, err := provider.Get(evID)
+				if err != nil {
+					ep.log.Err(err).Msg("Error getting ready event future")
+					continue
+				} else if ev != nil {
+					ep.Add(ev)
+				}
+			}
 		}
 	}
 	return ep
 }
 
-func (ep *TxnEventsProvider) keyForEventOD(eventID id.EventID) fdb.Key {
+func (ep *TxnEventsProvider) keyForEventID(eventID id.EventID) fdb.Key {
 	return ep.byID.Pack(tuple.Tuple{eventID.String()})
 }
 
-func (ep *TxnEventsProvider) WillGet(eventID id.EventID) fdb.FutureByteSlice {
-	if fut, found := ep.futures[eventID]; found {
-		return fut
+func (ep *TxnEventsProvider) WillGet(eventID id.EventID) {
+	if _, found := ep.events[eventID]; found {
+		return
 	}
-	fut := ep.txn.Get(ep.keyForEventOD(eventID))
+	if _, found := ep.futures[eventID]; found {
+		return
+	}
+	fut := ep.txn.Get(ep.keyForEventID(eventID))
 	ep.futures[eventID] = fut
 	ep.log.Trace().Str("event_id", eventID.String()).Msg("Will get event")
-	return fut
 }
 
 func (ep *TxnEventsProvider) Add(ev *types.Event) {
@@ -104,7 +124,7 @@ func (ep *TxnEventsProvider) Get(eventID id.EventID) (*types.Event, error) {
 		ep.log.Warn().
 			Stringer("event_id", eventID).
 			Msg("Fetching event with no existing future")
-		fut = ep.txn.Get(ep.keyForEventOD(eventID))
+		fut = ep.txn.Get(ep.keyForEventID(eventID))
 	} else if !fut.IsReady() {
 		ep.log.Warn().
 			Stringer("event_id", eventID).
@@ -117,7 +137,7 @@ func (ep *TxnEventsProvider) Get(eventID id.EventID) (*types.Event, error) {
 		return nil, err
 	} else if b == nil {
 		ep.log.Warn().Str("event_id", eventID.String()).Msg("Event does not exist")
-		return nil, types.ErrEventNotFound
+		return nil, nil
 	}
 
 	ep.log.Trace().Str("event_id", eventID.String()).Msg("Load event")
@@ -173,6 +193,8 @@ func (ap *TxnAuthEventsProvider) get(eventID id.EventID) (gomatrixserverlib.PDU,
 	ev, err := ap.eventsProvider.Get(eventID)
 	if err != nil {
 		return nil, err
+	} else if ev == nil {
+		return nil, types.ErrEventNotFound
 	}
 	return ev.PDU(), nil
 }
@@ -223,19 +245,11 @@ func (ap *TxnAuthEventsProvider) GetAuthEventIDsForEvent(ev *types.Event) []id.E
 	authEventIDs := make([]id.EventID, 0, len(ap.stateMap))
 	for stateTup, eventID := range ap.stateMap {
 		var include bool
-		if stateTup.Type == event.StateCreate {
-			// The m.room.create event.
+		switch stateTup.Type {
+		case event.StateCreate, event.StateJoinRules, event.StatePowerLevels:
 			include = true
-		} else if stateTup.Type == event.StatePowerLevels {
-			// The current m.room.power_levels event, if any.
-			include = true
-		} else if stateTup.Type == event.StateMember && stateTup.StateKey == ev.Sender.String() {
-			// The sender’s current m.room.member event, if any.
-			include = true
-		} else if ev.Type == event.StateMember {
-			// If type is m.room.member:
-			if stateTup.Type == event.StateMember && stateTup.StateKey == *ev.StateKey {
-				// The target’s current m.room.member event, if any.
+		case event.StateMember:
+			if stateTup.StateKey == ev.Sender.String() || stateTup.StateKey == *ev.StateKey {
 				include = true
 			}
 			// TODO: If membership is invite and content contains a third_party_invite property, the current m.room.third_party_invite event with state_key matching content.third_party_invite.signed.token, if any.

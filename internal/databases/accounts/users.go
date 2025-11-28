@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 	"maunium.net/go/mautrix/id"
 
@@ -14,7 +15,11 @@ import (
 
 var ZeroTime time.Time
 
-func (a *AccountsDatabase) GetLocalUserForUsername(ctx context.Context, username string) (*types.User, error) {
+func generateDeviceID() id.DeviceID {
+	return id.DeviceID(util.GenerateRandomStringBase32Hex(8))
+}
+
+func (a *AccountsDatabase) GetLocalUser(ctx context.Context, username string) (*types.User, error) {
 	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*types.User, error) {
 		return a.users.TxnGetLocalUser(txn, username, a.config.ServerName)
 	})
@@ -39,6 +44,7 @@ func (a *AccountsDatabase) GetUserDeviceForAuthToken(ctx context.Context, token 
 }
 
 type authResp struct {
+	UserID       id.UserID   `json:"user_id"`
 	DeviceID     id.DeviceID `json:"device_id"`
 	AccessToken  string      `json:"access_token"`
 	RefreshToken string      `json:"refresh_token,omitempty"`
@@ -52,7 +58,7 @@ func (a *AccountsDatabase) LoginWithPassword(
 	initialDeviceDisplayName string,
 ) (authResp, error) {
 	if deviceID == "" {
-		deviceID = id.DeviceID(util.GenerateRandomStringBase32Hex(8))
+		deviceID = generateDeviceID()
 	}
 	resp := authResp{
 		DeviceID: deviceID,
@@ -70,6 +76,8 @@ func (a *AccountsDatabase) LoginWithPassword(
 		}
 
 		userID := id.UserID("@" + username + ":" + a.config.ServerName)
+		resp.UserID = userID
+
 		resp.AccessToken, resp.RefreshToken = a.tokens.TxnCreateNewTokensForUserDevice(
 			txn,
 			userID,
@@ -97,7 +105,7 @@ func (a *AccountsDatabase) RegisterWithPassword(
 	initialDeviceDisplayName string,
 ) (authResp, error) {
 	if deviceID == "" {
-		deviceID = id.DeviceID(util.GenerateRandomStringBase32Hex(16))
+		deviceID = generateDeviceID()
 	}
 	resp := authResp{
 		DeviceID: deviceID,
@@ -120,6 +128,8 @@ func (a *AccountsDatabase) RegisterWithPassword(
 		}
 
 		userID := user.UserID()
+		resp.UserID = userID
+
 		resp.AccessToken, resp.RefreshToken = a.tokens.TxnCreateNewTokensForUserDevice(
 			txn,
 			userID,
@@ -137,34 +147,11 @@ func (a *AccountsDatabase) RegisterWithPassword(
 		return resp, err
 	}
 
+	zerolog.Ctx(ctx).
+		Info().
+		Str("username", username).
+		Str("device_id", deviceID.String()).
+		Msg("Registered new user")
+
 	return resp, nil
-}
-
-type deviceTokens struct {
-	AuthTokens    map[id.DeviceID][]string
-	RefreshTokens map[id.DeviceID][]string
-}
-
-func (a *AccountsDatabase) GetUserDeviceTokenPrefixes(
-	ctx context.Context,
-	userID id.UserID,
-) (deviceTokens, error) {
-	var tokens deviceTokens
-	var err error
-
-	if _, err := util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
-		tokens.AuthTokens, err = a.tokens.TxnListUserDeviceAuthTokenPrefixes(txn, userID)
-		if err != nil {
-			return nil, err
-		}
-		tokens.RefreshTokens, err = a.tokens.TxnListUserDeviceRefreshTokenPrefixes(txn, userID)
-		if err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}); err != nil {
-		return tokens, err
-	} else {
-		return tokens, nil
-	}
 }

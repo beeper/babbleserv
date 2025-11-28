@@ -32,7 +32,11 @@ func NewNotifiers(cfg config.BabbleConfig, logger zerolog.Logger) *Notifiers {
 	return &notifiers
 }
 
-func (n *Notifiers) Subscribe(ch chan any, req Subscription) {
+func (n *Notifiers) Subscribe(req Subscription) chan any {
+	return n.SubscribeWithChannel(make(chan any, 1), req)
+}
+
+func (n *Notifiers) SubscribeWithChannel(ch chan any, req Subscription) chan any {
 	if n.Rooms != nil {
 		n.Rooms.Subscribe(ch, req)
 	}
@@ -42,6 +46,8 @@ func (n *Notifiers) Subscribe(ch chan any, req Subscription) {
 	if n.Transient != nil {
 		n.Transient.Subscribe(ch, req)
 	}
+
+	return ch
 }
 
 func (n *Notifiers) Unsubscribe(ch chan any) {
@@ -54,6 +60,8 @@ func (n *Notifiers) Unsubscribe(ch chan any) {
 	if n.Transient != nil {
 		n.Transient.Unsubscribe(ch)
 	}
+
+	close(ch)
 }
 
 func (n *Notifiers) Start() {

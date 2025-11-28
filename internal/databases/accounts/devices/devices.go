@@ -17,11 +17,16 @@ type DevicesDirectory struct {
 	log zerolog.Logger
 	db  fdb.Database
 
-	byUserDeviceID,
-	userDeviceLastSeen,
-	userDeviceKeys,
-	userDeviceOneTimeKeys,
-	userDeviceFallbackKeys subspace.Subspace
+	// UserID/DeviceID to types.Device msgpack bytes
+	byUserDeviceID subspace.Subspace
+
+	// UserID/DeviceID to last seen time, separate to device bytes since updated on any req
+	userDeviceLastSeen subspace.Subspace
+
+	// UserID/DeviceID/ConnID to types.UserSyncConn msgpack bytes, stores basic information about
+	// (native/sliding) sync connections which v2/streaming also use. Also acts as a lock preventing
+	// parallel sync calls with the same deviceid/connid. Updated every sync req.
+	syncConns subspace.Subspace
 }
 
 func NewDevicesDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *DevicesDirectory {
@@ -39,12 +44,14 @@ func NewDevicesDirectory(logger zerolog.Logger, db fdb.Database, parentDir direc
 		log: log,
 		db:  db,
 
-		byUserDeviceID:         devicesDir.Sub("udi"), // userID/deviceID -> device msgpack bytes
-		userDeviceLastSeen:     devicesDir.Sub("uds"), // userID/deviceID -> (lastIP, lastSeenTS)
-		userDeviceKeys:         devicesDir.Sub("udk"), // userID/deviceID -> DeviceKeys JSON (CSAPI)
-		userDeviceOneTimeKeys:  devicesDir.Sub("otk"), // userID/deviceID/keyID -> KeyObject JSON (CSAPI)
-		userDeviceFallbackKeys: devicesDir.Sub("otk"), // userID/deviceID -> KeyObject JSON (CSAPI)
+		byUserDeviceID:     devicesDir.Sub("udi"),
+		syncConns:          devicesDir.Sub("scn"),
+		userDeviceLastSeen: devicesDir.Sub("uds"),
 	}
+}
+
+func (d *DevicesDirectory) RangeForUserDevices(userID id.UserID) fdb.ExactRange {
+	return d.byUserDeviceID.Sub(userID.String())
 }
 
 func (d *DevicesDirectory) KeyForDevice(userID id.UserID, deviceID id.DeviceID) fdb.Key {
@@ -55,9 +62,18 @@ func (d *DevicesDirectory) KeyForDeviceLastSeen(userID id.UserID, deviceID id.De
 	return d.userDeviceLastSeen.Pack(tuple.Tuple{userID.String(), deviceID.String()})
 }
 
+func (d *DevicesDirectory) KeyForDeviceSyncConn(userID id.UserID, deviceID id.DeviceID, connID string) fdb.Key {
+	return d.syncConns.Pack(tuple.Tuple{userID.String(), deviceID.String(), connID})
+}
+
+func (d *DevicesDirectory) RangeForDeviceSyncConns(userID id.UserID, deviceID id.DeviceID) fdb.ExactRange {
+	return d.syncConns.Sub(tuple.Tuple{userID.String(), deviceID.String()})
+}
+
 func (d *DevicesDirectory) TxnDeleteDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID) {
 	txn.Clear(d.KeyForDevice(userID, deviceID))
 	txn.Clear(d.KeyForDeviceLastSeen(userID, deviceID))
+	txn.ClearRange(d.RangeForDeviceSyncConns(userID, deviceID))
 }
 
 func (d *DevicesDirectory) TxnGetOrCreateDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, initialDisplayName string) (*types.Device, error) {
@@ -69,7 +85,7 @@ func (d *DevicesDirectory) TxnGetOrCreateDevice(txn fdb.Transaction, userID id.U
 		txn.Set(key, device.ToMsgpack())
 		return device, nil
 	} else {
-		device := types.MustNewDeviceFromBytes(kv, deviceID)
+		device := types.MustNewDeviceFromBytes(kv)
 		return device, nil
 	}
 }
