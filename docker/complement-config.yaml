@@ -1,0 +1,45 @@
+serverName: SERVER_NAME
+signingKeys:
+  ed25519:20240101:
+    path: ed25519-active
+database:
+  rooms:
+    clusterFilePath: /etc/foundationdb/fdb.cluster
+    transactionTimeout: 5000
+    transactionRetryLimit: 50
+routes:
+  servers:
+    - listenAddr: 0.0.0.0:8008
+      serviceGroups:
+        - client
+    - listenAddr: 0.0.0.0:8448
+      tlsKeyPath: SERVER_NAME.key
+      tlsCertPath: SERVER_NAME.crt
+      serviceGroups:
+        - client  # needed for versions endpoint
+        - federation
+notifier:
+  redisAddr: 127.0.0.1:6379
+rooms:
+  enabled: true
+  defaultVersion: 11
+accounts:
+  enabled: true
+transient:
+  enabled: true
+federation:
+  maxFetchMissingEvents: 1000
+secretSwitches:
+  enableFederatedSendRoomCreate: true
+  autoCreateDatastoreBuckets: true
+media:
+  enabled: true
+  presignedURLTimeout: 15m
+  datastores:
+    minioplay:
+      type: s3
+      enabled: true
+      bucket: babbleserv-dev
+      endpoint: play.min.io
+      accessKeyID: Q3AM3UQ867SPQQA43P2F
+      secretAccessKey: zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG
