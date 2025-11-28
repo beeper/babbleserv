@@ -4,7 +4,7 @@ Babbleserv is designed to lean on FoundationDB as much as possible. Think of it 
 
 ## Transactions
 
-At the core of this lies transactions which FDB provides strong consistency guarantees for. By **evaluating event authorzation and state resolution within transactions** we simplify handling of both local and federated events significantly. See the `SendLocalEvents` and `SendFederatedEvents` in `internal/database/send_events.go` which implement auth + store in single transactions.
+At the core of this lies transactions which FDB provides strong consistency guarantees for. By **evaluating event authorzation and state resolution within transactions** we simplify handling of both local and federated events significantly. See the `SendLocalEvents` and `SendFederatedEvents` in `internal/database/rooms/eventsend.go` which implement auth + store in single transactions.
 
 ### Transaction Rules
 

@@ -2,17 +2,9 @@
 
 This document explores Babbleserv's compatability (or not) with the Matrix specification. All subject to change.
 
-## Streaming Sync
-
-Babbleserv only supports "streaming" sync, which makes for much simpler implementations on both server and client. This has the following implications relating to the Matrix spec.
-
-- sync will never be limited
-- clients will always have an up to date view of state
-- server side aggregations are not supported or provided (MSC2675)
-
 ## No Server Bundled Aggregations
 
-These seem incredibly expensive to calculate for little benefit - clients must still implement all of their own aggregation logic because servers cannot guarantee their own aggregations are correct. So what's the point. By removing limited sync we can ensure that clients do have an up-to-date view of rooms, meaning they can accurately aggregate events as needed.
+These seem incredibly expensive to calculate for little benefit - clients must still implement all of their own aggregation logic because servers cannot guarantee their own aggregations are correct [citation needed]. So what's the point.
 
 Note: backfilling still presents an issue here, but the `/reations` and threads APIs are supported and are more suitable for gathering this information.
 
@@ -53,3 +45,15 @@ See [MSC3995](https://github.com/matrix-org/matrix-spec-proposals/pull/3995) - B
 ## No Reactions in Relations API
 
 The `/relations` API will not return `m.annotation` evens unless the `rel_type` is explicitly specified (and only `m.annotation` events are returned).
+
+## Push Rules
+
+Not implemented.
+
+## Profile Updates are NOT Considered Room State
+
+Deviates from the spec. Synthetic events used.
+
+## Profile Updates and Device List Changes are Asynchronous
+
+Request to update/change will return before the changes are applied. Does this even deviate from the spec?
