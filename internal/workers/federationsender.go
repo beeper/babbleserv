@@ -170,7 +170,7 @@ func (fs *FederationSender) maybeRunServerSender(ctx context.Context, serverName
 		fs.lock.Unlock()
 
 		log.Info().Msg("Starting server sender")
-		fs.sendEventsToServerLoop(ctx, serverName, lock, wakeCh)
+		fs.sendTransactionLoop(ctx, serverName, lock, wakeCh)
 
 		// Remove the internal flag on sender
 		fs.lock.Lock()
@@ -189,16 +189,30 @@ func (fs *FederationSender) maybeRunServerSender(ctx context.Context, serverName
 	}
 }
 
-func (fs *FederationSender) sendEventsToServerLoop(
+func (fs *FederationSender) sendTransactionLoop(
 	ctx context.Context,
 	serverName string,
 	lock lock.Lock,
 	wakeCh chan struct{},
 ) {
 	var noSends int
+	var errCount int
+	var delayS time.Duration = 1
+
+	log := zerolog.Ctx(ctx)
 
 	trySend := func() {
-		if fs.sendEventsToServer(ctx, serverName, lock) {
+		sent, err := fs.sendTransaction(ctx, serverName, lock)
+		if err != nil {
+			log.Err(err).
+				Dur("delay", delayS*time.Second).
+				Msg("Failed to send events to server, will retry")
+			errCount++
+			delayS = time.Duration(errCount)
+			return
+		}
+		errCount = 0
+		if sent {
 			noSends = 0
 		} else {
 			noSends++
@@ -213,11 +227,11 @@ func (fs *FederationSender) sendEventsToServerLoop(
 			return
 		case <-wakeCh:
 			trySend()
-		case <-time.After(time.Second):
+		case <-time.After(delayS * time.Second):
 			trySend()
 		}
 		// TODO: this is stupid
-		if noSends >= 2 {
+		if noSends >= 10 {
 			// After 10 refreshes without sends, exit the server sender. If new
 			// events come in relevant to this server we'll start again.
 			return
@@ -225,13 +239,10 @@ func (fs *FederationSender) sendEventsToServerLoop(
 	}
 }
 
-func (fs *FederationSender) sendEventsToServer(ctx context.Context, serverName string, lock lock.Lock) bool {
-	log := zerolog.Ctx(ctx)
-
+func (fs *FederationSender) sendTransaction(ctx context.Context, serverName string, lock lock.Lock) (bool, error) {
 	serverVersions, err := fs.db.System.GetServerPositions(ctx, serverName)
 	if err != nil {
-		log.Err(err).Msg("Failed to get current server positions")
-		return false
+		return false, err
 	} else if serverVersions == nil {
 		serverVersions = make(types.VersionMap)
 	}
@@ -244,21 +255,24 @@ func (fs *FederationSender) sendEventsToServer(ctx context.Context, serverName s
 		lock.Refresh()
 
 		var sent bool
+		var err error
 		if isRooms {
-			sent = fs.syncRoomsForServer(ctx, serverName, serverVersions)
+			sent, err = fs.syncRoomsForServer(ctx, serverName, serverVersions)
 		} else {
-			sent = fs.syncTransientForServer(ctx, serverName, serverVersions)
+			sent, err = fs.syncTransientForServer(ctx, serverName, serverVersions)
+		}
+		if err != nil {
+			return false, err
 		}
 
 		if !didSend && !sent {
 			// If we didn't send last time and we didn't send this time, exit
-			return false
+			return false, nil
 		}
 
 		err = fs.db.System.UpdateServerPositions(ctx, serverName, serverVersions, lock.TxnRefresh)
 		if err != nil {
-			log.Err(err).Msg("Failed to update current server positions")
-			return sent
+			return false, err
 		}
 
 		isRooms = !isRooms
@@ -270,7 +284,7 @@ func (fs *FederationSender) syncRoomsForServer(
 	ctx context.Context,
 	serverName string,
 	serverVersions types.VersionMap,
-) bool {
+) (bool, error) {
 	log := zerolog.Ctx(ctx)
 
 	roomsVersion, found := serverVersions[types.RoomsVersionKey]
@@ -291,12 +305,11 @@ func (fs *FederationSender) syncRoomsForServer(
 		Mode: types.SyncModeStreaming,
 	})
 	if err != nil {
-		log.Err(err).Msg("Failed to sync rooms for server")
-		return false
+		return false, err
 	}
 
 	if nextVersion == roomsVersion {
-		return false
+		return false, nil
 	}
 
 	allEvs := make([]*types.Event, 0, 50)
@@ -326,7 +339,7 @@ func (fs *FederationSender) syncRoomsForServer(
 			}
 			b, err := json.Marshal(content)
 			if err != nil {
-				panic(err)
+				return false, err
 			}
 
 			// TODO: we could merge receipts with the same room/type
@@ -339,20 +352,19 @@ func (fs *FederationSender) syncRoomsForServer(
 
 	if len(allEvs) > 0 || len(allReceipts) > 0 {
 		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allReceipts); err != nil {
-			log.Err(err).Msg("Failed to send rooms transaction")
-			return false
+			return false, fmt.Errorf("failed to send rooms transaction: %w", err)
 		}
 	}
 
 	serverVersions[types.RoomsVersionKey] = nextVersion
-	return true
+	return true, nil
 }
 
 func (fs *FederationSender) syncTransientForServer(
 	ctx context.Context,
 	serverName string,
 	serverVersions types.VersionMap,
-) bool {
+) (bool, error) {
 	log := zerolog.Ctx(ctx)
 
 	roomsVersion, found := serverVersions[types.TransientVersionKey]
@@ -373,12 +385,11 @@ func (fs *FederationSender) syncTransientForServer(
 		Mode: types.SyncModeStreaming,
 	})
 	if err != nil {
-		log.Err(err).Msg("Failed to sync transient for server")
-		return false
+		return false, err
 	}
 
 	if nextVersion == roomsVersion {
-		return false
+		return false, nil
 	}
 
 	allToDevice := make([]*types.EDU, 0, 100)
@@ -411,13 +422,12 @@ func (fs *FederationSender) syncTransientForServer(
 
 	if len(allToDevice) > 0 {
 		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, nil, allToDevice); err != nil {
-			log.Err(err).Msg("Failed to send transient transaction")
-			return false
+			return false, fmt.Errorf("failed to send transient transaction: %w", err)
 		}
 	}
 
 	serverVersions[types.TransientVersionKey] = nextVersion
-	return true
+	return true, nil
 }
 
 func (fs *FederationSender) sendTransactionToServer(
