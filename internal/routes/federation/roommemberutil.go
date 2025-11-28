@@ -72,23 +72,25 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 
 	// If possible grab the users profile from the requesting server
 	// TODO: check if we have the profile locally (uh, where)
-	if profileResp, err := f.fclient.LookupProfile(
-		r.Context(),
-		spec.ServerName(f.config.ServerName),
-		spec.ServerName(otherServer),
-		remoteUserID.String(),
-		"",
-	); err != nil {
-		hlog.FromRequest(r).
-			Warn().
-			Err(err).
-			Msg("Error fetching profile information when making remote join")
-	} else {
-		if profileResp.DisplayName != "" {
-			content["displayname"] = profileResp.DisplayName
-		}
-		if profileResp.AvatarURL != "" {
-			content["avatar_url"] = profileResp.AvatarURL
+	if f.config.Federation.FetchProfileForMemberEvents {
+		if profileResp, err := f.fclient.LookupProfile(
+			r.Context(),
+			spec.ServerName(f.config.ServerName),
+			spec.ServerName(otherServer),
+			remoteUserID.String(),
+			"",
+		); err != nil {
+			hlog.FromRequest(r).
+				Warn().
+				Err(err).
+				Msg("Error fetching profile information when making remote join")
+		} else {
+			if profileResp.DisplayName != "" {
+				content["displayname"] = profileResp.DisplayName
+			}
+			if profileResp.AvatarURL != "" {
+				content["avatar_url"] = profileResp.AvatarURL
+			}
 		}
 	}
 

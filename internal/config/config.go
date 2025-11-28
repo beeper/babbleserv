@@ -78,7 +78,8 @@ type BabbleConfig struct {
 	} `yaml:"workers"`
 
 	Federation struct {
-		MaxFetchMissingEvents int `yaml:"maxFetchMissingEvents"`
+		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
+		FetchProfileForMemberEvents bool `yaml:"fetchProfileForMemberEvents"`
 	} `yaml:"federation"`
 
 	// For development usage - serve the .well-known client/server endpoints

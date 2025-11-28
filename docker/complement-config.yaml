@@ -29,6 +29,8 @@ transient:
   enabled: true
 federation:
   maxFetchMissingEvents: 1000
+  # Complement gets mad if we hit the profile endpoint when it's not listening for it
+  fetchProfileForMemberEvents: false
 secretSwitches:
   enableFederatedSendRoomCreate: true
   autoCreateDatastoreBuckets: true
