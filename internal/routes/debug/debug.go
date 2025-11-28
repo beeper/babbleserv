@@ -54,7 +54,6 @@ func (b *DebugRoutes) AddDebugRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/debug/user/{userID}/sync", b.DebugSyncUser)
 
 	rtr.MethodFunc(http.MethodGet, "/debug/server/{serverName}", b.DebugGetServer)
-	rtr.MethodFunc(http.MethodGet, "/debug/server/{serverName}/sync", b.DebugSyncServer)
 
 	rtr.MethodFunc(http.MethodGet, "/debug/scratch", b.DebugScratch)
 }

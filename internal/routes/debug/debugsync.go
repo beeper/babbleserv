@@ -29,21 +29,3 @@ func (b *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
-
-func (b *DebugRoutes) DebugSyncServer(w http.ResponseWriter, r *http.Request) {
-	serverName := chi.URLParam(r, "serverName")
-
-	versions, err := util.VersionMapFromRequestQuery(r, "since")
-	if err != nil {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
-		return
-	}
-
-	if sync, err := b.db.SyncForServer(r.Context(), serverName, types.SyncOptions{}, versions); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else {
-		util.ResponseJSON(w, r, http.StatusOK, sync)
-		return
-	}
-}

@@ -42,26 +42,3 @@ func (d *Databases) SyncForUser(
 	sync.NextBatch = util.VersionMapToString(versions)
 	return sync, nil
 }
-
-func (d *Databases) SyncForServer(
-	ctx context.Context,
-	serverName string,
-	options types.SyncOptions,
-	versions types.VersionMap,
-) (*types.Sync, error) {
-	nextRoomsVersion, rooms, err := d.Rooms.SyncRoomsForServer(ctx, serverName, versions[types.RoomsVersionKey], options)
-	if err != nil {
-		return nil, err
-	} else {
-		versions[types.RoomsVersionKey] = nextRoomsVersion
-	}
-
-	sync := types.NewSync(rooms, nil, nil)
-
-	// TODO
-	// 1. get joined rooms
-	// 2. parallel sync transient db x rooms + to-device-outgoing
-
-	sync.NextBatch = util.VersionMapToString(versions)
-	return sync, nil
-}
