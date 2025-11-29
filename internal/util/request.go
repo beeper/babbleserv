@@ -77,6 +77,14 @@ func UserIDFromRequestURLParam(r *http.Request, field string) id.UserID {
 	}
 }
 
+func HomeserverForRoomID(roomID id.RoomID) string {
+	parts := strings.Split(string(roomID), ":")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
 // Query string
 
 func IntFromRequestQuery(r *http.Request, field string, def int) (int, error) {

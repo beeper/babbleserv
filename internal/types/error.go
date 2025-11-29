@@ -14,5 +14,7 @@ var (
 	ErrProfileNotChanged = errors.New("profile is unchanged")
 	ErrInvalidPassword   = errors.New("invalid password")
 
-	ErrRoomNotFound = errors.New("room not found")
+	ErrRoomNotFound      = errors.New("room not found")
+	ErrRoomAliasNotFound = errors.New("room alias not found")
+	ErrRoomAliasTaken    = errors.New("room alias taken")
 )

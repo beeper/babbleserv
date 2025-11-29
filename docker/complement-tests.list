@@ -11,6 +11,7 @@ TestToDeviceMessages
 TestDemotingUsersViaUsersDefault
 TestAddAccountData
 TestNotPresentUserCannotBanOthers
+TestRoomAlias
 
 # S2SAPI
 TestFederationStateResolution

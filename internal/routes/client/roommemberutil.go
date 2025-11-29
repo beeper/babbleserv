@@ -38,12 +38,12 @@ func getOtherServers(r *http.Request, roomID id.RoomID) []string {
 }
 
 func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) id.RoomID {
-	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	roomID := util.RoomIDFromRequestURLParam(r, param)
 	if strings.HasPrefix(roomID.String(), "!") {
 		return roomID
 	}
 
-	roomAlias := util.RoomAliasFromRequestURLParam(r, "roomID")
+	roomAlias := util.RoomAliasFromRequestURLParam(r, param)
 	// Replace #name:server -> @name:server to extract the homeserver
 	otherServer := id.UserID("@" + roomAlias[1:]).Homeserver()
 	aliasResp, err := c.fclient.LookupRoomAlias(

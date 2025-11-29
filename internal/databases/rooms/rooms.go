@@ -47,8 +47,17 @@ type RoomsDatabase struct {
 	// Room ID to tuple.Versionstamp of the most recent receipt or event in the room
 	idToVersion subspace.Subspace
 
-	// Aliases to room IDs
+	// Aliases to room IDs (and owner to authz delete)
+	//
+	// key: RoomAlias
+	// value: (RoomID, UserID)
 	aliasToID subspace.Subspace
+
+	// Aliases by roomID
+	//
+	// key: (RoomID, RoomAlias)
+	// value: empty
+	idAliases subspace.Subspace
 
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
@@ -96,6 +105,9 @@ func NewRoomsDatabase(
 		idToRoom:    roomsDir.Sub("id"),
 		idToDepth:   roomsDir.Sub("idd"),
 		idToVersion: roomsDir.Sub("iev"),
+
+		aliasToID: roomsDir.Sub("aid"),
+		idAliases: roomsDir.Sub("ida"),
 
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
 	}
@@ -157,4 +169,21 @@ func (r *RoomsDatabase) KeyForRoomVersion(roomID id.RoomID) fdb.Key {
 
 func (r *RoomsDatabase) KeyForRoomDepth(roomID id.RoomID) fdb.Key {
 	return r.idToDepth.Pack(tuple.Tuple{roomID.String()})
+}
+
+func (r *RoomsDatabase) KeyForRoomAlias(roomAlias id.RoomAlias) fdb.Key {
+	return r.aliasToID.Pack(tuple.Tuple{roomAlias.String()})
+}
+
+func (r *RoomsDatabase) KeyForIdAlias(roomID id.RoomID, roomAlias id.RoomAlias) fdb.Key {
+	return r.idAliases.Pack(tuple.Tuple{roomID.String(), roomAlias.String()})
+}
+
+func (r *RoomsDatabase) RangeForIDAliases(roomID id.RoomID) fdb.Range {
+	return r.idAliases.Sub(roomID.String())
+}
+
+func (r *RoomsDatabase) IDAliasKeyToRoomAlias(key fdb.Key) id.RoomAlias {
+	tup, _ := r.idAliases.Unpack(key)
+	return id.RoomAlias(tup[1].(string))
 }

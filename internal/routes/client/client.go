@@ -103,6 +103,12 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state", middleware.RequireUserAuth(c.GetRoomState))
 		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/members", middleware.RequireUserAuth(c.GetRoomMembers))
 
+		// Room aliases
+		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/aliases", middleware.RequireUserAuth(c.GetAliasesForRoom))
+		rtr.MethodFunc(http.MethodGet, "/v3/directory/room/{roomAlias}", c.GetAlias)
+		rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
+		rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
+
 		// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
 		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
 		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
