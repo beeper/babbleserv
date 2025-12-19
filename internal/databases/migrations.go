@@ -9,9 +9,7 @@ type migration struct {
 	handler func(context.Context) error
 }
 
-func (d *Databases) RunMigrations() {
-	return
-}
+func (d *Databases) RunMigrations() {}
 
 func (d *Databases) GetMigrations() []migration {
 	return []migration{

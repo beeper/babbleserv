@@ -199,11 +199,3 @@ func valueToAuthTokenTup(v []byte) *AuthTokenTup {
 		Expires:  time.UnixMicro(tup[2].(int64)),
 	}
 }
-
-func valueToRefreshTokenTup(v []byte) *RefreshTokenTup {
-	tup, _ := tuple.Unpack(v)
-	return &RefreshTokenTup{
-		UserID:   id.UserID(tup[0].(string)),
-		DeviceID: id.DeviceID(tup[1].(string)),
-	}
-}

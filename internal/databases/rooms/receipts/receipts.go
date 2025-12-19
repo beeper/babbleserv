@@ -8,14 +8,12 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
 type ReceiptsDirectory struct {
-	log    zerolog.Logger
-	db     fdb.Database
-	config config.BabbleConfig
+	log zerolog.Logger
+	db  fdb.Database
 
 	// ReceiptTup (user, room, thread, type) to version, used to clear previous keys when new ones are appended.
 	//

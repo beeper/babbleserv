@@ -35,12 +35,6 @@ type reqMemberSelf struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-type reqMemberJoin struct {
-	reqMemberSelf `json:",inline"`
-	// TODO: support third party join rules
-	// ThirdPartySigned struct{} `json:"third_party_signed"`
-}
-
 type reqMemberOther struct {
 	reqMemberSelf `json:",inline"`
 	UserID        id.UserID `json:"user_id"`

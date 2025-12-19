@@ -282,7 +282,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 	roomToEvs := make(map[id.RoomID][]*types.Event, 5)
 	for _, pdu := range verifyResults.Allowed {
 		if _, found := roomToEvs[pdu.RoomID]; !found {
-			roomToEvs[pdu.RoomID] = make([]*types.Event, 0, 0)
+			roomToEvs[pdu.RoomID] = make([]*types.Event, 0)
 		}
 		roomToEvs[pdu.RoomID] = append(roomToEvs[pdu.RoomID], pdu)
 	}

@@ -29,12 +29,13 @@ func TestEventHashAndSign(t *testing.T) {
 
 				Type:    event.NewEventType("X"),
 				Content: []byte(`{}`),
+				Unsigned: map[string]any{
+					"age_ts": 1000000,
+				},
 			},
 			ID:        "abc",
 			Timestamp: 1000000,
-			Unsigned: map[string]any{
-				"age_ts": 1000000,
-			}},
+		},
 		Depth:        3,
 		PrevEventIDs: []id.EventID{},
 		AuthEventIDs: []id.EventID{},

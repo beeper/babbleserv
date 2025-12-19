@@ -1,8 +1,6 @@
 package queue
 
 import (
-	"context"
-
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 )
@@ -19,7 +17,7 @@ import (
 type Queue[V any] struct {
 	db fdb.Database
 
-	handlerFn func(context.Context, V, func()) error
+	// handlerFn func(context.Context, V, func()) error
 
 	versionToItem subspace.Subspace
 	queueTups     subspace.Subspace

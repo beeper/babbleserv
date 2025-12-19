@@ -36,11 +36,12 @@ var presets = map[string][]struct {
 	"public_chat": {
 		{event.StateJoinRules, map[string]any{"join_rule": event.JoinRulePublic}},
 		{event.StateHistoryVisibility, map[string]any{"history_visibility": event.HistoryVisibilityShared}},
-		{event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessForbidden}},
+		// Not needed - default is forbidden
+		// {event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessForbidden}},
 	},
 }
 
-// https://spec.matrix.org/v1.10/client-server-api/#post_matrixclientv3createroom
+// https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3createroom
 func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	req, respErr := util.ParseRequestJSON[mautrix.ReqCreateRoom](r)
 	if respErr != nil {
@@ -53,9 +54,6 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 
 	evs := make([]*types.PartialEvent, 0, len(req.InitialState)+5)
 	sKey := "" // blank state key to point at
-
-	// Create events per the spec:
-	// https://spec.matrix.org/v1.10/client-server-api/#post_matrixclientv3createroom
 
 	// 1: The m.room.create event itself. Must be the first event in the room.
 	createContent := make(map[string]any, len(req.CreationContent)+2)
@@ -135,7 +133,14 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		evs = append(evs, nameEv)
 	}
 	if req.Topic != "" {
-		topicEv := types.NewPartialEvent(roomID, event.StateTopic, &sKey, userID, map[string]any{"topic": req.Topic})
+		topicEv := types.NewPartialEvent(roomID, event.StateTopic, &sKey, userID, map[string]any{
+			"topic": req.Topic,
+			"m.topic": map[string]any{
+				"m.text": []map[string]any{{
+					"body": req.Topic,
+				}},
+			},
+		})
 		evs = append(evs, topicEv)
 	}
 
@@ -146,10 +151,11 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	for _, uid := range req.Invite {
 		uidStr := string(uid)
 		inviteEv := types.NewPartialEvent(roomID, event.StateMember, &uidStr, userID, map[string]any{"membership": "invite"})
-		if uid.Homeserver() != c.config.ServerName {
-			externalInvites[uid] = inviteEv
-		} else {
+		// TODO: invite_room_state UNSIGNED
+		if uid.Homeserver() == c.config.ServerName {
 			evs = append(evs, inviteEv)
+		} else {
+			externalInvites[uid] = inviteEv
 		}
 	}
 
@@ -159,8 +165,6 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespCreateRoom{RoomID: roomID})
-
 	// Now send any external invites in a background goroutine so we don't block the create call
 	backgroundCtx := zerolog.Ctx(r.Context()).With().
 		Str("background_task", "SendRemoteInvitesAfterRoomCreate").
@@ -168,16 +172,13 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		WithContext(context.Background())
 	log := zerolog.Ctx(backgroundCtx)
 
-	c.backgroundWg.Add(1)
-	go func() {
-		defer c.backgroundWg.Done()
-
-		for uid, ev := range externalInvites {
-			_, respErr, err := c.prepareAndSendInviteForRemoteUser(backgroundCtx, roomID, uid, ev)
-			if err != nil {
-				log.Err(err).Any("resp_error", respErr).Msg("Error sending federated invite to newly created room")
-				// TODO: tell the request user about this! (via their personal control room)
-			}
+	for uid, ev := range externalInvites {
+		_, respErr, err := c.prepareAndSendInviteForRemoteUser(backgroundCtx, roomID, uid, ev)
+		if err != nil {
+			log.Err(err).Any("resp_error", respErr).Msg("Error sending federated invite to newly created room")
+			// TODO: tell the request user about this! (via their personal control room)
 		}
-	}()
+	}
+
+	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespCreateRoom{RoomID: roomID})
 }

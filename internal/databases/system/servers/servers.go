@@ -10,7 +10,6 @@ import (
 
 type ServersDirectory struct {
 	log zerolog.Logger
-	db  fdb.Database
 
 	// Server name to sync positions, similar to user devices
 	//

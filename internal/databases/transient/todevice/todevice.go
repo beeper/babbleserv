@@ -8,8 +8,6 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/beeper/babbleserv/internal/config"
-	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
@@ -17,10 +15,7 @@ import (
 // pagination during sync or federation sending. We also use these to store and sync/federate device
 // list changes (m.device_list_update EDU) and signing key updates (m.signing_key_update EDU).
 type ToDeviceDirectory struct {
-	log      zerolog.Logger
-	db       fdb.Database
-	config   config.BabbleConfig
-	notifier *notifier.Notifier
+	log zerolog.Logger
 
 	// Version to to-device details, acts as a global index so we can drop stale records, which
 	// build up as devices go missing/etc. These are not cleared when removing user/server messages

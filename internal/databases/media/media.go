@@ -19,9 +19,8 @@ import (
 const API_VERSION = 710
 
 type MediaDatabase struct {
-	log    zerolog.Logger
-	db     fdb.Database
-	config config.BabbleConfig
+	log zerolog.Logger
+	db  fdb.Database
 
 	byVersion,
 	byServerID subspace.Subspace

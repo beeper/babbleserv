@@ -111,7 +111,7 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 			rtr.Route("/_matrix/key", r.federation.AddKeyRoutes)
 			rtr.Route("/_matrix/federation", r.federation.AddFederationRoutes)
 		default:
-			panic(fmt.Errorf("Invalid route group: %s", group))
+			panic(fmt.Errorf("invalid route group: %s", group))
 		}
 	}
 

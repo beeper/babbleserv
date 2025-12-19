@@ -64,6 +64,10 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 				return
 			}
 			filter, err = c.db.Accounts.GetFilter(r.Context(), userID, b)
+			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			}
 		}
 	}
 
@@ -107,5 +111,4 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, sync)
-	return
 }

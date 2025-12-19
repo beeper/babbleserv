@@ -14,11 +14,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type subspace struct {
-	name    string
-	comment string
-}
-
 func genFileDocs(filename string) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)

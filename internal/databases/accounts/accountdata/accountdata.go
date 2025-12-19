@@ -8,14 +8,12 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
 type AccountDataDirectory struct {
-	log    zerolog.Logger
-	db     fdb.Database
-	config config.BabbleConfig
+	log zerolog.Logger
+	db  fdb.Database
 
 	// AccountDataTup to version, used to clear previous keys when new ones appended
 	//
