@@ -14,10 +14,10 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func (b *DebugRoutes) DebugGetEvent(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugGetEvent(w http.ResponseWriter, r *http.Request) {
 	eventID := id.EventID(chi.URLParam(r, "eventID"))
 
-	ev, err := b.db.Rooms.GetEvent(r.Context(), eventID)
+	ev, err := d.db.Rooms.GetEvent(r.Context(), eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -35,7 +35,7 @@ func (b *DebugRoutes) DebugGetEvent(w http.ResponseWriter, r *http.Request) {
 	}{util.EventForClientAPI(ev), ev.SoftFailed, ev.Outlier})
 }
 
-func (b *DebugRoutes) DebugMakeEvents(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugMakeEvents(w http.ResponseWriter, r *http.Request) {
 	var content map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
 		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
@@ -86,7 +86,7 @@ func (b *DebugRoutes) DebugMakeEvents(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	evs, rejected, err := b.db.Rooms.PrepareLocalEvents(r.Context(), roomID, partialEvs)
+	evs, rejected, err := d.db.Rooms.PrepareLocalEvents(r.Context(), roomID, partialEvs)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

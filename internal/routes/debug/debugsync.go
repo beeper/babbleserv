@@ -11,7 +11,7 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func (b *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
 	userID := id.UserID(chi.URLParam(r, "userID"))
 	deviceID := id.DeviceID(chi.URLParam(r, "deviceID"))
 
@@ -21,7 +21,7 @@ func (b *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sync, err := b.db.SyncForUser(r.Context(), userID, deviceID, types.SyncOptions{}, versions); err != nil {
+	if sync, err := d.db.SyncForUser(r.Context(), userID, deviceID, types.SyncOptions{}, versions); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else {

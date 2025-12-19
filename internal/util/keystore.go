@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/matrix-org/gomatrixserverlib/fclient"
@@ -19,6 +20,7 @@ type serverKeys struct {
 type KeyStore struct {
 	fclient fclient.FederationClient
 	cache   map[string]serverKeys
+	lock    sync.Mutex
 }
 
 func NewKeyStore(fclient fclient.FederationClient) *KeyStore {
@@ -29,13 +31,16 @@ func NewKeyStore(fclient fclient.FederationClient) *KeyStore {
 }
 
 func (k *KeyStore) GetServerKeys(ctx context.Context, serverName string) (serverKeys, error) {
+	k.lock.Lock()
+	defer k.lock.Unlock()
+
 	cached, found := k.cache[serverName]
 	if found && cached.validUntil.After(time.Now()) {
 		return cached, nil
 	}
 
 	zerolog.Ctx(ctx).Info().
-		Str("server", serverName).
+		Str("server2", serverName).
 		Msg("Fetching keys from server")
 
 	keys, err := k.fclient.GetServerKeys(ctx, spec.ServerName(serverName))
@@ -80,13 +85,4 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 	}
 
 	return errors.New("invalid signature")
-}
-
-func (k *KeyStore) VerifyHistoricalJSONFromServer(
-	ctx context.Context,
-	serverName string,
-	at time.Time,
-	b []byte,
-) error {
-	return errors.New("not implemented: VerifyHistoricalJSONFromServer")
 }

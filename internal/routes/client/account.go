@@ -57,10 +57,22 @@ func (c *ClientRoutes) Login(w http.ResponseWriter, r *http.Request) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid password")
 		return
 	}
+	// TODO: other auth methods?
+
+	username := req.Identifier.User
+
+	// Handle userIDs -> extract localpart
+	if userID := id.UserID(req.Identifier.User); userID.Homeserver() != "" {
+		if userID.Homeserver() != c.config.ServerName {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid userid")
+			return
+		}
+		username = userID.Localpart()
+	}
 
 	resp, err := c.db.Accounts.LoginWithPassword(
 		r.Context(),
-		req.Identifier.User,
+		username,
 		req.Password,
 		req.RefreshToken,
 		req.DeviceID,

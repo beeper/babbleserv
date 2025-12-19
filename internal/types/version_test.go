@@ -21,7 +21,7 @@ func TestVersionstamp(t *testing.T) {
 	incompleteVersion := tuple.IncompleteVersionstamp(1)
 
 	// Check we can do version -> bytes -> same version
-	b := types.VersionstampToBytes(incompleteVersion)
+	b := types.MustVersionstampToBytes(incompleteVersion)
 	versionFromBytes, err := types.BytesToVersionstamp(b)
 	require.NoError(t, err, string(b))
 	assert.Equal(t, incompleteVersion, versionFromBytes)
@@ -58,8 +58,8 @@ func TestVersionMap(t *testing.T) {
 
 	// Check that our custom msgpack encoding using bytes (vs. reflection on vstamp struct fields)
 	rawMap := map[string][]byte{
-		string(types.RoomsVersionKey):    types.VersionstampToBytes(incompleteVersionstamp),
-		string(types.AccountsVersionKey): types.VersionstampToBytes(otherVersionstamp),
+		string(types.RoomsVersionKey):    types.MustVersionstampToBytes(incompleteVersionstamp),
+		string(types.AccountsVersionKey): types.MustVersionstampToBytes(otherVersionstamp),
 	}
 	rawB, err := msgpack.Marshal(rawMap)
 	require.NoError(t, err)

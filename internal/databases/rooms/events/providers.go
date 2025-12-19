@@ -218,6 +218,27 @@ func (ap *TxnAuthEventsProvider) IsEventAllowed(ev *types.Event) error {
 	); err != nil {
 		return err
 	}
+
+	// TODO: there's a TODO in GMSL eventauth ~L1300 that states these are not checked - but they
+	// are tested by complement.
+	// LOL: complement tests only check the API level, if we do this check in the DB write other
+	// federated leave tests rely on this!
+	// if ev.Type == event.StateMember && ev.Membership() == event.MembershipLeave {
+	// 	oldEvID, found := ap.stateMap[types.StateTup{
+	// 		Type:     event.StateMember,
+	// 		StateKey: *ev.StateKey,
+	// 	}]
+	// 	if !found {
+	// 		return fmt.Errorf("user does not have room membership")
+	// 	}
+	// 	oldEv, err := ap.eventsProvider.Get(oldEvID)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	if oldEv.Membership() == event.MembershipLeave {
+	// 		return fmt.Errorf("user is already left")
+	// 	}
+
 	// If we authorized this event and it's a state event type, overwrite any
 	// in our stateEventIDs/memberEventIDs. This means subsequent auth checks
 	// will use this event if it has altered the auth state.

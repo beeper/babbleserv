@@ -65,7 +65,7 @@ func RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		log := hlog.FromRequest(r)
 		log.UpdateContext(func(c zerolog.Context) zerolog.Context {
-			return c.Str("user_id", u.UserID.String())
+			return c.Str("request_ud", u.UserID.String()+"/"+u.DeviceID.String())
 		})
 		next(w, r)
 	}

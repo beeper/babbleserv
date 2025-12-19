@@ -11,34 +11,34 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func (b *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 
-	room, err := b.db.Rooms.GetRoom(r.Context(), roomID)
+	room, err := d.db.Rooms.GetRoom(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
-	servers, err := b.db.Rooms.GetCurrentRoomServers(r.Context(), roomID)
+	servers, err := d.db.Rooms.GetCurrentRoomServers(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
-	stateEvs, err := b.db.Rooms.GetCurrentRoomStateEvents(r.Context(), roomID)
+	stateEvs, err := d.db.Rooms.GetCurrentRoomStateEvents(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
-	extremIDs, err := b.db.Rooms.GetRoomCurrentExtremEventIDs(r.Context(), roomID)
+	extremIDs, err := d.db.Rooms.GetRoomCurrentExtremEventIDs(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
-	receipts, err := b.db.Rooms.GetCurrentRoomReceipts(r.Context(), roomID)
+	receipts, err := d.db.Rooms.GetCurrentRoomReceipts(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -53,11 +53,11 @@ func (b *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
 	}{room, servers, extremIDs, stateEvs, receipts})
 }
 
-func (b *DebugRoutes) DebugGetRoomStateAt(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugGetRoomStateAt(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 	eventID := id.EventID(chi.URLParam(r, "eventID"))
 
-	allStateMap, err := b.db.Rooms.GetRoomStateMapAtEvent(r.Context(), roomID, eventID)
+	allStateMap, err := d.db.Rooms.GetRoomStateMapAtEvent(r.Context(), roomID, eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -70,7 +70,7 @@ func (b *DebugRoutes) DebugGetRoomStateAt(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	authStateMap, err := b.db.Rooms.GetRoomAuthStateMapAtEvent(r.Context(), roomID, eventID)
+	authStateMap, err := d.db.Rooms.GetRoomAuthStateMapAtEvent(r.Context(), roomID, eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -82,7 +82,7 @@ func (b *DebugRoutes) DebugGetRoomStateAt(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	memberStateMap, err := b.db.Rooms.GetRoomSpecificRoomMemberStateMapAtEvent(r.Context(), roomID, userIDs, eventID)
+	memberStateMap, err := d.db.Rooms.GetRoomSpecificRoomMemberStateMapAtEvent(r.Context(), roomID, userIDs, eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

@@ -41,24 +41,26 @@ func NewDebugRoutes(
 	}
 }
 
-func (b *DebugRoutes) AddDebugRoutes(rtr chi.Router) {
-	rtr.MethodFunc(http.MethodGet, "/debug/event/{eventID}", b.DebugGetEvent)
-	rtr.MethodFunc(http.MethodPost, "/debug/events/{roomID}", b.DebugMakeEvents)
+func (d *DebugRoutes) AddDebugRoutes(rtr chi.Router) {
+	rtr.MethodFunc(http.MethodGet, "/debug/event/{eventID}", d.DebugGetEvent)
+	rtr.MethodFunc(http.MethodPost, "/debug/events/{roomID}", d.DebugMakeEvents)
 
-	rtr.MethodFunc(http.MethodGet, "/debug/room/{roomID}", b.DebugGetRoom)
-	rtr.MethodFunc(http.MethodGet, "/debug/room/{roomID}/state/{eventID}", b.DebugGetRoomStateAt)
+	rtr.MethodFunc(http.MethodGet, "/debug/room/{roomID}", d.DebugGetRoom)
+	rtr.MethodFunc(http.MethodGet, "/debug/room/{roomID}/state/{eventID}", d.DebugGetRoomStateAt)
 
-	rtr.MethodFunc(http.MethodPost, "/debug/notifier/change", b.DebugSendNotifierChange)
+	rtr.MethodFunc(http.MethodPost, "/debug/notifier/change", d.DebugSendNotifierChange)
 
-	rtr.MethodFunc(http.MethodGet, "/debug/user/{userID}", b.DebugGetUser)
-	rtr.MethodFunc(http.MethodGet, "/debug/user/{userID}/sync", b.DebugSyncUser)
+	rtr.MethodFunc(http.MethodGet, "/debug/user/{userID}", d.DebugGetUser)
+	rtr.MethodFunc(http.MethodGet, "/debug/user/{userID}/sync", d.DebugSyncUser)
 
-	rtr.MethodFunc(http.MethodGet, "/debug/server/{serverName}", b.DebugGetServer)
+	rtr.MethodFunc(http.MethodGet, "/debug/server/{serverName}", d.DebugGetServer)
 
-	rtr.MethodFunc(http.MethodGet, "/debug/scratch", b.DebugScratch)
+	rtr.MethodFunc(http.MethodGet, "/debug/system/iterators", d.DebugGetIteratorPositions)
+
+	rtr.MethodFunc(http.MethodGet, "/debug/scratch", d.DebugScratch)
 }
 
-func (b *DebugRoutes) DebugScratch(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugScratch(w http.ResponseWriter, r *http.Request) {
 	// Scratch debug area
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)

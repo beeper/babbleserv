@@ -19,15 +19,6 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 	userID := middleware.GetRequestUserID(r)
 
-	// Check the user *was* joined to the room at the time this event was sent
-	if wasInRoom, err := c.db.Rooms.WasUserJoinedRoomAtEvent(r.Context(), userID, roomID, eventID); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else if !wasInRoom {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "You do not have access to this event")
-		return
-	}
-
 	ev, err := c.db.Rooms.GetEvent(r.Context(), eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
@@ -38,6 +29,15 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 	} else if ev.RoomID != roomID {
 		// Return a 404 if the event isn't in the room in the request
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	}
+
+	// Check the user *was* joined to the room at the time this event was sent
+	if wasInRoom, err := c.db.Rooms.WasUserJoinedRoomAtEvent(r.Context(), userID, roomID, eventID); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	} else if !wasInRoom {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "You do not have access to this event")
 		return
 	}
 
@@ -74,7 +74,6 @@ func (c *ClientRoutes) GetRoomStateEvent(w http.ResponseWriter, r *http.Request)
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, stateEv.Content)
-
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3roomsroomidstate

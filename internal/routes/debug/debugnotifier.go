@@ -9,7 +9,7 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func (b *DebugRoutes) DebugSendNotifierChange(w http.ResponseWriter, r *http.Request) {
+func (d *DebugRoutes) DebugSendNotifierChange(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
 	change := notifier.Change{}
@@ -27,14 +27,14 @@ func (b *DebugRoutes) DebugSendNotifierChange(w http.ResponseWriter, r *http.Req
 		change.Servers = []string{query.Get("server")}
 	}
 
-	if b.notifiers.Rooms != nil {
-		b.notifiers.Rooms.SendChange(change)
+	if d.notifiers.Rooms != nil {
+		d.notifiers.Rooms.SendChange(change)
 	}
-	if b.notifiers.Accounts != nil {
-		b.notifiers.Accounts.SendChange(change)
+	if d.notifiers.Accounts != nil {
+		d.notifiers.Accounts.SendChange(change)
 	}
-	if b.notifiers.Transient != nil {
-		b.notifiers.Transient.SendChange(change)
+	if d.notifiers.Transient != nil {
+		d.notifiers.Transient.SendChange(change)
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)

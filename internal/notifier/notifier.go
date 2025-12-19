@@ -46,7 +46,7 @@ type Change struct {
 
 func (c Change) MarshalZerologObject(ev *zerolog.Event) {
 	for _, eventID := range c.EventIDs {
-		ev.Str("even_id", eventID.String())
+		ev.Str("event_id", eventID.String())
 	}
 	for _, roomID := range c.RoomIDs {
 		ev.Str("room_id", roomID.String())
@@ -97,9 +97,12 @@ func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) 
 		Str("notifier", name).
 		Logger()
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr,
-	})
+	var rdb *redis.Client
+	if cfg.RedisAddr != "" {
+		rdb = redis.NewClient(&redis.Options{
+			Addr: cfg.RedisAddr,
+		})
+	}
 
 	// Generate a small and process specific instance ID from XID's machine ID + PID
 	uid := xid.New()
@@ -123,6 +126,7 @@ func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) 
 		roomIDToChan:       make(map[id.RoomID]map[chan any]struct{}),
 		eventChs:           make(map[chan any]struct{}),
 		serverChs:          make(map[chan any]struct{}),
+		userChs:            make(map[chan any]struct{}),
 	}
 }
 
@@ -138,11 +142,13 @@ func (n *Notifier) Start() {
 		n.wg.Done()
 	}()
 
-	n.wg.Add(1)
-	go func() {
-		n.redisLoop(ctx)
-		n.wg.Done()
-	}()
+	if n.redis != nil {
+		n.wg.Add(1)
+		go func() {
+			n.redisLoop(ctx)
+			n.wg.Done()
+		}()
+	}
 }
 
 func (n *Notifier) Stop() {
@@ -170,7 +176,9 @@ func (n *Notifier) SendChange(change Change) {
 	n.log.Trace().Any("change", change).Msg("Sending change")
 	n.sendInternalChange(change)
 	// Fire of the Redis change asynchronously, as pubsub is best-effort + unordered
-	go n.sendRedisChange(n.log.WithContext(context.Background()), change)
+	if n.redis != nil {
+		go n.sendRedisChange(n.log.WithContext(context.Background()), change)
+	}
 }
 
 func (n *Notifier) sendInternalChange(change Change) {
