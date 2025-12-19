@@ -107,7 +107,6 @@ func (c *ClientRoutes) makeFederatedEvent(
 
 	ev := types.EventFromProtoEvent(resp.Event)
 	ev.Timestamp = time.Now().UTC().UnixMilli()
-	ev.Origin = c.config.ServerName
 	ev.RoomVersion = roomVersion
 
 	keyID, key := c.config.MustGetActiveSigningKey()

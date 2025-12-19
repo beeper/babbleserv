@@ -158,6 +158,7 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 			return util.EmptyJSON
 		})
 	} else {
+		// TODO: lookup any invite
 		otherServers := getOtherServers(r, roomID)
 		ev, otherServer, err := c.makeFederatedEvent(r, roomID, otherServers, func(otherServer string) (federatedMakeResp, error) {
 			makeJoinResp, err := c.fclient.MakeJoin(
@@ -207,7 +208,9 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return
 			}
-			verifyErr, err := util.VerifyEvent(backgroundCtx, remoteEv, remoteEv.Origin, c.keyStore)
+			// Verify the event is signed by the senders server (which may not be the one we are
+			// joining the room via).
+			verifyErr, err := util.VerifyEvent(backgroundCtx, remoteEv, remoteEv.Sender.Homeserver(), c.keyStore)
 			if err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return
@@ -239,6 +242,9 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		if _, err = c.db.Rooms.SendFederatedEvents(
 			backgroundCtx, roomID, allEvs,
 			rooms.SendFederatedEventsOptions{
+				// We're joining *now* and won't have all prev event history, ultimately we have
+				// to trust the other HS is giving us the correct state.
+				IsRemoteJoin: true,
 				// We're joining, meaning we're *not* currently in the room
 				SkipServerInRoomCheck: true,
 			},
@@ -363,6 +369,12 @@ func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
 			return util.EmptyJSON
 		})
 	}
+
+	// TODO: this isn't quite right, we need to ensure that both us and the other relevant HS are
+	// in the room to do the local send.
+	// - if we're not in the room, but other HS is -> make/send leave, send local outlier
+	// - if we're in the room, other HS is not -> make/send leave, send as federated
+	// - both in room - send local leave
 
 	if serverInRoom {
 		// The easy path - we're (the server) in the room, we can just send the leave. Note that

@@ -3,6 +3,7 @@ package federation
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 
@@ -178,10 +179,35 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		}
 	}
 
+	// Edge cases: we're no longer in the room but either:
+	// - remote user is rejecting an invite sent from a local user before they left
+	// - remote user is rejecting their own invite and we've never been in the room
+	// TODO: in those cases we should store the memberships as outliers, don't skip the check
+
+	var skipInRoomCheck bool
+	if membership == event.MembershipLeave {
+		otherUserMembership, err := f.db.Rooms.GetUserMembership(r.Context(), id.UserID(*ev.StateKey), roomID)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
+		if otherUserMembership != nil && otherUserMembership.Membership == event.MembershipInvite {
+			currentMembershipEv, err := f.db.Rooms.GetEvent(r.Context(), otherUserMembership.EventID)
+			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			} else if currentMembershipEv == nil {
+				panic(fmt.Errorf("missing membership event: %s", otherUserMembership.EventID))
+			}
+			if currentMembershipEv.Sender.Homeserver() == f.config.ServerName ||
+				currentMembershipEv.Sender == ev.Sender {
+				skipInRoomCheck = true
+			}
+		}
+	}
+
 	options := rooms.SendFederatedEventsOptions{
-		// TODO: fixme, if this is a local room that happens to be empty (everyone left) we're not
-		// actually joined (as a server) anymore, so the check fails.
-		SkipServerInRoomCheck: true,
+		SkipServerInRoomCheck: skipInRoomCheck,
 	}
 	res, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, options)
 	if err != nil {

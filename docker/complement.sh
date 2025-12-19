@@ -10,6 +10,11 @@ openssl x509 -req -in $SERVER_NAME.csr -CA /complement/ca/ca.crt -CAkey /complem
 # Ensure fdb is running
 service foundationdb start
 
-# Run babbleserv
+# Generate a signing key (if needed)
+test -f ed25519-active || /build/babbleserv-cli generate-signing-key -out=ed25519-active
+
+# Configure
 sed -i s/SERVER_NAME/$SERVER_NAME/ /complement-config.yaml
+
+# Run babbleserv
 exec /build/babbleserv -config /complement-config.yaml -prettyLogs -debug -routes -workers

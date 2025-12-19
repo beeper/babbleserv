@@ -11,6 +11,8 @@ RUN wget https://github.com/apple/foundationdb/releases/download/7.3.71/foundati
 RUN wget https://github.com/apple/foundationdb/releases/download/7.3.71/foundationdb-server_7.3.71-1_amd64.deb && \
     dpkg -i foundationdb-server_7.3.71-1_amd64.deb
 
+RUN apt-get update && apt-get install -y libolm-dev libolm3
+
 # Setup go dependencies
 COPY go.mod go.sum /build/
 # COPY external /build/external
@@ -19,6 +21,8 @@ RUN go mod download
 COPY . /build
 RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -o babbleserv ./cmd/babbleserv
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -o babbleserv-cli ./cmd/babbleserv-cli
 
 COPY docker/complement.sh /complement.sh
 COPY docker/complement-config.yaml /complement-config.yaml

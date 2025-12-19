@@ -53,16 +53,17 @@ type Event struct {
 	Local bool `msgpack:"loc" json:"-"`
 	// Internal copy of the room version so we don't need to look it up
 	RoomVersion string `msgpack:"rmv" json:"-"`
-	// Internal indicators of whether an event is soft failed or an outlier,
-	// if so it should not appear in any indices or user facing responses.
+	// Internal indicators of whether an event is soft failed or an outlier, if so it should not
+	// appear in any indices or user facing responses.
 	SoftFailed bool `msgpack:"sfd" json:"-"`
 	Outlier    bool `msgpack:"out" json:"-"`
 	Rejected   bool `msgpack:"rej" json:"-"`
-	// Internal indicator of whether the event has been redacted - note the
-	// actual content will not be redacted in the DB.
+	// Internal indicator of whether the event has been redacted - needed? (content hash)
 	Redacted bool `msgpack:"red" json:"-"`
 
-	Origin string `msgpack:"ori" json:"origin"`
+	// Spec unclear, sometimes exists others does not - must be here for signature validation, not
+	// actually used anywhere.
+	Origin string `msgpack:"ori" json:"origin,omitempty"`
 
 	Depth int64 `msgpack:"dpt" json:"depth"`
 

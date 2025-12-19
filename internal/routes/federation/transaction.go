@@ -3,7 +3,6 @@ package federation
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"maps"
 	"net/http"
 	"slices"
@@ -423,8 +422,6 @@ func (f *FederationRoutes) getMissingEventsForSendBatch(
 		var ev types.Event
 		if err := json.Unmarshal(b, &ev); err != nil {
 			return nil, err
-		} else if ev.Origin != origin {
-			return nil, fmt.Errorf("event origin mismatch")
 		}
 		ev.RoomVersion = roomVersion
 

@@ -192,7 +192,6 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 			},
 			Local:        true,
 			Depth:        depth,
-			Origin:       r.config.ServerName,
 			RoomVersion:  room.Version,
 			PrevEventIDs: prevEventIDs,
 		}
@@ -284,6 +283,11 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 }
 
 type SendFederatedEventsOptions struct {
+	// Skip stage 5 auth of the state at each events prev_events. This is required when doing remote
+	// joins where we don't have the history of the room prior to the join.
+	IsRemoteJoin bool
+	// By default we check, within the write txn, that this server is currently in the room - this
+	// disables that when expected (remote join).
 	SkipServerInRoomCheck bool
 }
 
@@ -455,6 +459,10 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// Second read only transaction, second authorization check:
 	// Step 5: Passes authorization rules based on the state before the event, otherwise it is rejected.
 	if _, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
+		if options.IsRemoteJoin {
+			return nil, nil
+		}
+
 		// New provider for this txn copying any events we pulled in the last
 		eventsProvider = r.events.NewTxnEventsProvider(ctx, txn).WithProviderEvents(eventsProvider)
 
@@ -638,9 +646,15 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		changedServers := make(map[string]struct{}, 1)
 
 		if r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers) {
-			// Split into it's own method for readability, should probably only ever called here
-			if err := r.txnResolveRoomState(ctx, txn, room, evs, changedUsers, changedServers, eventsProvider); err != nil {
-				return nil, fmt.Errorf("failed to resolve room state: %w", err)
+			// If we're a remote join we'll probably have multiple extremeties because we don't
+			// have the full history of the room. For now skip state res at this point, the next
+			// event in the room will trigger it, however. To properly fix this we should overwrite
+			// the room extreme IDs to just be the join event from the join handshake.
+			if !options.IsRemoteJoin {
+				// Split into it's own method for readability, should probably only ever called here
+				if err := r.txnResolveRoomState(ctx, txn, room, evs, changedUsers, changedServers, eventsProvider); err != nil {
+					return nil, fmt.Errorf("failed to resolve room state: %w", err)
+				}
 			}
 		} else {
 			log.Warn().Msg("No events stored in send transaction")
