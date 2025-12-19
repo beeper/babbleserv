@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -euo pipefail
+set -exu
 
 # Bootstrap the TLS certificate
 openssl genrsa -out $SERVER_NAME.key 2048
@@ -12,4 +12,4 @@ service foundationdb start
 
 # Run babbleserv
 sed -i s/SERVER_NAME/$SERVER_NAME/ /complement-config.yaml
-exec /build/babbleserv -config /complement-config.yaml -prettyLogs -trace -routes -workers
+exec /build/babbleserv -config /complement-config.yaml -prettyLogs -debug -routes -workers

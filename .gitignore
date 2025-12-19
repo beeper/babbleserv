@@ -3,3 +3,6 @@ config.yaml
 clusterfile
 ed25519-*
 *.pem
+babbleserv
+external/
+.claude/

@@ -4,9 +4,20 @@ signingKeys:
     path: ed25519-active
 database:
   rooms:
-    clusterFilePath: /etc/foundationdb/fdb.cluster
-    transactionTimeout: 5000
-    transactionRetryLimit: 50
+    transactionTimeout: 15000
+    transactionRetryLimit: 100
+  accounts:
+    transactionTimeout: 15000
+    transactionRetryLimit: 100
+  transient:
+    transactionTimeout: 15000
+    transactionRetryLimit: 100
+  media:
+    transactionTimeout: 15000
+    transactionRetryLimit: 100
+  system:
+    transactionTimeout: 15000
+    transactionRetryLimit: 100
 routes:
   servers:
     - listenAddr: 0.0.0.0:8008
@@ -19,7 +30,7 @@ routes:
         - client  # needed for versions endpoint
         - federation
 notifier:
-  redisAddr: 127.0.0.1:6379
+  redisAddr:
 rooms:
   enabled: true
   defaultVersion: 11
