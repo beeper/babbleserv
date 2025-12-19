@@ -136,4 +136,3 @@ list changes (m.device_list_update EDU) and signing key updates (m.signing_key_u
 | `localUserMessages` | `(UserID, DeviceID, Version)` | `types.ToDevice` | To-device messages for local user devices<br/> |
 | `localUserMessageTxns` | `(UserID, DeviceID, TransactionID)` | `[]byte (always empty)` | Used to-device transaction IDs<br/> |
 | `remoteServerMessages` | `(ServerName, version)` | `types.ToDevice (as msgpack []byte)` | To-device messages for other user devices on other homeservers<br/> |
-
