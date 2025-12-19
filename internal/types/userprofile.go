@@ -1,12 +1,22 @@
 package types
 
-import "github.com/vmihailenco/msgpack/v5"
+import (
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/vmihailenco/msgpack/v5"
+	"maunium.net/go/mautrix/id"
+)
 
 type UserProfile struct {
 	DisplayName string `json:"displayname" msgpack:"dn"`
 	AvatarURL   string `json:"avatar_url" msgpack:"au"`
 
 	Custom map[string]any `json:"-" msgpack:"cu"` // MSC4133 placeholder
+}
+
+type UserProfileChange struct {
+	UserID  id.UserID
+	Version tuple.Versionstamp
+	Profile *UserProfile
 }
 
 func NewUserProfileFromBytes(b []byte) (*UserProfile, error) {

@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 var errIsLocked = errors.New("lock is locked")
@@ -27,8 +28,10 @@ type LockOptions struct {
 	Timeout       time.Duration
 }
 
+type LockTxnRefreshFunc func(fdb.Transaction)
+
 type Lock struct {
-	TxnRefresh func(fdb.Transaction)
+	TxnRefresh LockTxnRefreshFunc
 	Refresh    func()
 	Release    func()
 }
@@ -89,8 +92,6 @@ func acquireLock(ctx context.Context, database LockingDatabase, name string, opt
 	log.Debug().Msg("Acquiring lock...")
 
 	for {
-		// Note: use of db.Transact not util.DoWriteTransaction so we don't
-		// write a time -> version every attempt.
 		if token, err := acquireLockOnce(ctx, database, name, options); err == errIsLocked {
 			log.Trace().
 				Dur("retry", options.RetryInterval/2).
@@ -114,9 +115,7 @@ func acquireLockOnce(ctx context.Context, database LockingDatabase, name string,
 
 	db, prefix := database.GetLockPrimitives()
 
-	// Note: use of db.Transact not util.DoWriteTransaction so we don't
-	// write a time -> version every attempt.
-	if fut, err := db.Transact(func(txn fdb.Transaction) (any, error) {
+	if fut, err := util.DoWriteTransaction(ctx, db, func(txn fdb.Transaction) (any, error) {
 		if txnIsLocked(ctx, txn, prefix, name) {
 			return nil, errIsLocked
 		}
@@ -135,6 +134,7 @@ func makeLock(
 	options LockOptions,
 	token []byte,
 ) Lock {
+	log := zerolog.Ctx(ctx)
 	db, prefix := database.GetLockPrimitives()
 
 	refreshLockTxn := func(txn fdb.Transaction) {
@@ -148,30 +148,44 @@ func makeLock(
 		vstamp := tup[0].(tuple.Versionstamp)
 		vtoken := vstamp.TransactionVersion[:]
 
-		if bytes.Compare(vtoken, token) != 0 {
+		if !bytes.Equal(vtoken, token) {
 			panic(fmt.Sprintf("lock fencing token changed (got %b, expected %b)", vtoken, token))
 		}
 
 		txnUpdateLock(txn, prefix, name, options.Timeout)
 	}
 
+	// Both refreshLock & releaseLock use db.Transact directly not the util.DoWriteTransaction
+	// wrapper used elsewhere. We don't want the ctx check as our ctx is likely canceled during
+	// lock release. And we also don't want such verbose logging.
+
 	refreshLock := func() {
-		// Note: use of db.Transact not util.DoWriteTransaction so we don't
-		// write a time -> version every refresh.
-		db.Transact(func(txn fdb.Transaction) (any, error) {
+		// Note: use of db.Transact not util.DoWriteTransaction
+		_, err := db.Transact(func(txn fdb.Transaction) (any, error) {
 			refreshLockTxn(txn)
 			return nil, nil
 		})
+		if err != nil {
+			panic(err)
+		}
+		log.Trace().
+			Str("name", name).
+			Bytes("token", token).
+			Msg("Refreshed lock")
 	}
 
 	releaseLock := func() {
-		db.Transact(func(txn fdb.Transaction) (any, error) {
+		// Note: use of db.Transact not util.DoWriteTransaction
+		_, err := db.Transact(func(txn fdb.Transaction) (any, error) {
 			txn.Clear(keyForLock(prefix, name))
 			txn.Clear(keyForLockExpires(prefix, name))
 			txn.Clear(keyForLockHostname(prefix, name))
 			return nil, nil
 		})
-		zerolog.Ctx(ctx).Debug().
+		if err != nil {
+			panic(err)
+		}
+		log.Debug().
 			Str("name", name).
 			Bytes("token", token).
 			Msg("Released lock")

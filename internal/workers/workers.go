@@ -9,11 +9,6 @@ import (
 	"github.com/beeper/babbleserv/internal/notifier"
 )
 
-type Worker interface {
-	Start()
-	Stop()
-}
-
 type Workers struct {
 	log    zerolog.Logger
 	config config.BabbleConfig
@@ -42,6 +37,21 @@ func NewWorkers(
 			NewEventsIterator(log, cfg, db, notifiers),
 			NewFederationSender(log, cfg, db, notifiers, fclient),
 		)
+	}
+
+	if cfg.Accounts.Enabled {
+		// ProfileChangeIterator accounts profile changes -> room member events
+		if cfg.Rooms.Enabled {
+			workers = append(workers,
+				NewProfileChangeIterator(log, cfg, db, notifiers),
+			)
+		}
+		// DeviceChangeIterator accounts device changes -> transient to device
+		if cfg.Transient.Enabled {
+			workers = append(workers,
+				NewDeviceChangeIterator(log, cfg, db, notifiers),
+			)
+		}
 	}
 
 	return &Workers{
