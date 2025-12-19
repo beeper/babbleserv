@@ -1,8 +1,12 @@
 package accounts
 
 import (
+	"context"
+	"time"
+
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/config"
@@ -11,6 +15,7 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/accounts/tokens"
 	"github.com/beeper/babbleserv/internal/databases/accounts/users"
 	"github.com/beeper/babbleserv/internal/notifier"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 const API_VERSION = 710
@@ -30,6 +35,7 @@ type AccountsDatabase struct {
 func NewAccountsDatabase(
 	cfg config.BabbleConfig,
 	logger zerolog.Logger,
+	notifier *notifier.Notifier,
 ) *AccountsDatabase {
 	log := logger.With().
 		Str("database", "accounts").
@@ -54,11 +60,12 @@ func NewAccountsDatabase(
 		Msg("Init accounts directory")
 
 	return &AccountsDatabase{
-		log:    log,
-		db:     db,
-		config: cfg,
+		log:      log,
+		db:       db,
+		config:   cfg,
+		notifier: notifier,
 
-		users:       users.NewUsersDirectory(log, db, accountsDir),
+		users:       users.NewUsersDirectory(cfg, log, db, accountsDir),
 		tokens:      tokens.NewTokensDirectory(log, db, accountsDir),
 		devices:     devices.NewDevicesDirectory(log, db, accountsDir),
 		accountdata: accountdata.NewAccountDataDirectory(log, db, accountsDir),
@@ -66,4 +73,18 @@ func NewAccountsDatabase(
 }
 
 func (a *AccountsDatabase) Stop() {
+}
+
+func (a *AccountsDatabase) getTxnLogContext(ctx context.Context, name string) zerolog.Context {
+	return zerolog.Ctx(ctx).With().
+		Str("component", "database").
+		Str("database", "rooms").
+		Str("transaction", name)
+}
+
+func (a *AccountsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (time.Time, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (time.Time, error) {
+		time := util.TxnGetTimeForVersion(txn, version)
+		return time, nil
+	})
 }

@@ -50,7 +50,7 @@ func NewDatabases(
 		dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers.Rooms)
 	}
 	if cfg.Accounts.Enabled {
-		dbs.Accounts = accounts.NewAccountsDatabase(cfg, log)
+		dbs.Accounts = accounts.NewAccountsDatabase(cfg, log, notifiers.Accounts)
 	}
 	if cfg.Transient.Enabled {
 		dbs.Transient = transient.NewTransientDatabase(cfg, log, notifiers.Transient)

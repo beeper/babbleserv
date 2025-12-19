@@ -9,19 +9,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
 var ZeroTime time.Time
 
+const deviceIDBytes = 8
+
 func generateDeviceID() id.DeviceID {
-	return id.DeviceID(util.GenerateRandomStringBase32Hex(8))
+	return id.DeviceID(util.GenerateRandomStringBase32Hex(deviceIDBytes))
 }
 
-func (a *AccountsDatabase) GetLocalUser(ctx context.Context, username string) (*types.User, error) {
+func (a *AccountsDatabase) GetLocalUser(ctx context.Context, userID id.UserID) (*types.User, error) {
 	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*types.User, error) {
-		return a.users.TxnGetLocalUser(txn, username, a.config.ServerName)
+		return a.users.TxnGetLocalUser(txn, userID)
 	})
 }
 
@@ -57,6 +60,9 @@ func (a *AccountsDatabase) LoginWithPassword(
 	deviceID id.DeviceID,
 	initialDeviceDisplayName string,
 ) (authResp, error) {
+	// TODO: check if deviceID is base64 -> correct bytes for ed25519 -> reject, just don't allow
+	// ed25519 keys base64'd as deviceIDs
+
 	if deviceID == "" {
 		deviceID = generateDeviceID()
 	}
@@ -64,7 +70,7 @@ func (a *AccountsDatabase) LoginWithPassword(
 		DeviceID: deviceID,
 	}
 
-	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (authResp, error) {
+	resp, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (authResp, error) {
 		hashedPassword, err := a.users.TxnGetLocalUserPasswordHash(txn, username)
 		if err != nil {
 			return resp, err
@@ -92,6 +98,13 @@ func (a *AccountsDatabase) LoginWithPassword(
 
 		return resp, nil
 	})
+
+	if err == nil {
+		a.notifier.SendChange(notifier.Change{
+			UserIDs: []id.UserID{resp.UserID},
+		})
+	}
+	return resp, err
 }
 
 // Registers a user with a given username/password combination, note the username is not checked
@@ -116,14 +129,14 @@ func (a *AccountsDatabase) RegisterWithPassword(
 		return resp, err
 	}
 
-	if _, err = util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (*struct{}, error) {
+	if _, err = util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (*struct{}, error) {
 		user := types.User{
 			Username:   username,
 			ServerName: a.config.ServerName,
 			CreatedAt:  time.Now().UTC(),
 		}
 
-		if err := a.users.TxnCreateUser(txn, &user, hashedPassword); err != nil {
+		if err := a.users.TxnCreateLocalUser(txn, &user, hashedPassword); err != nil {
 			return nil, err
 		}
 
@@ -147,6 +160,9 @@ func (a *AccountsDatabase) RegisterWithPassword(
 		return resp, err
 	}
 
+	a.notifier.SendChange(notifier.Change{
+		UserIDs: []id.UserID{resp.UserID},
+	})
 	zerolog.Ctx(ctx).
 		Info().
 		Str("username", username).

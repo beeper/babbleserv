@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -10,8 +11,10 @@ import (
 type EDUType string
 
 var (
-	EDUTypeToDevice EDUType = "m.direct_to_device"
-	EDUTypeReceipt  EDUType = "m.receipt"
+	EDUTypeToDevice         EDUType = "m.direct_to_device"
+	EDUTypeReceipt          EDUType = "m.receipt"
+	EDUTypeDeviceListUpdate EDUType = "m.device_list_update"
+	EDUTypeSigningKeyUpdate EDUType = "m.signing_key_update"
 )
 
 type EDU struct {
@@ -37,4 +40,23 @@ type ToDeviceEDUContent struct {
 	Messages  ToDeviceEDUMessages `json:"messages"`
 	Sender    id.UserID           `json:"sender"`
 	Type      event.Type          `json:"type"`
+}
+
+// TODO: move to mautrix
+type SigningKeyUpdateEDUContent struct {
+	UserID      id.UserID                `json:"user_id"`
+	MasterKey   mautrix.CrossSigningKeys `json:"master_key"`
+	SelfSigning mautrix.CrossSigningKeys `json:"self_signing_key"`
+}
+
+// TODO: move to mautrix
+type DeviceListUpdateEDUContent struct {
+	DeviceID id.DeviceID `json:"device_id"`
+	UserID   id.UserID   `json:"user_id"`
+	StreamID int64       `json:"stream_id"`
+
+	PrevID            []int64             `json:"prev_id,omitzero"`
+	DeviceKeys        *mautrix.DeviceKeys `json:"keys,omitempty"`
+	Deleted           bool                `json:"deleted,omitzero"`
+	DeviceDisplayName string              `json:"device_display_name,omitzero"`
 }

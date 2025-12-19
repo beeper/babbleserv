@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"crypto/ed25519"
+	"crypto/tls"
 	"net/http"
 
 	"github.com/matrix-org/gomatrixserverlib"
@@ -14,6 +16,8 @@ import (
 	"github.com/beeper/babbleserv/internal/routes"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/workers"
+	"maunium.net/go/mautrix/federation"
+	"maunium.net/go/mautrix/id"
 )
 
 type Babbleserv struct {
@@ -34,7 +38,7 @@ func (t *UserAgentTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
-	log := log.With().Logger()
+	log := log.With().Str("server_name", cfg.ServerName).Logger()
 
 	// Overwrite default Go HTTP client user agent
 	http.DefaultClient.Transport = &UserAgentTransport{http.DefaultTransport, cfg.UserAgent}
@@ -46,6 +50,17 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 		KeyID:      gomatrixserverlib.KeyID(keyID),
 		PrivateKey: key,
 	}}, fclient.WithUserAgent(cfg.UserAgent), fclient.WithSkipVerify(true))
+
+	fedCache := federation.NewInMemoryCache()
+	fedClient := federation.NewClient(cfg.ServerName, &federation.SigningKey{
+		ID:   id.KeyID(keyID),
+		Pub:  id.SigningKey(key.Public().(ed25519.PublicKey)),
+		Priv: key,
+	}, fedCache)
+
+	fedClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true,
+	}
 
 	// Create a global key store to cache server signing keys
 	keyStore := util.NewKeyStore(fclient)
@@ -63,7 +78,7 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 
 	var rts *routes.Routes
 	if cfg.RoutesEnabled {
-		rts = routes.NewRoutes(cfg, log, db, notifiers, fclient, keyStore, datastores)
+		rts = routes.NewRoutes(cfg, log, db, notifiers, fclient, fedClient, keyStore, datastores)
 	} else {
 		log.Info().Msg("Routes disabled")
 	}

@@ -7,11 +7,12 @@ var (
 	ErrAlreadyExists = errors.New("event already exists")
 	ErrEventRedacted = errors.New("event has been redacted")
 
-	ErrUserNotInRoom     = errors.New("user is not in this room")
-	ErrUserNotFound      = errors.New("user not found")
+	ErrUserNotInRoom      = errors.New("user is not in this room")
+	ErrUserNotFound       = errors.New("user not found")
+	ErrUserDeviceNotFound = errors.New("user device not found")
+
 	ErrTokenExpired      = errors.New("token is expired")
 	ErrUserAlreadyExists = errors.New("username already exists")
-	ErrProfileNotChanged = errors.New("profile is unchanged")
 	ErrInvalidPassword   = errors.New("invalid password")
 
 	ErrRoomNotFound      = errors.New("room not found")

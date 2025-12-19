@@ -4,13 +4,12 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/cespare/xxhash"
 	"github.com/go-chi/chi/v5"
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/federation"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
@@ -26,13 +25,10 @@ type ClientRoutes struct {
 	db         *databases.Databases
 	config     config.BabbleConfig
 	fclient    fclient.FederationClient
+	fedClient  *federation.Client
 	keyStore   *util.KeyStore
 	datastores *util.Datastores
 	notifiers  *notifier.Notifiers
-}
-
-func xxhashMatrixKey[K id.UserID](s K) uint32 {
-	return uint32(xxhash.Sum64String(string(s)))
 }
 
 func NewClientRoutes(
@@ -40,6 +36,7 @@ func NewClientRoutes(
 	logger zerolog.Logger,
 	db *databases.Databases,
 	fclient fclient.FederationClient,
+	fedClient *federation.Client,
 	keyStore *util.KeyStore,
 	datastores *util.Datastores,
 	notifiers *notifier.Notifiers,
@@ -53,6 +50,7 @@ func NewClientRoutes(
 		db:         db,
 		config:     cfg,
 		fclient:    fclient,
+		fedClient:  fedClient,
 		keyStore:   keyStore,
 		datastores: datastores,
 		notifiers:  notifiers,
@@ -126,7 +124,18 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 		rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
 
+		rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
+		rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
+		rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
+		rtr.MethodFunc(http.MethodDelete, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.DeleteDevice))
+		rtr.MethodFunc(http.MethodDelete, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
+
+		rtr.MethodFunc(http.MethodGet, "/v3/keys/changes", middleware.RequireUserAuth(c.GetKeyChanges))
+		rtr.MethodFunc(http.MethodPost, "/v3/keys/query", middleware.RequireUserAuth(c.QueryKeys))
 		rtr.MethodFunc(http.MethodPost, "/v3/keys/upload", middleware.RequireUserAuth(c.UploadKeys))
+		rtr.MethodFunc(http.MethodPost, "/v3/keys/claim", middleware.RequireUserAuth(c.ClaimKeys))
+		rtr.MethodFunc(http.MethodPost, "/v3/keys/signatures/upload", middleware.RequireUserAuth(c.UploadSignatures))
+		rtr.MethodFunc(http.MethodPost, "/v3/keys/device_signing/upload", middleware.RequireUserAuth(c.UploadCrossSigningKeys))
 
 		rtr.MethodFunc(http.MethodPost, "/v3/user/{userID}/filter", middleware.RequireUserAuth(c.CreateFilter))
 		rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/filter/{filterID}", middleware.RequireUserAuth(c.GetFilter))

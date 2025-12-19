@@ -142,6 +142,7 @@ func (tup MembershipTup) MarshalText() ([]byte, error) {
 
 type Memberships map[id.RoomID]MembershipTup
 type MembershipChanges []MembershipTupWithVersion
+type RoomMemberships map[id.UserID]MembershipTup
 
 func MembershipTupToBytes(tup MembershipTup) []byte {
 	return tuple.Tuple{tup.EventID.String(), tup.RoomID.String(), string(tup.Membership)}.Pack()

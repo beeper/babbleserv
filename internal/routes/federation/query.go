@@ -13,7 +13,7 @@ import (
 func (f *FederationRoutes) QueryProfile(w http.ResponseWriter, r *http.Request) {
 	userID := id.UserID(r.URL.Query().Get("user_id"))
 
-	profile, err := f.db.Rooms.GetUserProfile(r.Context(), userID)
+	profile, err := f.db.Accounts.GetUserProfile(r.Context(), userID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -36,5 +36,4 @@ func (f *FederationRoutes) QueryProfile(w http.ResponseWriter, r *http.Request) 
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, resp)
-	return
 }

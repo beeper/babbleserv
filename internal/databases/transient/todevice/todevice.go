@@ -22,6 +22,14 @@ type ToDeviceDirectory struct {
 	config   config.BabbleConfig
 	notifier *notifier.Notifier
 
+	// Version to to-device details, acts as a global index so we can drop stale records, which
+	// build up as devices go missing/etc. These are not cleared when removing user/server messages
+	// during sync, but when dropping stale records.
+	//
+	// key: Versionstamp
+	// value: ("server", ServerName) OR ("user", UserID, DeviceID, TransactionID)
+	versionToMessage subspace.Subspace
+
 	// To-device messages for local user devices
 	//
 	// key: (UserID, DeviceID, Version)
@@ -55,6 +63,7 @@ func NewToDeviceDirectory(logger zerolog.Logger, db fdb.Database, parentDir dire
 	return &ToDeviceDirectory{
 		log: log,
 
+		versionToMessage:     toDeviceDir.Sub("vtm"),
 		localUserMessages:    toDeviceDir.Sub("lum"),
 		localUserMessageTxns: toDeviceDir.Sub("lut"),
 		remoteServerMessages: toDeviceDir.Sub("rsm"),
@@ -74,7 +83,7 @@ func (t *ToDeviceDirectory) KeyToLocalUserVersion(key fdb.Key) tuple.Versionstam
 	return tup[2].(tuple.Versionstamp)
 }
 
-func (t *ToDeviceDirectory) KeyForLocalUserVersion(
+func (t *ToDeviceDirectory) keyForLocalUserVersion(
 	userID id.UserID,
 	deviceID id.DeviceID,
 	version tuple.Versionstamp,
@@ -110,7 +119,7 @@ func (t *ToDeviceDirectory) KeyToRemoteServerVersion(key fdb.Key) tuple.Versions
 	return tup[2].(tuple.Versionstamp)
 }
 
-func (t *ToDeviceDirectory) KeyForRemoteServerVersion(
+func (t *ToDeviceDirectory) keyForRemoteServerVersion(
 	serverName string,
 	version tuple.Versionstamp,
 ) fdb.Key {
@@ -120,4 +129,28 @@ func (t *ToDeviceDirectory) KeyForRemoteServerVersion(
 		panic(err)
 	}
 	return key
+}
+
+func (t *ToDeviceDirectory) keyForVersionToMessage(version tuple.Versionstamp) fdb.Key {
+	key, err := t.versionToMessage.PackWithVersionstamp(tuple.Tuple{version})
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+func (t *ToDeviceDirectory) TxnStoreLocalUserVersion(txn fdb.Transaction, toDevice *types.ToDevice, version tuple.Versionstamp, transactionID string) {
+	key := t.keyForLocalUserVersion(toDevice.UserID, toDevice.DeviceID, version)
+	txn.SetVersionstampedKey(key, toDevice.Bytes())
+
+	versionTuple := tuple.Tuple{"user", toDevice.UserID.String(), toDevice.DeviceID.String(), transactionID}
+	txn.SetVersionstampedKey(t.keyForVersionToMessage(version), versionTuple.Pack())
+}
+
+func (t *ToDeviceDirectory) TxnStoreRemoteServerVersion(txn fdb.Transaction, toDevice *types.ToDevice, version tuple.Versionstamp) {
+	key := t.keyForRemoteServerVersion(toDevice.UserID.Homeserver(), version)
+	txn.SetVersionstampedKey(key, toDevice.Bytes())
+
+	versionTuple := tuple.Tuple{"server", toDevice.UserID.Homeserver()}
+	txn.SetVersionstampedKey(t.keyForVersionToMessage(version), versionTuple.Pack())
 }

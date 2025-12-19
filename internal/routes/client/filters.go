@@ -16,7 +16,7 @@ func (c *ClientRoutes) CreateFilter(w http.ResponseWriter, r *http.Request) {
 	pathUserID := util.UserIDFromRequestURLParam(r, "userID")
 	userID := middleware.GetRequestUserID(r)
 	if userID != pathUserID {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Username mismatch")
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "UserID mismatch")
 		return
 	}
 
@@ -44,7 +44,7 @@ func (c *ClientRoutes) GetFilter(w http.ResponseWriter, r *http.Request) {
 	pathUserID := util.UserIDFromRequestURLParam(r, "userID")
 	userID := middleware.GetRequestUserID(r)
 	if userID != pathUserID {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Username mismatch")
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "UserID mismatch")
 		return
 	}
 

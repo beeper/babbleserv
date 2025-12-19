@@ -7,10 +7,12 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"maunium.net/go/mautrix/federation"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/middleware"
+	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
@@ -19,8 +21,10 @@ type FederationRoutes struct {
 	db         *databases.Databases
 	config     config.BabbleConfig
 	fclient    fclient.FederationClient
+	fedclient  *federation.Client
 	keyStore   *util.KeyStore
 	datastores *util.Datastores
+	notifiers  *notifier.Notifiers
 }
 
 func NewFederationRoutes(
@@ -28,8 +32,10 @@ func NewFederationRoutes(
 	logger zerolog.Logger,
 	db *databases.Databases,
 	fclient fclient.FederationClient,
+	fedclient *federation.Client,
 	keyStore *util.KeyStore,
 	datastores *util.Datastores,
+	notifiers *notifier.Notifiers,
 ) *FederationRoutes {
 	log := log.With().
 		Str("routes", "federation").
@@ -40,8 +46,10 @@ func NewFederationRoutes(
 		db:         db,
 		config:     cfg,
 		fclient:    fclient,
+		fedclient:  fedclient,
 		keyStore:   keyStore,
 		datastores: datastores,
+		notifiers:  notifiers,
 	}
 }
 
@@ -57,17 +65,13 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 	requireServerAuth := middleware.NewServerAuthMiddleware(f.config.ServerName, f.keyStore)
 
 	if f.config.Rooms.Enabled {
-		rtr.MethodFunc(http.MethodPut, "/v1/send/{tnxID}", requireServerAuth(f.SendTransaction))
+		rtr.MethodFunc(http.MethodPut, "/v1/send/{txnID}", requireServerAuth(f.SendTransaction))
 
 		rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
 		rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
 
 		rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
 		rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))
-
-		rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
-
-		rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
 
 		rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
 
@@ -81,7 +85,12 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 	}
 
 	if f.config.Accounts.Enabled {
+		rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
 
+		rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
+
+		rtr.MethodFunc(http.MethodPost, "/v1/user/keys/query", requireServerAuth(f.QueryUserKeys))
+		rtr.MethodFunc(http.MethodPost, "/v1/user/keys/claim", requireServerAuth(f.ClaimUserKeys))
 	}
 
 	if f.config.Transient.Enabled {

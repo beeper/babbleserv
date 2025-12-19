@@ -2,7 +2,6 @@ package accounts
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
@@ -20,12 +19,9 @@ func (a *AccountsDatabase) CreateFilter(
 ) ([]byte, error) {
 	versionFut, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (fdb.FutureKey, error) {
 		v := tuple.IncompleteVersionstamp(0)
-		key := a.users.KeyForNewUserFilter(userID.Localpart(), v)
-		b, err := json.Marshal(filter)
-		if err != nil {
+		if err := a.users.TxnStoreUserFilter(txn, userID, filter, v); err != nil {
 			return nil, err
 		}
-		txn.SetVersionstampedKey(key, b)
 		return txn.GetVersionstamp(), nil
 	})
 	if err != nil {
@@ -44,16 +40,7 @@ func (a *AccountsDatabase) GetFilter(
 	filterID []byte,
 ) (*mautrix.Filter, error) {
 	version := types.MustBytesToVersionstamp(filterID)
-
 	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*mautrix.Filter, error) {
-		key := a.users.KeyForUserFilter(userID.Localpart(), version)
-		b := txn.Get(key).MustGet()
-
-		var filter mautrix.Filter
-		if err := json.Unmarshal(b, &filter); err != nil {
-			return nil, err
-		}
-
-		return &filter, nil
+		return a.users.TxnGetUserFilter(txn, userID, version)
 	})
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
 type RejectedToDeviceEvent struct {
@@ -31,6 +32,9 @@ type SendToDeviceOptions struct {
 	// Both TransactionID + DeviceID must be set together to act as the idempotency token
 	TransactionID string
 	DeviceID      id.DeviceID
+
+	// Ensure (+refresh) a lock is held at commit time
+	LockTxnRefresh lock.LockTxnRefreshFunc
 }
 
 func (t *TransientDatabase) SendToDeviceEvents(
@@ -38,6 +42,10 @@ func (t *TransientDatabase) SendToDeviceEvents(
 	tds []*types.ToDevice,
 	options SendToDeviceOptions,
 ) (*SendToDeviceResults, error) {
+	if len(tds) > types.MaxVersionstampUserVersion {
+		panic("not safe to write this many to-device in one transaction")
+	}
+
 	log := zerolog.Ctx(ctx).With().
 		Str("component", "database").
 		Str("database", "todevice").
@@ -55,7 +63,7 @@ func (t *TransientDatabase) SendToDeviceEvents(
 		for i, tdev := range tds {
 			log.Trace().Any("to_device", tdev).Msg("Storing to-device event")
 
-			if options.TransactionID != "" {
+			if options.TransactionID != "" && !t.config.SecretSwitches.DisableToDeviceTransactionIDCheck {
 				key := t.todevice.KeyForLocalUserTransaction(tdev.Sender, options.DeviceID, options.TransactionID)
 				if txn.Get(key).MustGet() != nil {
 					log.Warn().Msg("Ignored duplicate to-device transaction ID")
@@ -64,7 +72,6 @@ func (t *TransientDatabase) SendToDeviceEvents(
 				}
 			}
 
-			tdBytes := tdev.Bytes()
 			version := tuple.IncompleteVersionstamp(uint16(i))
 
 			serverName := tdev.UserID.Homeserver()
@@ -75,13 +82,11 @@ func (t *TransientDatabase) SendToDeviceEvents(
 					panic("cannot user * DeviceID in SendToDeviceEvents")
 				}
 				changedUsers[tdev.UserID] = struct{}{}
-				key := t.todevice.KeyForLocalUserVersion(tdev.UserID, tdev.DeviceID, version)
-				txn.SetVersionstampedKey(key, tdBytes)
+				t.todevice.TxnStoreLocalUserVersion(txn, tdev, version, options.TransactionID)
 			} else {
 				changedServers[serverName] = struct{}{}
 				// For remote servers we just send it as-is
-				key := t.todevice.KeyForRemoteServerVersion(serverName, version)
-				txn.SetVersionstampedKey(key, tdBytes)
+				t.todevice.TxnStoreRemoteServerVersion(txn, tdev, version)
 			}
 
 			allowedEvents = append(allowedEvents, tdev)
@@ -92,6 +97,10 @@ func (t *TransientDatabase) SendToDeviceEvents(
 				key := t.todevice.KeyForLocalUserTransaction(tdev.Sender, options.DeviceID, options.TransactionID)
 				txn.Set(key, []byte{})
 			}
+		}
+
+		if options.LockTxnRefresh != nil {
+			options.LockTxnRefresh(txn)
 		}
 
 		change := notifier.Change{

@@ -36,7 +36,7 @@ type SyncOptions struct {
 }
 
 func (o *SyncOptions) GetTimelineLimit() int {
-	if o == nil || o.Filter == nil {
+	if o == nil || o.Filter == nil || o.Filter.Room == nil || o.Filter.Room.Timeline == nil {
 		return DefaultTimelineLimit
 	}
 	if o.Filter.Room.Timeline.Limit > 0 {
@@ -59,14 +59,14 @@ func (o *SyncOptions) GetRoomFilter() *mautrix.RoomFilter {
 	if o == nil || o.Filter == nil {
 		return nil
 	}
-	return &o.Filter.Room
+	return o.Filter.Room
 }
 
 func (o *SyncOptions) GetTimelineFilter() *mautrix.FilterPart {
 	if o == nil || o.Filter == nil {
 		return nil
 	}
-	return &o.Filter.Room.Timeline
+	return o.Filter.Room.Timeline
 }
 
 // Represents a user device native/sliding sync connection
@@ -92,23 +92,48 @@ type syncDeviceLists struct {
 }
 
 type Sync struct {
-	NextBatch   string            `json:"next_batch"`
-	Rooms       *syncRooms        `json:"rooms,omitempty"`
-	DeviceLists *syncDeviceLists  `json:"device_lists,omitempty"`
-	AccountData *PartialEventList `json:"account_data,omitempty"`
-	ToDevice    *PartialEventList `json:"to_device,omitempty"`
+	NextBatch   string          `json:"next_batch"`
+	Rooms       syncRooms       `json:"rooms,omitzero"`
+	DeviceLists syncDeviceLists `json:"device_lists,omitzero"`
+	AccountData EventList       `json:"account_data,omitzero"`
+	ToDevice    EventList       `json:"to_device,omitzero"`
 }
 
-func NewSync(rooms map[MembershipTup]*SyncRoom, accounts map[AccountDataTup]map[string]any, toDevice []*ToDevice) *Sync {
+func NewSync(
+	rooms map[MembershipTup]*SyncRoom,
+	accounts map[AccountDataTup]map[string]any,
+	toDevice []*ToDevice,
+) *Sync {
 	sync := &Sync{}
 
 	if len(toDevice) > 0 {
-		toDeviceEvents := make([]*PartialEvent, len(toDevice))
-		for i, td := range toDevice {
-			toDeviceEvents[i] = td.ToEvent()
+		// Convert internal device list to-device events into device lists
+		toDeviceEvents := make([]*Event, 0, len(toDevice))
+		changedUserIDs := make(map[id.UserID]struct{})
+		leftUserIDs := make(map[id.UserID]struct{})
+
+		for _, td := range toDevice {
+			switch td.Type {
+			case BabbleservLocalDeviceChange:
+				changedUserIDs[td.Sender] = struct{}{}
+			case BabbleservLocalDeviceLeft:
+				leftUserIDs[td.Sender] = struct{}{}
+			default:
+				toDeviceEvents = append(toDeviceEvents, NewEventFromPartialEvent(td.ToPartialEvent()))
+			}
 		}
-		sync.ToDevice = &PartialEventList{
-			Events: toDeviceEvents,
+
+		if len(toDeviceEvents) > 0 {
+			sync.ToDevice = EventList{
+				Events: toDeviceEvents,
+			}
+		}
+
+		for userID := range changedUserIDs {
+			sync.DeviceLists.Changed = append(sync.DeviceLists.Changed, userID)
+		}
+		for userID := range leftUserIDs {
+			sync.DeviceLists.Left = append(sync.DeviceLists.Left, userID)
 		}
 	}
 
@@ -117,17 +142,17 @@ func NewSync(rooms map[MembershipTup]*SyncRoom, accounts map[AccountDataTup]map[
 		allRooms[membershipTup.RoomID] = room
 	}
 
-	globalAccountData := make([]*PartialEvent, 0, 1)
+	globalAccountData := make([]*Event, 0, 1)
 	for accountDataTup, content := range accounts {
-		partialEv := NewPartialEvent(
+		ev := NewEventFromPartialEvent(NewPartialEvent(
 			"",
 			accountDataTup.Type,
 			nil,
 			"",
 			content,
-		)
+		))
 		if accountDataTup.RoomID == "" {
-			globalAccountData = append(globalAccountData, partialEv)
+			globalAccountData = append(globalAccountData, ev)
 			continue
 		}
 		room, found := allRooms[accountDataTup.RoomID]
@@ -140,15 +165,15 @@ func NewSync(rooms map[MembershipTup]*SyncRoom, accounts map[AccountDataTup]map[
 			}] = room
 		}
 		if room.AccountData.Events == nil {
-			room.AccountData.Events = make([]*PartialEvent, 0, 1)
+			room.AccountData.Events = make([]*Event, 0, 1)
 		}
-		room.AccountData.Events = append(room.AccountData.Events, partialEv)
+		room.AccountData.Events = append(room.AccountData.Events, ev)
 	}
 	if len(globalAccountData) > 0 {
-		sync.AccountData = &PartialEventList{Events: globalAccountData}
+		sync.AccountData = EventList{Events: globalAccountData}
 	}
 
-	sync.Rooms = &syncRooms{
+	sync.Rooms = syncRooms{
 		Join:   make(map[id.RoomID]*SyncRoom, len(rooms)),
 		Leave:  make(map[id.RoomID]*SyncRoom, 5),
 		Invite: make(map[id.RoomID]*syncRoomInvite, 5),
@@ -173,14 +198,14 @@ func NewSync(rooms map[MembershipTup]*SyncRoom, accounts map[AccountDataTup]map[
 }
 
 func (s *Sync) IsEmpty() bool {
-	return (s.AccountData == nil || len(s.AccountData.Events) == 0) &&
-		(s.ToDevice == nil || len(s.ToDevice.Events) == 0) &&
-		(s.DeviceLists == nil || (len(s.DeviceLists.Changed) == 0 &&
-			len(s.DeviceLists.Left) == 0)) &&
-		(s.Rooms == nil || (len(s.Rooms.Join) == 0 &&
-			len(s.Rooms.Leave) == 0 &&
-			len(s.Rooms.Invite) == 0 &&
-			len(s.Rooms.Knock) == 0))
+	return len(s.AccountData.Events) == 0 &&
+		len(s.ToDevice.Events) == 0 &&
+		len(s.DeviceLists.Changed) == 0 &&
+		len(s.DeviceLists.Left) == 0 &&
+		len(s.Rooms.Join) == 0 &&
+		len(s.Rooms.Leave) == 0 &&
+		len(s.Rooms.Invite) == 0 &&
+		len(s.Rooms.Knock) == 0
 }
 
 type marshalSync Sync
@@ -209,12 +234,11 @@ func (s *Sync) prepareForJSON() {
 		hasRooms = true
 	}
 	if !hasRooms {
-		s.Rooms = nil
+		s.Rooms.Join = nil
+		s.Rooms.Leave = nil
+		s.Rooms.Invite = nil
+		s.Rooms.Knock = nil
 	}
-
-	// TODO
-	// Combine all room device list updates
-	// Combine all room presence updates
 }
 
 type PartialEventList struct {
@@ -242,10 +266,10 @@ type syncRoomKnock struct {
 
 type SyncRoom struct {
 	// Rooms database
-	TimelineEvents Timeline         `json:"timeline"`
-	StateEvents    EventList        `json:"state"`
-	Ephemeral      PartialEventList `json:"ephemeral"`
-	AccountData    PartialEventList `json:"account_data"`
+	TimelineEvents Timeline  `json:"timeline"`
+	StateEvents    EventList `json:"state"`
+	Ephemeral      EventList `json:"ephemeral"`
+	AccountData    EventList `json:"account_data"`
 
 	Receipts          []*ReceiptWithVersion `json:"-"`
 	DeviceListChanges []id.UserID           `json:"-"`
@@ -263,7 +287,7 @@ func (s *SyncRoom) prepareForJSON() {
 	}
 
 	if s.Ephemeral.Events == nil {
-		s.Ephemeral.Events = []*PartialEvent{}
+		s.Ephemeral.Events = []*Event{}
 	}
 
 	// Turn receipts -> ephemeral event
@@ -282,7 +306,14 @@ func (s *SyncRoom) prepareForJSON() {
 			rawContent[evID.String()] = v
 		}
 
-		rev := NewPartialEvent(s.Receipts[0].RoomID, event.EphemeralEventReceipt, nil, "", rawContent)
+		rev := NewEventFromPartialEvent(NewPartialEvent(
+			s.Receipts[0].RoomID,
+			event.EphemeralEventReceipt,
+			nil,
+			"",
+			rawContent,
+		))
+		rev.IsForClientAPI = true
 		s.Ephemeral.Events = append(s.Ephemeral.Events, rev)
 	}
 
@@ -290,9 +321,15 @@ func (s *SyncRoom) prepareForJSON() {
 }
 
 func (s *SyncRoom) toInviteRoom() *syncRoomInvite {
+	if len(s.StateEvents.Events) != 1 {
+		panic("invalid invite room")
+	}
 	return &syncRoomInvite{SyncRoom: s, InviteState: s.StateEvents}
 }
 
 func (s *SyncRoom) toKnockRoom() *syncRoomKnock {
+	if len(s.StateEvents.Events) != 1 {
+		panic("invalid knock room")
+	}
 	return &syncRoomKnock{SyncRoom: s, KnockState: s.StateEvents}
 }

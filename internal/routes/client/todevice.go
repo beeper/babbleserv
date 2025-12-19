@@ -32,7 +32,7 @@ func (c *ClientRoutes) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	for targetUserID, devices := range req.Messages {
 		targetUserHS := targetUserID.Homeserver()
 		if targetUserHS == c.config.ServerName {
-			user, err := c.db.Accounts.GetLocalUser(r.Context(), targetUserID.Localpart())
+			user, err := c.db.Accounts.GetLocalUser(r.Context(), targetUserID)
 			if err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return

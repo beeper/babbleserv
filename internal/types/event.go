@@ -27,6 +27,10 @@ type PartialEvent struct {
 	// event.Type doesn't implement msgpack marshalling, so we use TypeStr
 	TypeStr string     `msgpack:"typ" json:"-"`
 	Type    event.Type `msgpack:"-" json:"type"`
+
+	// We store some unsigned info (invite state), marshalled as JSON bytes
+	UnsignedRaw json.RawMessage `msgpack:"ussn" json:"-"`
+	Unsigned    map[string]any  `msgpack:"-" json:"unsigned,omitempty"`
 }
 
 // The CSAPI ClientEvent type, described here:
@@ -38,9 +42,6 @@ type ClientEvent struct {
 	ID id.EventID `msgpack:"-" json:"event_id"`
 
 	Timestamp int64 `msgpack:"ots" json:"origin_server_ts"`
-
-	// Unsigned itself is not stored as mostly contains generated content
-	Unsigned map[string]any `msgpack:"-" json:"unsigned,omitempty"`
 }
 
 // The S2SAPI PDU type, described here (varies slightly by room version):
@@ -76,6 +77,7 @@ type Event struct {
 
 	// Internal, in-memory only flags used for the lifetime of a request/background job
 	IsForClientAPI    bool               `msgpack:"-" json:"-"`
+	IsDuplicate       bool               `msgpack:"-" json:"-"`
 	IncompleteVersion tuple.Versionstamp `msgpack:"-" json:"-"`
 }
 
@@ -85,10 +87,6 @@ func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
 		return nil, err
 	}
 	ev.ID = id
-	ev.Type = event.NewEventType(ev.TypeStr)
-	if ev.Unsigned == nil {
-		ev.Unsigned = make(map[string]any)
-	}
 	return &ev, nil
 }
 
@@ -121,6 +119,21 @@ func NewPartialEvent(
 	return ev
 }
 
+func NewEventFromPartialEvent(pev *PartialEvent) *Event {
+	return &Event{
+		ClientEvent: ClientEvent{
+			PartialEvent: *pev,
+		},
+	}
+}
+
+func (ev *PartialEvent) SetUnsigned(key string, value any) {
+	if ev.Unsigned == nil {
+		ev.Unsigned = make(map[string]any, 1)
+	}
+	ev.Unsigned[key] = value
+}
+
 func eventIDsFromProtoEvent(input any) []id.EventID {
 	ids := input.([]any)
 	evIDs := make([]id.EventID, 0, len(ids))
@@ -151,10 +164,33 @@ func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) *Event {
 
 type marshalEvent Event
 
-// Wrapper around msgpack marshalling to set TypeStr
+// Wrapper around msgpack marshalling to set .TypeStr + .UnsignedRaw
 func (ev Event) MarshalMsgpack() ([]byte, error) {
 	ev.TypeStr = ev.Type.Type
+
+	if b, err := json.Marshal(ev.Unsigned); err != nil {
+		return nil, err
+	} else {
+		ev.UnsignedRaw = b
+	}
+
 	return msgpack.Marshal((marshalEvent)(ev))
+}
+
+// Wrapper around msgpack unmarshal to set .Type + .Unsigned
+func (ev *Event) UnmarshalMsgpack(b []byte) error {
+	if err := msgpack.Unmarshal(b, (*marshalEvent)(ev)); err != nil {
+		return err
+	}
+
+	ev.Type = event.NewEventType(ev.TypeStr)
+
+	if len(ev.UnsignedRaw) > 0 {
+		if err := json.Unmarshal(ev.UnsignedRaw, &ev.Unsigned); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ev *Event) ToMsgpack() []byte {
@@ -167,8 +203,14 @@ func (ev *Event) ToMsgpack() []byte {
 
 func (ev Event) MarshalJSON() ([]byte, error) {
 	if ev.IsForClientAPI {
-		return json.Marshal(ev.ClientEvent)
+		b, err := json.Marshal(ev.ClientEvent)
+		if err != nil {
+			return nil, err
+		}
+		// Remove room_id, which is only included in the S2S API
+		return sjson.DeleteBytes(b, "room_id")
 	}
+
 	if ev.AuthEventIDs == nil {
 		ev.AuthEventIDs = make([]id.EventID, 0)
 	}
@@ -262,6 +304,10 @@ func (ev *Event) MustGetRoomSpec() gomatrixserverlib.IRoomVersion {
 		panic(err)
 	}
 	return roomSpec
+}
+
+func (ev *Event) IsProfileUpdate() bool {
+	return gjson.GetBytes(ev.Content, "babbleserv.is_profile_update").Bool()
 }
 
 func (ev *Event) Membership() event.Membership {

@@ -4,11 +4,31 @@ import (
 	"context"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
+
+func (a *AccountsDatabase) StoreDeviceChange(ctx context.Context, userID id.UserID, deviceID id.DeviceID) error {
+	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+		version := tuple.IncompleteVersionstamp(0)
+		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
+		return nil, nil
+	})
+	return err
+}
+
+func (a *AccountsDatabase) GetUserDevice(
+	ctx context.Context,
+	userID id.UserID,
+	deviceID id.DeviceID,
+) (*types.Device, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*types.Device, error) {
+		return a.devices.TxnGetDevice(txn, userID, deviceID)
+	})
+}
 
 func (a *AccountsDatabase) GetUserDevices(
 	ctx context.Context,
@@ -29,6 +49,37 @@ func (a *AccountsDatabase) GetUserDevices(
 		}
 		return devices, nil
 	})
+}
+
+func (a *AccountsDatabase) UpdateUserDevice(
+	ctx context.Context,
+	userID id.UserID,
+	deviceID id.DeviceID,
+	displayName string,
+) error {
+	_, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+		device, err := a.devices.TxnGetDevice(txn, userID, deviceID)
+		if err != nil {
+			return nil, err
+		} else if device == nil {
+			return nil, types.ErrUserDeviceNotFound
+		}
+
+		if device.DisplayName == displayName {
+			return nil, nil
+		}
+
+		// Store the change
+		device.DisplayName = displayName
+		a.devices.TxnStoreDevice(txn, userID, device)
+
+		// And send a device change so this gets sent out to relevant users/servers
+		version := tuple.IncompleteVersionstamp(0)
+		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
+
+		return nil, nil
+	})
+	return err
 }
 
 type deviceTokens struct {

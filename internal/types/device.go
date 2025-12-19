@@ -1,13 +1,24 @@
 package types
 
 import (
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/vmihailenco/msgpack/v5"
 	"maunium.net/go/mautrix/id"
 )
 
 type Device struct {
-	ID          id.DeviceID `msgpack:"id"`
-	DisplayName string      `msgpack:"dn"`
+	ID          id.DeviceID `msgpack:"id" json:"device_id"`
+	DisplayName string      `msgpack:"dn" json:"display_name"`
+}
+
+type UserDevice struct {
+	UserID   id.UserID
+	DeviceID id.DeviceID
+}
+
+type UserDeviceChange struct {
+	UserDevice
+	Version tuple.Versionstamp
 }
 
 func NewDevice(id id.DeviceID, displayName string) *Device {

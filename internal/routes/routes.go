@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
+	maufederation "maunium.net/go/mautrix/federation"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
@@ -49,6 +50,7 @@ func NewRoutes(
 	databases *databases.Databases,
 	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
+	fedClient *maufederation.Client,
 	keyStore *util.KeyStore,
 	dstores *util.Datastores,
 ) *Routes {
@@ -63,8 +65,8 @@ func NewRoutes(
 		databases: databases,
 
 		babbleserv: debug.NewDebugRoutes(cfg, logger, databases, notifiers, dstores),
-		client:     client.NewClientRoutes(cfg, logger, databases, fclient, keyStore, dstores, notifiers),
-		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, keyStore, dstores),
+		client:     client.NewClientRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers),
+		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers),
 
 		servers: make([]*Server, 0),
 	}

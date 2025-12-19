@@ -50,6 +50,9 @@ type BabbleConfig struct {
 		Notifier NotifierConfig `yaml:"notifier"`
 
 		RefreshAccessTokenExpire time.Duration `yaml:"refreshAccessTokenExpire"`
+
+		// How long to keep device changes around (/keys/changes endpoint)
+		DeviceChangesRetention time.Duration `yaml:"deviceChangesRetention"`
 	} `yaml:"accounts"`
 
 	Transient struct {
@@ -94,6 +97,10 @@ type BabbleConfig struct {
 		EnableFederatedSendRoomCreate bool `yaml:"enableFederatedSendRoomCreate"`
 		// Create datastore buckets that don't exist
 		AutoCreateDatastoreBuckets bool `yaml:"autoCreateDatastoreBuckets"`
+		// Disable to-device txn ID deduplication
+		DisableToDeviceTransactionIDCheck bool `yaml:"disableToDeviceTransactionIDs"`
+		// Disable DeviceKeys & CrossSigningKeys equal check (ie always apply)
+		DisableKeysEqualCheck bool `yaml:"disableKeysEqualCheck"`
 	} `yaml:"secretSwitches"`
 
 	// Provided via caller (added at build time)

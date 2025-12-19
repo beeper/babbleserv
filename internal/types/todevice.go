@@ -8,18 +8,28 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-// Note we smuggle device list and signing key updates within the user/server to-device versions. We
-// use custom types to identify these just in case someone tries to send a to-device message with an
+// Custom internal to-device events
+//
+
+// We smuggle device list and signing key updates within the user/server to-device versions. We use
+// custom types to identify these just in case someone tries to send a to-device message with an
 // event type m.device_list_update or m.signing_key_update.
 var (
-	// To device events of this type are popped and turned into m.device_list_update EDUs or sync
-	// device_lists content.
-	InternalDeviceListUpdate = event.Type{
-		Type: "babbleserv.device_list_update",
+	// These are for local user device_lists.changed sync field
+	BabbleservLocalDeviceChange = event.Type{
+		Type: "babbleserv.local_device_change",
 	}
-	// To device events of this type are popped and turned into m.signing_key_update EDUs
-	InternalSigningKeyUpdate = event.Type{
-		Type: "babbleserv.signing_key_update",
+	// These are for local user device_lists.left sync field
+	BabbleservLocalDeviceLeft = event.Type{
+		Type: "babbleserv.local_device_left",
+	}
+	// These are turned into federation m.device_list_update EDUs
+	BabbleservRemoteDeviceListUpdate = event.Type{
+		Type: "babbleserv.remote_device_list_update",
+	}
+	// These are turned into federation m.signing_key_update EDUs
+	BabbleservRemoteSigningKeyUpdate = event.Type{
+		Type: "babbleserv.remote_signing_key_update",
 	}
 )
 
@@ -63,7 +73,7 @@ func MustBytesToToDevice(b []byte) *ToDevice {
 	return t
 }
 
-func (t *ToDevice) ToEvent() *PartialEvent {
+func (t *ToDevice) ToPartialEvent() *PartialEvent {
 	var content map[string]any
 	json.Unmarshal(t.Content, &content)
 	return NewPartialEvent("", t.Type, nil, t.Sender, content)
