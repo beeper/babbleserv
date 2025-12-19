@@ -12,6 +12,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
+	"github.com/tidwall/gjson"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -34,8 +35,8 @@ type FederationSender struct {
 	lock          sync.RWMutex
 	serverSenders map[string]chan struct{}
 
-	wg        sync.WaitGroup
-	cancelCtx context.CancelFunc
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
 }
 
 func NewFederationSender(
@@ -49,13 +50,6 @@ func NewFederationSender(
 		Str("worker", "FederationSender").
 		Logger()
 
-	// lockCache, err := freelru.New[string, string](1000, func(s string) uint32 {
-	// 	return uint32(xxhash.Sum64String(string(s)))
-	// })
-	// if err != nil {
-	// 	panic(err)
-	// }
-
 	return &FederationSender{
 		log:           log,
 		config:        cfg,
@@ -67,8 +61,8 @@ func NewFederationSender(
 }
 
 func (fs *FederationSender) Start() {
-	ctx, cancel := context.WithCancel(fs.log.WithContext(context.Background()))
-	fs.cancelCtx = cancel
+	var ctx context.Context
+	ctx, fs.cancel = context.WithCancel(fs.log.WithContext(context.Background()))
 
 	initialServerNames, err := fs.db.System.GetServerNamesWithPositions(ctx)
 	if err != nil {
@@ -84,7 +78,7 @@ func (fs *FederationSender) Start() {
 
 func (fs *FederationSender) Stop() {
 	fs.log.Debug().Msg("Stopping federation sender")
-	fs.cancelCtx()
+	fs.cancel()
 	fs.wg.Wait()
 	fs.log.Info().Msg("Federation sender stopped")
 }
@@ -300,7 +294,6 @@ func (fs *FederationSender) syncRoomsForServer(
 		Msg("Syncing rooms for server")
 
 	nextVersion, rooms, err := fs.db.Rooms.SyncRoomsForServer(ctx, serverName, roomsVersion, types.SyncOptions{
-		IsServerToServer: true,
 		// Servers need to send everything, no gaps
 		Mode: types.SyncModeStreaming,
 	})
@@ -380,7 +373,6 @@ func (fs *FederationSender) syncTransientForServer(
 		Msg("Syncing transient for server")
 
 	nextVersion, toDevice, err := fs.db.Transient.SyncTransientForServer(ctx, serverName, roomsVersion, types.SyncOptions{
-		IsServerToServer: true,
 		// Servers need to send everything, no gaps
 		Mode: types.SyncModeStreaming,
 	})
@@ -392,9 +384,31 @@ func (fs *FederationSender) syncTransientForServer(
 		return false, nil
 	}
 
-	allToDevice := make([]*types.EDU, 0, 100)
+	allEDUs := make([]*types.EDU, 0, 100)
 
 	for _, td := range toDevice {
+		switch td.Type {
+		case types.BabbleservRemoteDeviceListUpdate:
+			allEDUs = append(allEDUs, &types.EDU{
+				Type:    types.EDUTypeDeviceListUpdate,
+				Content: td.Content,
+			})
+			log.Debug().
+				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
+				Str("device_id", gjson.GetBytes(td.Content, "device_id").String()).
+				Msg("Sending remote device list update")
+			continue
+		case types.BabbleservRemoteSigningKeyUpdate:
+			allEDUs = append(allEDUs, &types.EDU{
+				Type:    types.EDUTypeSigningKeyUpdate,
+				Content: td.Content,
+			})
+			log.Debug().
+				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
+				Msg("Sending remote signing key update")
+			continue
+		}
+
 		var tdContent map[string]any
 		if err := json.Unmarshal(td.Content, &tdContent); err != nil {
 			panic(err)
@@ -414,14 +428,20 @@ func (fs *FederationSender) syncTransientForServer(
 			panic(err)
 		}
 
-		allToDevice = append(allToDevice, &types.EDU{
+		allEDUs = append(allEDUs, &types.EDU{
 			Type:    types.EDUTypeToDevice,
 			Content: b,
 		})
+		log.Debug().
+			Str("user_id", td.UserID.String()).
+			Str("device_id", td.DeviceID.String()).
+			Str("type", td.Type.String()).
+			Str("sender", td.Sender.String()).
+			Msg("Sending remote to-device event")
 	}
 
-	if len(allToDevice) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, nil, allToDevice); err != nil {
+	if len(allEDUs) > 0 {
+		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, nil, allEDUs); err != nil {
 			return false, fmt.Errorf("failed to send transient transaction: %w", err)
 		}
 	}
