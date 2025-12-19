@@ -67,10 +67,9 @@ type federatedMakeResp struct {
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
 	roomID id.RoomID,
+	otherServers []string,
 	getMakeResp func(string) (federatedMakeResp, error),
 ) (*types.Event, string, error) {
-	otherServers := getOtherServers(r, roomID)
-
 	var err error
 	var otherServer string
 	var resp federatedMakeResp
@@ -83,14 +82,14 @@ func (c *ClientRoutes) makeFederatedEvent(
 		log.Debug().
 			Str("room_id", roomID.String()).
 			Str("server", otherServer).
-			Msg("Attempting to make join via server")
+			Msg("Attempting to make federated event via server")
 
 		resp, err = getMakeResp(otherServer)
 
 		if err != nil {
 			log.Warn().Err(err).
 				Str("server", otherServer).
-				Msg("Failed to make join via server")
+				Msg("Failed to make federated event via server")
 			continue
 		}
 		break
@@ -102,7 +101,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 	log.Debug().
 		Str("room_id", roomID.String()).
 		Str("server", otherServer).
-		Msg("Joining room via server")
+		Msg("Making federated event via server")
 
 	roomVersion := string(resp.RoomVersion)
 

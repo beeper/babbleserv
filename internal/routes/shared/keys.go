@@ -5,10 +5,11 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/beeper/babbleserv/internal/config"
-	"github.com/beeper/babbleserv/internal/databases"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/config"
+	"github.com/beeper/babbleserv/internal/databases"
 )
 
 type MissingUserKeyClaimsByServer map[string]map[id.UserID]map[id.DeviceID]id.KeyAlgorithm

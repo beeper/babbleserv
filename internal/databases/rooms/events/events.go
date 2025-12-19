@@ -22,14 +22,14 @@ type EventsDirectory struct {
 	// metadata like `auth_events` & `prev_events`.
 	//
 	// key: EventID
-	// value: types.Event (as msgpack []byte)
+	// value: types.Event
 	idToEvent subspace.Subspace
 
 	// Ordered EventTups by version, for paginating all events over all rooms. Used by internal
 	// services for things like profile update propagation.
 	//
 	// key: tuple.Versionstamp
-	// value: types.EventTup (as tuple.Tuple []byte)
+	// value: types.EventTup
 	versionToTup subspace.Subspace
 
 	// Event ID to `tuple.Versionstamp`. Allows us to get the version of an event so we can lookup state
@@ -42,14 +42,14 @@ type EventsDirectory struct {
 	// Ordered `EventTup`s by room/version, for paginating all events in a room
 	//
 	// key: (RoomID, tuple.Versionstamp)
-	// value: types.EventTup (as tuple.Tuple []byte)
+	// value: types.EventTup
 	roomVersionToTup subspace.Subspace
 
 	// Ordered `EventTup`s originating from this homeserver, for paginating events to send over
 	// federation.
 	//
 	// key: (RoomID, tuple.Versionstamp)
-	// value: types.EventTup (as tuple.Tuple []byte)
+	// value: types.EventTup
 	localRoomVersionToTup subspace.Subspace
 
 	// Ordered `EventStateTup`s by room/version, for pagination of room state changes.
@@ -71,17 +71,17 @@ type EventsDirectory struct {
 	// - on store event clear any found in `prev_events`
 	//
 	// key: (RoomID, EventID)
-	// value: empty []byte
+	// value: empty
 	roomExtremIDs subspace.Subspace
 
 	// Room ID to tuple of information from the last time state resolution was performed on the room
 	// ie (versionstamp, eventID1, eventID2, ...). We combine this with the list of current extrem
 	// IDs to identify whether we need to re-resolve the room again (if multiple forks have written
 	// state changes since last resolve).
-	idToLastResolvedData subspace.Subspace
 	//
 	// key: RoomID
-	// value: []string
+	// value: []id.EventID
+	idToLastResolvedData subspace.Subspace
 
 	// State events by room/type/version, for paginating the history of a single state event. This
 	// allows us to fetch state for a given room/type at a point in time, for authorizing events.
@@ -112,6 +112,13 @@ type EventsDirectory struct {
 	// key: (RoomID, EventType, StateKey)
 	// value: types.MembershipTup
 	currentRoomServers subspace.Subspace
+
+	// Per server history of membership changes for the room. Allows us to determine a servers
+	// membership at a given version.
+	//
+	// key: (id.RoomID, ServerName, tuple.Versionstamp)
+	// value: types.MembershipTup
+	serverMembershipChanges subspace.Subspace
 
 	// RoomID/related-event-ID/version to (eventID, relType)
 	//
@@ -167,14 +174,27 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 		currentRoomStateToID:    eventsDir.Sub("rcs"),
 		currentRoomMemberships:  eventsDir.Sub("rmb"),
 		currentRoomServers:      eventsDir.Sub("rsr"),
+		serverMembershipChanges: eventsDir.Sub("smc"),
 		byRoomRelation:          eventsDir.Sub("rel"),
 		byRoomReaction:          eventsDir.Sub("rea"),
 		roomThreadVersionToID:   eventsDir.Sub("rth"),
 	}
 }
 
-func (e *EventsDirectory) KeyForEvent(eventID id.EventID) fdb.Key {
+func (e *EventsDirectory) keyForEventID(eventID id.EventID) fdb.Key {
 	return e.idToEvent.Pack(tuple.Tuple{eventID.String()})
+}
+
+func (e *EventsDirectory) TxnStoreEvent(txn fdb.Transaction, ev *types.Event) {
+	txn.Set(e.keyForEventID(ev.ID), ev.ToMsgpack())
+}
+
+func (e *EventsDirectory) TxnGetEvent(txn fdb.ReadTransaction, id id.EventID) *types.Event {
+	b := txn.Get(e.keyForEventID(id)).MustGet()
+	if b == nil {
+		return nil
+	}
+	return types.MustNewEventFromBytes(b, id)
 }
 
 func (e *EventsDirectory) KeyForIDToVersion(eventID id.EventID) fdb.Key {
@@ -197,7 +217,7 @@ func (e *EventsDirectory) KeyToVersion(key fdb.Key) tuple.Versionstamp {
 	return tup[0].(tuple.Versionstamp)
 }
 
-func (e *EventsDirectory) RangeForVersion(fromVersion, toVersion tuple.Versionstamp) fdb.Range {
+func (e *EventsDirectory) rangeForVersion(fromVersion, toVersion tuple.Versionstamp) fdb.Range {
 	ret := types.GetVersionRange(e.versionToTup, fromVersion, toVersion)
 	return ret
 }
@@ -221,7 +241,7 @@ func (e *EventsDirectory) KeyForRoomVersion(roomID id.RoomID, version tuple.Vers
 	}
 }
 
-func (e *EventsDirectory) RangeForRoomVersion(
+func (e *EventsDirectory) rangeForRoomVersion(
 	roomID id.RoomID,
 	fromVersion, toVersion tuple.Versionstamp,
 ) fdb.Range {
@@ -244,7 +264,7 @@ func (e *EventsDirectory) KeyForLocalRoomVersion(roomID id.RoomID, version tuple
 	}
 }
 
-func (e *EventsDirectory) RangeForLocalRoomVersion(
+func (e *EventsDirectory) rangeForLocalRoomVersion(
 	roomID id.RoomID,
 	fromVersion, toVersion tuple.Versionstamp,
 ) fdb.Range {
@@ -301,13 +321,36 @@ func (e *EventsDirectory) KeyForCurrentRoomServer(roomID id.RoomID, serverName s
 	return e.currentRoomServers.Pack(tuple.Tuple{roomID.String(), serverName})
 }
 
-func (e *EventsDirectory) CurrentRoomServerKeyToServer(key fdb.Key) string {
+func (e *EventsDirectory) currentRoomServerKeyToServer(key fdb.Key) string {
 	tup, _ := e.currentRoomServers.Unpack(key)
 	return tup[1].(string)
 }
 
-func (e *EventsDirectory) RangeForCurrentRoomServers(roomID id.RoomID) fdb.Range {
+func (e *EventsDirectory) rangeForCurrentRoomServers(roomID id.RoomID) fdb.Range {
 	return e.currentRoomServers.Sub(roomID.String())
+}
+
+func (e *EventsDirectory) TxnStoreServerMembership(
+	txn fdb.Transaction,
+	roomID id.RoomID,
+	serverName string,
+	mtup types.MembershipTup,
+	version tuple.Versionstamp,
+) {
+	mtupBytes := types.MembershipTupToBytes(mtup)
+
+	key := e.KeyForCurrentRoomServer(roomID, serverName)
+	if mtup.Membership == event.MembershipJoin {
+		txn.Set(key, mtupBytes)
+	} else {
+		txn.Clear(key)
+	}
+
+	key, err := e.serverMembershipChanges.PackWithVersionstamp(tuple.Tuple{roomID.String(), serverName, version})
+	if err != nil {
+		panic(err)
+	}
+	txn.Set(key, mtupBytes)
 }
 
 // Room extremeties (room_id, event_id) -> ''
@@ -364,7 +407,7 @@ func (e *EventsDirectory) RangeForRoomCurrentState(roomID id.RoomID) fdb.Range {
 // Room version state tups
 //
 
-func (e *EventsDirectory) RangeForRoomVersionStateTup(roomID id.RoomID, evType event.Type, stateKey string, version tuple.Versionstamp) fdb.Range {
+func (e *EventsDirectory) rangeForRoomVersionStateTup(roomID id.RoomID, evType event.Type, stateKey string, version tuple.Versionstamp) fdb.Range {
 	return fdb.KeyRange{
 		Begin: e.roomVersionToIDStateTup.Pack(tuple.Tuple{
 			roomID.String(), evType.String(), stateKey,

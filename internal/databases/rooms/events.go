@@ -35,14 +35,7 @@ func (r *RoomsDatabase) MustDoesEventExist(ctx context.Context, eventID id.Event
 
 func (r *RoomsDatabase) GetEvent(ctx context.Context, eventID id.EventID) (*types.Event, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.Event, error) {
-		key := r.events.KeyForEvent(eventID)
-		if b, err := txn.Get(key).Get(); err != nil {
-			return nil, err
-		} else if b == nil {
-			return nil, nil
-		} else {
-			return types.MustNewEventFromBytes(b, eventID), nil
-		}
+		return r.events.TxnGetEvent(txn, eventID), nil
 	})
 }
 
@@ -67,6 +60,6 @@ func (r *RoomsDatabase) GetEventAuthChain(ctx context.Context, eventID id.EventI
 
 func (r *RoomsDatabase) PaginateAllEventTups(ctx context.Context, options types.PaginationOptions) ([]types.EventTupWithVersion, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]types.EventTupWithVersion, error) {
-		return r.events.TxnPaginateAllEventTups(txn, options, nil)
+		return r.events.TxnPaginateAllEventTups(txn, options, nil), nil
 	})
 }

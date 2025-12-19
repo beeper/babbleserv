@@ -67,7 +67,7 @@ func EventIDFromRequestURLParam(r *http.Request, field string) id.EventID {
 func UserIDFromRequestURLParam(r *http.Request, field string) id.UserID {
 	p := chi.URLParam(r, field)
 
-	if strings.HasSuffix(p, "!") {
+	if strings.HasSuffix(p, "@") {
 		return id.UserID(p)
 	}
 	if parsed, err := url.PathUnescape(p); err != nil {

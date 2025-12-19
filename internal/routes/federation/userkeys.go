@@ -3,9 +3,10 @@ package federation
 import (
 	"net/http"
 
+	"maunium.net/go/mautrix"
+
 	"github.com/beeper/babbleserv/internal/routes/shared"
 	"github.com/beeper/babbleserv/internal/util"
-	"maunium.net/go/mautrix"
 )
 
 // https://spec.matrix.org/v1.16/server-server-api/#post_matrixfederationv1userkeysclaim

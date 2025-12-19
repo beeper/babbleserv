@@ -155,7 +155,7 @@ func (r *RoomsDatabase) GetRoom(ctx context.Context, roomID id.RoomID) (*types.R
 
 func (r *RoomsDatabase) GetRoomCurrentExtremEventIDs(ctx context.Context, roomID id.RoomID) ([]id.EventID, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]id.EventID, error) {
-		return r.events.TxnLookupCurrentRoomExtremEventIDs(txn, roomID)
+		return r.events.TxnLookupCurrentRoomExtremEventIDs(txn, roomID), nil
 	})
 }
 

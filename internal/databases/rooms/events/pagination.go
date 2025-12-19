@@ -17,19 +17,16 @@ func (e *EventsDirectory) TxnPaginateAllEventTups(
 	txn fdb.ReadTransaction,
 	options types.PaginationOptions,
 	eventsProvider *TxnEventsProvider,
-) ([]types.EventTupWithVersion, error) {
+) []types.EventTupWithVersion {
 	iter := txn.GetRange(
-		e.RangeForVersion(options.From, options.To),
+		e.rangeForVersion(options.From, options.To),
 		options.RangeOptions(),
 	).Iterator()
 
 	evIDs := make([]types.EventTupWithVersion, 0, options.Limit)
 
 	for iter.Advance() {
-		kv, err := iter.Get()
-		if err != nil {
-			return nil, err
-		}
+		kv := iter.MustGet()
 		version := e.KeyToVersion(kv.Key)
 		tup := types.EventTupWithVersion{
 			EventTup: types.BytesToEventTup(kv.Value),
@@ -41,7 +38,7 @@ func (e *EventsDirectory) TxnPaginateAllEventTups(
 		}
 	}
 
-	return evIDs, nil
+	return evIDs
 }
 
 func (e *EventsDirectory) TxnPaginateRoomStateEventTups(
@@ -49,7 +46,7 @@ func (e *EventsDirectory) TxnPaginateRoomStateEventTups(
 	roomID id.RoomID,
 	options types.PaginationOptions,
 	eventsProvider *TxnEventsProvider,
-) ([]types.EventStateTupWithVersion, error) {
+) []types.EventStateTupWithVersion {
 	iter := txn.GetRange(
 		e.RangeForRoomStateVersion(roomID, options.From, options.To),
 		options.RangeOptions(),
@@ -58,10 +55,7 @@ func (e *EventsDirectory) TxnPaginateRoomStateEventTups(
 	evIDs := make([]types.EventStateTupWithVersion, 0, options.Limit)
 
 	for iter.Advance() {
-		kv, err := iter.Get()
-		if err != nil {
-			return nil, err
-		}
+		kv := iter.MustGet()
 		version := e.KeyToRoomStateVersion(kv.Key)
 		stateTup := types.BytesToEventStateTup(kv.Value)
 		tup := types.EventStateTupWithVersion{
@@ -74,7 +68,7 @@ func (e *EventsDirectory) TxnPaginateRoomStateEventTups(
 		}
 	}
 
-	return evIDs, nil
+	return evIDs
 }
 
 func (e *EventsDirectory) TxnPaginateRoomEventTups(
@@ -83,11 +77,11 @@ func (e *EventsDirectory) TxnPaginateRoomEventTups(
 	options types.PaginationOptions,
 	eventsProvider *TxnEventsProvider,
 	filter *mautrix.FilterPart,
-) ([]types.EventTupWithVersion, error) {
+) []types.EventTupWithVersion {
 	return e.txnPaginateRoomEventIDs(
 		txn,
 		options,
-		e.RangeForRoomVersion(roomID, options.From, options.To),
+		e.rangeForRoomVersion(roomID, options.From, options.To),
 		e.KeyToRoomVersion,
 		eventsProvider,
 		filter,
@@ -100,11 +94,11 @@ func (e *EventsDirectory) TxnPaginateLocalRoomEventTups(
 	options types.PaginationOptions,
 	eventsProvider *TxnEventsProvider,
 	filter *mautrix.FilterPart,
-) ([]types.EventTupWithVersion, error) {
+) []types.EventTupWithVersion {
 	return e.txnPaginateRoomEventIDs(
 		txn,
 		options,
-		e.RangeForLocalRoomVersion(roomID, options.From, options.To),
+		e.rangeForLocalRoomVersion(roomID, options.From, options.To),
 		e.KeyToLocalRoomVersion,
 		eventsProvider,
 		filter,
@@ -118,16 +112,12 @@ func (e *EventsDirectory) txnPaginateRoomEventIDs(
 	keyToVersion func(fdb.Key) tuple.Versionstamp,
 	eventsProvider *TxnEventsProvider,
 	filter *mautrix.FilterPart,
-) ([]types.EventTupWithVersion, error) {
+) []types.EventTupWithVersion {
 	iter := txn.GetRange(keyRange, options.RangeOptions()).Iterator()
 	evIDs := make([]types.EventTupWithVersion, 0, options.Limit)
 
 	for iter.Advance() {
-		kv, err := iter.Get()
-		if err != nil {
-			return nil, err
-		}
-
+		kv := iter.MustGet()
 		version := keyToVersion(kv.Key)
 		tup := types.BytesToEventTup(kv.Value)
 
@@ -153,5 +143,5 @@ func (e *EventsDirectory) txnPaginateRoomEventIDs(
 		}
 	}
 
-	return evIDs, nil
+	return evIDs
 }

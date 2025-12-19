@@ -69,6 +69,7 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 
 		rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
 		rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
+		rtr.MethodFunc(http.MethodPost, "/v1/get_missing_events/{roomID}", requireServerAuth(f.GetMissingEvents))
 
 		rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
 		rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))

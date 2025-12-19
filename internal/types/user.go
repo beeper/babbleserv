@@ -7,11 +7,6 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-type UserDevice struct {
-	UserID   id.UserID
-	DeviceID id.DeviceID
-}
-
 type User struct {
 	// Populated at fetch time
 	Username   string `msgpack:"-"`
@@ -20,6 +15,8 @@ type User struct {
 	Email string `msgpack:"em"`
 
 	CreatedAt time.Time `msgpack:"ct"`
+
+	DeviceListVersion int64 `msgpack:"dlv"`
 }
 
 func NewUserFromBytes(b []byte, username, serverName string) (*User, error) {
@@ -48,6 +45,6 @@ func (u *User) ToMsgpack() []byte {
 	}
 }
 
-func (r *User) UserID() id.UserID {
-	return id.UserID("@" + r.Username + ":" + r.ServerName)
+func (u *User) UserID() id.UserID {
+	return id.UserID("@" + u.Username + ":" + u.ServerName)
 }

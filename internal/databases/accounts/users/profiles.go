@@ -3,8 +3,9 @@ package users
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/types"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 func (u *UsersDirectory) keyForProfile(userID id.UserID) fdb.Key {

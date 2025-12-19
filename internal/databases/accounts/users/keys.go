@@ -5,10 +5,11 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/types"
 	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 func (u *UsersDirectory) TxnGetUserCrossSigningKeys(txn fdb.ReadTransaction, userID id.UserID) (*types.UserCrossSigningKeys, error) {

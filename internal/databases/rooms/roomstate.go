@@ -12,23 +12,29 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
+func (r *RoomsDatabase) IsRoomEncrypted(ctx context.Context, roomID id.RoomID) (bool, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
+		isEncrypted := r.events.TxnIsRoomEncrypted(txn, roomID)
+		return isEncrypted, nil
+	})
+}
+
 func (r *RoomsDatabase) GetRoomStateEvent(ctx context.Context, roomID id.RoomID, stateTup types.StateTup) (*types.Event, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.Event, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
 
 		var sMap types.StateMap
-		var err error
 
 		// Member state events are special and are stored separately to other state events
 		if stateTup.Type == event.StateMember {
-			sMap, err = r.events.TxnLookupCurrentSpecificRoomMemberStateMap(
+			sMap = r.events.TxnLookupCurrentSpecificRoomMemberStateMap(
 				txn,
 				roomID,
 				[]id.UserID{id.UserID(stateTup.StateKey)},
 				eventsProvider,
 			)
 		} else {
-			sMap, err = r.events.TxnLookupCurrentStateEventIDs(
+			sMap = r.events.TxnLookupCurrentStateEventIDs(
 				txn,
 				roomID,
 				[]types.StateTup{stateTup},
@@ -36,9 +42,7 @@ func (r *RoomsDatabase) GetRoomStateEvent(ctx context.Context, roomID id.RoomID,
 			)
 		}
 
-		if err != nil {
-			return nil, err
-		} else if len(sMap) == 0 {
+		if len(sMap) == 0 {
 			return nil, nil
 		}
 
@@ -53,47 +57,47 @@ func (r *RoomsDatabase) GetRoomStateEvent(ctx context.Context, roomID id.RoomID,
 	})
 }
 
+func (r *RoomsDatabase) GetCurrentRoomMemberships(ctx context.Context, roomID id.RoomID) (types.RoomMemberships, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.RoomMemberships, error) {
+		return r.events.TxnLookupCurrentRoomMemberships(txn, roomID, nil), nil
+	})
+}
+
 func (r *RoomsDatabase) GetRoomStateMapAtEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (types.StateMap, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.StateMap, error) {
-		return r.events.TxnLookupRoomStateAndMemberMapAtEvent(txn, roomID, eventID, nil)
+		return r.events.TxnLookupRoomStateAndMemberMapAtEvent(txn, roomID, eventID, nil), nil
 	})
 }
 
 func (r *RoomsDatabase) GetRoomAuthStateMapAtEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (types.StateMap, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.StateMap, error) {
-		return r.events.TxnLookupRoomAuthStateMapAtEvent(ctx, txn, roomID, eventID, nil)
+		return r.events.TxnLookupRoomAuthStateMapAtEvent(ctx, txn, roomID, eventID, nil), nil
 	})
 }
 
 func (r *RoomsDatabase) GetRoomSpecificRoomMemberStateMapAtEvent(ctx context.Context, roomID id.RoomID, userIDs []id.UserID, eventID id.EventID) (types.StateMap, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.StateMap, error) {
-		return r.events.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, userIDs, eventID, nil)
+		return r.events.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, userIDs, eventID, nil), nil
 	})
 }
 
-func (r *RoomsDatabase) GetCurrentRoomStrippedStateEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
+func (r *RoomsDatabase) GetCurrentRoomStrippedStateEvents(ctx context.Context, roomID id.RoomID) ([]*types.PartialEvent, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.PartialEvent, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		stateMap, err := r.events.TxnLookupCurrentRoomStrippedStateStateMap(txn, roomID, eventsProvider)
-		if err != nil {
-			return nil, err
-		}
+		stateMap := r.events.TxnLookupCurrentRoomStrippedStateStateMap(txn, roomID, eventsProvider)
 		evs := make([]*types.Event, 0, len(stateMap))
 		for _, evID := range stateMap {
 			evs = append(evs, eventsProvider.MustGet(evID))
 		}
 		util.SortEventList(evs)
-		return evs, nil
+		return util.EventsToPartialEvents(evs), nil
 	})
 }
 
 func (r *RoomsDatabase) GetCurrentRoomMemberEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
 	if memberEvs, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		memberMap, err := r.events.TxnLookupCurrentRoomMemberStateMap(txn, roomID, eventsProvider)
-		if err != nil {
-			return nil, err
-		}
+		memberMap := r.events.TxnLookupCurrentRoomMemberStateMap(txn, roomID, eventsProvider)
 		evs := make([]*types.Event, 0, len(memberMap))
 		for _, evID := range memberMap {
 			evs = append(evs, eventsProvider.MustGet(evID))
@@ -110,10 +114,7 @@ func (r *RoomsDatabase) GetCurrentRoomMemberEvents(ctx context.Context, roomID i
 func (r *RoomsDatabase) GetCurrentRoomStateEvents(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
 	stateEvs, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		stateMap, err := r.events.TxnLookupCurrentRoomStateAndMemberMap(txn, roomID, eventsProvider)
-		if err != nil {
-			return nil, err
-		}
+		stateMap := r.events.TxnLookupCurrentRoomStateAndMemberMap(txn, roomID, eventsProvider)
 		evs := make([]*types.Event, 0, len(stateMap))
 		for _, evID := range stateMap {
 			evs = append(evs, eventsProvider.MustGet(evID))
@@ -171,10 +172,7 @@ func (r *RoomsDatabase) GetRoomStateWithAuthChainAtEvent(
 
 	if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		stateMap, err := r.events.TxnLookupRoomStateAndMemberMapAtEvent(txn, roomID, eventID, eventsProvider)
-		if err != nil {
-			return nil, err
-		}
+		stateMap := r.events.TxnLookupRoomStateAndMemberMapAtEvent(txn, roomID, eventID, eventsProvider)
 		res.StateEvents = make([]*types.Event, 0, len(stateMap))
 		for _, eventID := range stateMap {
 			res.StateEvents = append(res.StateEvents, eventsProvider.MustGet(eventID))

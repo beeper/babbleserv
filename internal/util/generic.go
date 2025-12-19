@@ -1,21 +1,37 @@
 package util
 
-func MergeMaps[K comparable, V any](maps ...map[K]V) map[K]V {
-	baseMap := make(map[K]V, len(maps)*10) // preallocate 10 slots per map
-	for _, m := range maps {
-		for k, v := range m {
-			baseMap[k] = v
+import "fmt"
+
+func Memoize[T any](f func() (*T, error)) func() (*T, error) {
+	var i *T = nil
+	return func() (_ *T, err error) {
+		if i != nil {
+			return i, nil
 		}
+		i, err = f()
+		return i, err
 	}
-	return baseMap
 }
 
-func MinInt(ns ...int) int {
-	min := ns[0]
-	for _, n := range ns[1:] {
-		if n < min {
-			min = n
+func MemoizeMap[K comparable, T any](f func(k K) (*T, error), initialSize int) func(k K) (*T, error) {
+	cache := make(map[K]*T, initialSize)
+	return func(k K) (*T, error) {
+		if i, ok := cache[k]; ok {
+			return i, nil
 		}
+		i, err := f(k)
+		if err != nil {
+			return nil, err
+		}
+		cache[k] = i
+		return i, nil
 	}
-	return min
+}
+
+func StringersToStrs[T fmt.Stringer](ids []T) []string {
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	return strs
 }

@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"fmt"
 	"maps"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -18,26 +17,13 @@ import (
 func (e *EventsDirectory) TxnLookupVersionForEventID(
 	txn fdb.ReadTransaction,
 	eventID id.EventID,
-) (tuple.Versionstamp, error) {
-	key := e.KeyForIDToVersion(eventID)
-	b, err := txn.Get(key).Get()
-	if err != nil {
-		return types.ZeroVersionstamp, err
-	} else if b == nil {
-		return types.ZeroVersionstamp, types.ErrEventNotFound
-	}
-	return types.BytesToVersionstamp(b)
-}
-
-func (e *EventsDirectory) TxnMustLookupVersionForEventID(
-	txn fdb.ReadTransaction,
-	eventID id.EventID,
 ) tuple.Versionstamp {
-	version, err := e.TxnLookupVersionForEventID(txn, eventID)
-	if err != nil {
-		panic(err)
+	key := e.KeyForIDToVersion(eventID)
+	b := txn.Get(key).MustGet()
+	if b == nil {
+		return types.ZeroVersionstamp
 	}
-	return version
+	return types.MustBytesToVersionstamp(b)
 }
 
 func (e *EventsDirectory) TxnLookupRoomStateAndMemberMapAtVersion(
@@ -45,23 +31,20 @@ func (e *EventsDirectory) TxnLookupRoomStateAndMemberMapAtVersion(
 	roomID id.RoomID,
 	version tuple.Versionstamp,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
+) types.StateMap {
 	// Fetch all state event tups up to now
-	stateTups, err := e.TxnPaginateRoomStateEventTups(txn, roomID, types.PaginationOptions{
+	stateTups := e.TxnPaginateRoomStateEventTups(txn, roomID, types.PaginationOptions{
 		From: types.ZeroVersionstamp,
 		To:   version,
 		Mode: fdb.StreamingModeWantAll,
 	}, eventsProvider)
-	if err != nil {
-		return nil, err
-	}
 
 	// Apply each in order, last state wins
 	stateMap := make(types.StateMap, 10)
 	for _, tup := range stateTups {
 		stateMap[tup.StateTup] = tup.EventID
 	}
-	return stateMap, nil
+	return stateMap
 }
 
 // Lookup room state event IDs before a given event, optionally passing an events provider to start
@@ -72,11 +55,8 @@ func (e *EventsDirectory) TxnLookupRoomStateAndMemberMapAtEvent(
 	roomID id.RoomID,
 	eventID id.EventID,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
-	version, err := e.TxnLookupVersionForEventID(txn, eventID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup event version: %w", err)
-	}
+) types.StateMap {
+	version := e.TxnLookupVersionForEventID(txn, eventID)
 	return e.TxnLookupRoomStateAndMemberMapAtVersion(txn, roomID, version, eventsProvider)
 }
 
@@ -88,16 +68,12 @@ func (e *EventsDirectory) TxnLookupRoomAuthStateMapAtEvent(
 	roomID id.RoomID,
 	eventID id.EventID,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
-	version, err := e.TxnLookupVersionForEventID(txn, eventID)
-	if err != nil {
-		return nil, err
-	}
+) types.StateMap {
+	version := e.TxnLookupVersionForEventID(txn, eventID)
 	version.UserVersion += 1 // FDB range ends are exclusive, the event should be included
 
-	zerolog.Ctx(ctx).UpdateContext(func(c zerolog.Context) zerolog.Context {
-		return c.Str("at_or_before_event_id", eventID.String())
-	})
+	log := zerolog.Ctx(ctx).With().Str("at_or_before_event_id", eventID.String()).Logger()
+	ctx = log.WithContext(ctx)
 
 	return e.TxnLookupRoomAuthStateMapAtVersion(ctx, txn, roomID, version, eventsProvider)
 }
@@ -108,11 +84,11 @@ func (e *EventsDirectory) TxnLookupRoomAuthStateMapAtVersion(
 	roomID id.RoomID,
 	version tuple.Versionstamp,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
+) types.StateMap {
 	futs := make(map[event.Type]fdb.RangeResult, len(authStateTypes))
 	for _, stateType := range authStateTypes {
 		futs[stateType] = txn.GetRange(
-			e.RangeForRoomVersionStateTup(roomID, stateType, "", version),
+			e.rangeForRoomVersionStateTup(roomID, stateType, "", version),
 			fdb.RangeOptions{
 				Reverse: true,
 				Limit:   1,
@@ -122,16 +98,14 @@ func (e *EventsDirectory) TxnLookupRoomAuthStateMapAtVersion(
 
 	stateMap := make(types.StateMap, len(authStateTypes))
 	for _, stateType := range authStateTypes {
-		results, err := futs[stateType].GetSliceWithError()
-		if err != nil {
-			return nil, err
-		} else if len(results) > 1 {
+		results := futs[stateType].GetSliceOrPanic()
+		if len(results) > 1 {
 			panic("more than one key returned for versioned state request")
 		} else if results == nil {
 			zerolog.Ctx(ctx).Warn().
-				Str("room_id", roomID.String()).
-				Str("state_type", stateType.String()).
-				Str("versionstamp", version.String()).
+				Stringer("room_id", roomID).
+				Stringer("state_type", stateType).
+				Any("versionstamp", version).
 				Msg("No historical state event found in room")
 			continue
 		}
@@ -146,7 +120,7 @@ func (e *EventsDirectory) TxnLookupRoomAuthStateMapAtVersion(
 		}
 	}
 
-	return stateMap, nil
+	return stateMap
 
 }
 
@@ -159,17 +133,14 @@ func (e *EventsDirectory) TxnLookupSpecificRoomMemberStateMapAtEvent(
 	userIDs []id.UserID,
 	eventID id.EventID,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
-	version, err := e.TxnLookupVersionForEventID(txn, eventID)
-	if err != nil {
-		return nil, err
-	}
+) types.StateMap {
+	version := e.TxnLookupVersionForEventID(txn, eventID)
 	version.UserVersion += 1 // FDB range ends are exclusive, the event should be included
 
 	futs := make(map[id.UserID]fdb.RangeResult, len(userIDs))
 	for _, userID := range userIDs {
 		futs[userID] = txn.GetRange(
-			e.RangeForRoomVersionStateTup(roomID, event.StateMember, userID.String(), version),
+			e.rangeForRoomVersionStateTup(roomID, event.StateMember, userID.String(), version),
 			fdb.RangeOptions{
 				Reverse: true,
 				Limit:   1,
@@ -179,10 +150,8 @@ func (e *EventsDirectory) TxnLookupSpecificRoomMemberStateMapAtEvent(
 
 	stateMap := make(types.StateMap, len(userIDs))
 	for _, userID := range userIDs {
-		results, err := futs[userID].GetSliceWithError()
-		if err != nil {
-			return nil, err
-		} else if len(results) > 1 {
+		results := futs[userID].GetSliceOrPanic()
+		if len(results) > 1 {
 			panic("more than one key returned for versioned member state request")
 		} else if results == nil {
 			zerolog.Ctx(ctx).Warn().
@@ -205,7 +174,7 @@ func (e *EventsDirectory) TxnLookupSpecificRoomMemberStateMapAtEvent(
 		}
 	}
 
-	return stateMap, nil
+	return stateMap
 }
 
 func (e *EventsDirectory) TxnLookupRoomAuthAndSpecificMemberStateMapAtEvent(
@@ -215,15 +184,9 @@ func (e *EventsDirectory) TxnLookupRoomAuthAndSpecificMemberStateMapAtEvent(
 	userIDs []id.UserID,
 	eventID id.EventID,
 	eventsProvider *TxnEventsProvider,
-) (types.StateMap, error) {
-	stateMap, err := e.TxnLookupRoomAuthStateMapAtEvent(ctx, txn, roomID, eventID, eventsProvider)
-	if err != nil {
-		return nil, err
-	}
-	memberMap, err := e.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, userIDs, eventID, eventsProvider)
-	if err != nil {
-		return nil, err
-	}
+) types.StateMap {
+	stateMap := e.TxnLookupRoomAuthStateMapAtEvent(ctx, txn, roomID, eventID, eventsProvider)
+	memberMap := e.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, userIDs, eventID, eventsProvider)
 	maps.Copy(stateMap, memberMap)
-	return stateMap, nil
+	return stateMap
 }

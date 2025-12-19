@@ -6,9 +6,10 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/types"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 func (u *UsersDirectory) keyForNewUserFilter(username string, version tuple.Versionstamp) fdb.Key {

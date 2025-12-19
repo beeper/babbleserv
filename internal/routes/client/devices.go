@@ -3,12 +3,13 @@ package client
 import (
 	"net/http"
 
-	"github.com/beeper/babbleserv/internal/middleware"
-	"github.com/beeper/babbleserv/internal/types"
-	"github.com/beeper/babbleserv/internal/util"
 	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/middleware"
+	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 // https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv3devices

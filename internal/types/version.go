@@ -5,6 +5,7 @@ import (
 	"encoding/base32"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -12,6 +13,8 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+const MaxVersionstampUserVersion = math.MaxUint16 - 1
 
 type Version tuple.Versionstamp
 

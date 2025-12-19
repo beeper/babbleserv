@@ -7,13 +7,14 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/notifier"
-	"github.com/beeper/babbleserv/internal/types"
-	"github.com/beeper/babbleserv/internal/util"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/notifier"
+	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 func (a *AccountsDatabase) PaginateDeviceChanges(

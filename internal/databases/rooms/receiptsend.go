@@ -2,7 +2,6 @@ package rooms
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -61,7 +60,7 @@ func (r *RoomsDatabase) SendReceipts(
 				panic("wrong room id provided")
 			}
 
-			if !r.users.TxnMustIsUserJoinedRoom(txn, rc.UserID, rc.RoomID) {
+			if !r.users.TxnIsUserJoinedRoom(txn, rc.UserID, rc.RoomID) {
 				// Change from spec: silently ignore receipts for rooms the user is not a member of
 				log.Warn().
 					Stringer("user_id", rc.UserID).
@@ -87,13 +86,11 @@ func (r *RoomsDatabase) SendReceipts(
 				}
 			}
 
-			evVersion, err := r.events.TxnLookupVersionForEventID(txn, rc.EventID)
-			if errors.Is(err, types.ErrEventNotFound) {
+			evVersion := r.events.TxnLookupVersionForEventID(txn, rc.EventID)
+			if evVersion == types.ZeroVersionstamp {
 				log.Warn().
 					Str("event_id", rc.EventID.String()).
 					Msg("Saving receipt with unknown event version")
-			} else if err != nil {
-				return nil, err
 			}
 			rc.EventVersion = types.Version(evVersion)
 

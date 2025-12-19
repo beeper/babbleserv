@@ -8,14 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -23,10 +21,12 @@ import (
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
 type SendLocalEventsOptions struct {
-	PreloadProviders []*events.TxnEventsProvider
+	// Ensure (+refresh) a lock is held at commit time
+	LockTxnRefresh lock.LockTxnRefreshFunc
 }
 
 // Send local events to a room, populating prev/auth events as well as authorizing
@@ -49,7 +49,7 @@ func (r *RoomsDatabase) SendLocalEvents(
 	ctx = log.WithContext(ctx)
 
 	if res, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*SendEventsResult, error) {
-		room, err := r.txnGetRoomForEvents(txn, roomID, partialEvs)
+		room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
 		if err != nil {
 			return nil, err
 		}
@@ -62,7 +62,13 @@ func (r *RoomsDatabase) SendLocalEvents(
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
 
-		r.txnStoreEvents(ctx, txn, room, allowedEvs, changedUsers, changedServers)
+		if !r.txnStoreEvents(ctx, txn, room, allowedEvs, changedUsers, changedServers) {
+			log.Warn().Msg("No events stored in send transaction")
+		}
+
+		if options.LockTxnRefresh != nil {
+			options.LockTxnRefresh(txn)
+		}
 
 		return newSendEventsResults(
 			txn.GetVersionstamp(),
@@ -73,7 +79,7 @@ func (r *RoomsDatabase) SendLocalEvents(
 			changedServers,
 		), nil
 	}); err != nil {
-		return nil, fmt.Errorf("write failed: %w", err)
+		return nil, fmt.Errorf("failed to send local events: %w", err)
 	} else {
 		return r.handleSendEventsResults(res, log)
 	}
@@ -94,7 +100,7 @@ func (r *RoomsDatabase) PrepareLocalEvents(ctx context.Context, roomID id.RoomID
 	var rejected []RejectedEvent
 
 	_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-		room, err := r.txnGetRoomForEvents(txn, roomID, partialEvs)
+		room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
 		if err != nil {
 			return nil, err
 		}
@@ -115,12 +121,9 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 	options SendLocalEventsOptions,
 ) ([]*types.Event, []RejectedEvent, error) {
 	eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-	if len(options.PreloadProviders) > 0 {
-		eventsProvider = eventsProvider.WithProviderEvents(options.PreloadProviders...)
-	}
 
 	// Get the current room state which we'll use to authenticate the events
-	currentStateMap, err := r.events.TxnLookupCurrentRoomAuthAndSpecificMemberStateMap(
+	currentStateMap := r.events.TxnLookupCurrentRoomAuthAndSpecificMemberStateMap(
 		ctx,
 		txn,
 		room.ID,
@@ -148,10 +151,7 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 	// Current room state events cannot be updated out-of-order w/FoundationDB
 	// The auth check using current state happens within the transaction
 
-	prevEventIDs, err := r.events.TxnLookupCurrentRoomExtremEventIDs(txn, room.ID)
-	if err != nil {
-		return nil, nil, err
-	}
+	prevEventIDs := r.events.TxnLookupCurrentRoomExtremEventIDs(txn, room.ID)
 
 	authProvider := events.NewTxnAuthEventsProvider(ctx, eventsProvider, currentStateMap)
 
@@ -164,6 +164,27 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 	keyID, key := r.config.MustGetActiveSigningKey()
 
 	for _, partialEv := range partialEvs {
+		if partialEv.StateKey != nil {
+			// If we're a state event check for any current state that is identical (by type, key
+			// and content), and dedupe.
+			stateTup := types.StateTup{Type: partialEv.Type, StateKey: *partialEv.StateKey}
+			currentStateMap := r.events.TxnLookupCurrentStateEventIDs(txn, room.ID, []types.StateTup{stateTup}, eventsProvider)
+			if evID, ok := currentStateMap[stateTup]; ok {
+				currentEv := eventsProvider.MustGet(evID)
+				if currentEv != nil && util.CompareSignedJSON(partialEv.Content, currentEv.Content) {
+					zerolog.Ctx(ctx).Warn().
+						Stringer("event_id", currentEv.ID).
+						Stringer("type", currentEv.Type).
+						Str("state_key", stateTup.StateKey).
+						Msg("Received duplicate state event, returning current")
+					// Flag as dupe (so we don't store) and return as the event
+					currentEv.IsDuplicate = true
+					allowedEvs = append(allowedEvs, currentEv)
+					continue
+				}
+			}
+		}
+
 		ev := &types.Event{
 			ClientEvent: types.ClientEvent{
 				PartialEvent: *partialEv,
@@ -188,7 +209,7 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 
 		if err := authProvider.IsEventAllowed(ev); err != nil {
 			zerolog.Ctx(ctx).Err(err).
-				Str("event_id", ev.ID.String()).
+				Stringer("event_id", ev.ID).
 				Any("event", ev).
 				Msg("Failed to auth event against current state")
 			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
@@ -202,16 +223,68 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 		allowedEvs = append(allowedEvs, ev)
 		eventsProvider.Add(ev)
 		zerolog.Ctx(ctx).Debug().
-			Str("event_id", ev.ID.String()).
-			Str("type", ev.Type.String()).
+			Stringer("event_id", ev.ID).
+			Stringer("type", ev.Type).
 			Msg("Event authorized for storage")
 	}
 
 	return allowedEvs, rejectedEvs, nil
 }
 
+// Sends an event we don't actually want stored in a room, but only on the relevant users membership
+// stream so they can see them, plus the raw event bytes. Simply sets a small subset of keys we
+// normally set during event store. Future non-outlier memberships will overwrite.
+func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context, ev *types.Event) error {
+	if ev.Type != event.StateMember {
+		panic("outlier event is not a member event")
+	}
+
+	// Flag the event as an outlier so we only store it without adding to the room/state
+	ev.Outlier = true
+
+	userID := id.UserID(*ev.StateKey)
+
+	versionFut, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (fdb.FutureKey, error) {
+		// Important to check that we're not in the room inside the write txn
+		if r.servers.TxnIsServerJoinedRoom(txn, r.config.ServerName, ev.RoomID) {
+			return nil, fmt.Errorf("cannot send outlier events to rooms this server is participating in")
+		}
+
+		eventTupBytes := types.EventTupToBytes(ev.EventTup())
+
+		// Firstly, store the event itself
+		r.events.TxnStoreEvent(txn, ev)
+
+		// Store global version -> EventTup, this is our index of all events
+		version := tuple.IncompleteVersionstamp(0)
+		txn.SetVersionstampedKey(r.events.KeyForVersion(version), eventTupBytes)
+
+		// Store the membership and membership change for the user
+		mtup := ev.MembershipTup()
+		r.users.TxnStoreMembership(txn, userID, ev.RoomID, mtup)
+		r.users.TxnStoreMembershipChange(txn, userID, version, mtup)
+
+		return txn.GetVersionstamp(), nil
+	})
+
+	if err == nil {
+		r.notifier.SendChange(notifier.Change{
+			UserIDs: []id.UserID{userID},
+		})
+		zerolog.Ctx(ctx).Debug().
+			Stringer("event_id", ev.ID).
+			Stringer("target_user_id", userID).
+			Stringer("sender", ev.Sender).
+			Str("membership", string(ev.Membership())).
+			Bool("is_outlier", ev.Outlier).
+			Any("versionstamp", types.DecodeRawVersionstamp(versionFut.MustGet())).
+			Msg("Stored outlier membership event")
+	}
+	return err
+}
+
 type SendFederatedEventsOptions struct {
-	SendLocalEventsOptions
+	SkipServerInRoomCheck bool
 }
 
 var (
@@ -253,7 +326,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// and apply the first authorization check:
 	// Step 4: Passes authorization rules based on the event’s auth events, otherwise it is rejected.
 	if _, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-		room, err = r.txnGetRoomForEvents(txn, roomID, util.EventsToPartialEvents(evs))
+		room, err = r.txnGetOrCreateRoomForEvents(txn, roomID, util.EventsToPartialEvents(evs))
 		if err != nil {
 			return nil, err
 		}
@@ -295,14 +368,13 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			// gets confused and sends a duplicate.
 			evExists, err := eventIDToVersionFut[ev.ID].Get()
 			var isDuplicate bool
-			if err != nil && err != types.ErrEventNotFound {
+			if err != nil {
 				return nil, err
 			} else if evExists != nil {
 				if ev.Type == event.StateMember {
-					// If we're a member event it's possible the "dupe" is an
-					// outlier event we're now un-outlier-ing.
-					outlierKey := r.users.KeyForOutlierMembership(id.UserID(*ev.StateKey), ev.RoomID)
-					if txn.Get(outlierKey).MustGet() == nil {
+					// We might be un-outlier-ing a federated member event
+					currentEv := r.events.TxnGetEvent(txn, ev.ID)
+					if !currentEv.Outlier {
 						isDuplicate = true
 					}
 				} else {
@@ -310,17 +382,24 @@ func (r *RoomsDatabase) SendFederatedEvents(
 				}
 			}
 			if isDuplicate {
-				evLog.Warn().Msg("Rejecting duplicate event we already know about")
-				rejectedEvs = append(rejectedEvs, RejectedEvent{ev, types.ErrAlreadyExists})
+				// Flag as a dupe - but we'll still continue to process/auth it below as events
+				// later in the batch may rely on it if is state.
+				evLog.Warn().Msg("Received duplicate event we already know about")
+				ev.IsDuplicate = true
+				currentEv := eventsProvider.MustGet(ev.ID)
+				if currentEv.Rejected {
+					// Make sure we match the dupe
+					ev.Rejected = true
+					rejectedEvs = append(rejectedEvs, RejectedEvent{ev, types.ErrAlreadyExists})
+				}
+				continue
+			} else if err := r.txnCheckEventBeforeStore(txn, roomID, ev); err != nil {
+				ev.Rejected = true
+				rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
 				continue
 			}
 
 			ev.RoomVersion = room.Version
-
-			if err := r.txnCheckEventBeforeStore(txn, roomID, ev); err != nil {
-				rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
-				continue
-			}
 
 			var authEventsMissing bool
 			var authErr error
@@ -408,9 +487,9 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		// so we can use it in the prev state checks. Often we'll be persisting a batch of events
 		// that refer to one another as prev_events and this enables doing that.
 		evIDToStateMap := make(map[id.EventID]types.StateMap, len(evs))
-		getStateAtEvent := func(evID id.EventID) (types.StateMap, error) {
+		getStateAtEvent := func(evID id.EventID) types.StateMap {
 			if sMap, found := evIDToStateMap[evID]; found {
-				return sMap, nil
+				return sMap
 			}
 			return r.events.TxnLookupRoomAuthAndSpecificMemberStateMapAtEvent(
 				ctx,
@@ -423,18 +502,18 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		}
 
 		for _, ev := range evs {
-			if ev.Rejected {
-				continue
-			}
 			evLog := log.With().
-				Str("event_id", ev.ID.String()).
-				Str("type", ev.Type.String()).
+				Stringer("event_id", ev.ID).
+				Stringer("type", ev.Type).
 				Logger()
 
 			var prevEvStateMap types.StateMap
-			var err error
 			if len(ev.PrevEventIDs) == 1 {
-				prevEvStateMap, err = getStateAtEvent(ev.PrevEventIDs[0])
+				if sMap, found := evIDToStateMap[ev.PrevEventIDs[0]]; found {
+					prevEvStateMap = sMap
+				} else {
+					prevEvStateMap = getStateAtEvent(ev.PrevEventIDs[0])
+				}
 			} else {
 				// We have multiple prev events, so we need to get the state at each, combine them
 				// together and perform state resolution to get the state we need.
@@ -442,40 +521,48 @@ func (r *RoomsDatabase) SendFederatedEvents(
 				for _, evID := range ev.PrevEventIDs {
 					sMap, found := evIDToStateMap[evID]
 					if !found {
-						sMap, err = getStateAtEvent(evID)
-						if err != nil {
-							break
-						}
+						sMap = getStateAtEvent(evID)
 					}
 					for _, evID := range sMap {
 						stateEvs[evID] = struct{}{}
 					}
 				}
-				if err == nil {
-					prevEvStateMap, err = r.txnResolveStateForEvents(txn, stateEvs, room.Version, eventsProvider)
+				prevEvStateMap, err = r.txnResolveStateForEvents(txn, stateEvs, room.Version, eventsProvider)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get state at prev event(s): %w", err)
 				}
 			}
 
-			if errors.Is(err, types.ErrEventNotFound) {
+			// If we've no previous state and we're not creating the room - fail
+			if len(prevEvStateMap) == 0 && ev.Type != event.StateCreate {
+				evLog.Error().
+					Any("event", ev).
+					Stringer("event_id", ev.ID).
+					Any("prev_event_ids", ev.PrevEventIDs).
+					Msg("Failed to auth event (step 5): prev event(s) not found")
 				ev.Rejected = true
 				rejectedEvs = append(rejectedEvs, RejectedEvent{
 					ev,
 					fmt.Errorf("failed to auth event (step 5): prev event(s) not found: %s", ev.PrevEventIDs),
 				})
 				continue
-			} else if err != nil {
-				return nil, fmt.Errorf("failed to get state at prev event(s): %w", err)
 			}
 
-			// Store the state map for the event now, before we finish authorizing
-			// it, we'll update it with the event iself if it is allowed.
+			// Store the state map for the event now, before we finish authorizing it, we'll update
+			// it with the event iself if it is allowed.
 			evIDToStateMap[ev.ID] = prevEvStateMap
+
+			// Important that we skip rejected *after* fetching any prev state, if a later event
+			// refers to the rejected event as it's prev we must use the prior state.
+			if ev.Rejected {
+				continue
+			}
 
 			prevStateAuthProvider := events.NewTxnAuthEventsProvider(ctx, eventsProvider, prevEvStateMap)
 			if err := prevStateAuthProvider.IsEventAllowed(ev); err != nil {
-				log.Err(err).
+				evLog.Err(err).
 					Any("event", ev).
-					Str("event_id", ev.ID.String()).
+					Stringer("event_id", ev.ID).
 					Msg("Failed to auth event (step 5)")
 				// Flag event as rejected - we still store it
 				ev.Rejected = true
@@ -502,21 +589,23 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// Bonus: we must also handle state resolution here if the room now has multiple extremeties, as
 	// this affects the current room state.
 	if res, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*SendEventsResult, error) {
+		// Important to check that we're in the room inside the write txn
+		if !options.SkipServerInRoomCheck && !r.servers.TxnIsServerJoinedRoom(txn, r.config.ServerName, roomID) {
+			return nil, fmt.Errorf("cannot send federated events to rooms this server is not participating in")
+		}
+
 		// New provider for this txn copying any events we pulled in the last two
 		eventsProvider = r.events.NewTxnEventsProvider(ctx, txn).WithProviderEvents(eventsProvider)
 
 		// Get the current room auth state + members
 		// Get the current room state which we'll use to authenticate the events
-		currentStateMap, err := r.events.TxnLookupCurrentRoomAuthAndSpecificMemberStateMap(
+		currentStateMap := r.events.TxnLookupCurrentRoomAuthAndSpecificMemberStateMap(
 			ctx,
 			txn,
 			roomID,
 			userIDs,
 			eventsProvider,
 		)
-		if err != nil {
-			return nil, err
-		}
 
 		// Use this auth provider throughout as we accept events after step 6
 		currentStateAuthProvider := events.NewTxnAuthEventsProvider(ctx, eventsProvider, currentStateMap)
@@ -548,10 +637,13 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
 
-		r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers)
-		// Split into it's own method for readability, should probably only ever called here
-		if err := r.txnResolveRoomState(ctx, txn, room, evs, changedUsers, changedServers, eventsProvider); err != nil {
-			return nil, fmt.Errorf("failed to resolve room state: %w", err)
+		if r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers) {
+			// Split into it's own method for readability, should probably only ever called here
+			if err := r.txnResolveRoomState(ctx, txn, room, evs, changedUsers, changedServers, eventsProvider); err != nil {
+				return nil, fmt.Errorf("failed to resolve room state: %w", err)
+			}
+		} else {
+			log.Warn().Msg("No events stored in send transaction")
 		}
 
 		return newSendEventsResults(
@@ -563,7 +655,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			changedServers,
 		), nil
 	}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to send federated events: %w", err)
 	} else {
 		return r.handleSendEventsResults(res, log)
 	}
@@ -589,11 +681,11 @@ func (r *RoomsDatabase) txnResolveRoomState(
 	changedServers map[string]struct{},
 	eventsProvider *events.TxnEventsProvider,
 ) error {
+	log := zerolog.Ctx(ctx)
+
 	// Now we check the room extremeties to see if we need to resolve forked states
-	extremEventIDs, err := r.events.TxnLookupCurrentRoomExtremEventIDs(txn, room.ID)
-	if err != nil {
-		return err
-	} else if len(extremEventIDs) == 1 {
+	extremEventIDs := r.events.TxnLookupCurrentRoomExtremEventIDs(txn, room.ID)
+	if len(extremEventIDs) == 1 {
 		// Room has one extremety in the DAG (allowedEvs[-1]) so current state is correct
 		return nil
 	}
@@ -611,7 +703,7 @@ func (r *RoomsDatabase) txnResolveRoomState(
 		// first prev event of the first event. This might over-fetch by being too old but that's
 		// absolutely fine, the resolution algorithm will handle it.
 		oldestEventID := evs[0].PrevEventIDs[0] // this should, by definition, be outside the batch
-		prevResVersion = r.events.TxnMustLookupVersionForEventID(txn, oldestEventID)
+		prevResVersion = r.events.TxnLookupVersionForEventID(txn, oldestEventID)
 	} else {
 		// We have resolved state in the room before - we now check which extremity event IDs we did
 		// that for. If there's only one different one in the current set we can skip state res as
@@ -635,31 +727,22 @@ func (r *RoomsDatabase) txnResolveRoomState(
 		prevResVersion = types.MustBytesToVersionstamp(txn.Get(lastResolvedVersionKey).MustGet())
 	}
 
-	zerolog.Ctx(ctx).Warn().Msg("Room has unresolved extremeties, performing state resolution")
+	log.Warn().
+		Strs("extreme_event_ids", util.StringersToStrs(extremEventIDs)).
+		Msg("Room has unresolved extremeties, performing state resolution")
 
 	// Collect events: current
-	currentStateMap, err := r.events.TxnLookupCurrentRoomStateAndMemberMap(txn, room.ID, eventsProvider)
-	if err != nil {
-		return err
-	}
+	currentStateMap := r.events.TxnLookupCurrentRoomStateAndMemberMap(txn, room.ID, eventsProvider)
 
 	// State at point of last res
-	stateAtLastResMap, err := r.events.TxnLookupRoomStateAndMemberMapAtVersion(txn, room.ID, prevResVersion, eventsProvider)
-	if err != nil {
-		return err
-	}
-
+	stateAtLastResMap := r.events.TxnLookupRoomStateAndMemberMapAtVersion(txn, room.ID, prevResVersion, eventsProvider)
 	// All state changes from last res -> now, this will include events from all forks (that passed
 	// authorization).
-	stateChangesSinceLastRes, err := r.events.TxnPaginateRoomStateEventTups(txn, room.ID, types.PaginationOptions{
+	stateChangesSinceLastRes := r.events.TxnPaginateRoomStateEventTups(txn, room.ID, types.PaginationOptions{
 		From: prevResVersion,
-		// Under NO circumstances can we range over anything not yet written
 		To:   util.TxnGetLatestWriteVersion(txn),
 		Mode: fdb.StreamingModeWantAll,
 	}, eventsProvider)
-	if err != nil {
-		return err
-	}
 
 	// Combine, resolve
 	eventMap := make(map[id.EventID]struct{}, len(currentStateMap)+len(stateAtLastResMap)+len(stateChangesSinceLastRes))
@@ -674,7 +757,7 @@ func (r *RoomsDatabase) txnResolveRoomState(
 	}
 	resolvedStateMap, err := r.txnResolveStateForEvents(txn, eventMap, room.Version, eventsProvider)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to resolve state for events: %w", err)
 	}
 
 	// Apply changes
@@ -713,7 +796,7 @@ func (r *RoomsDatabase) txnResolveRoomState(
 		r.txnDeleteStateEvent(txn, eventsProvider.MustGet(tup.EventID))
 	}
 
-	roomChanged := false
+	var roomChanged bool
 	latestVersion := evs[len(evs)-1].IncompleteVersion
 
 	for _, tup := range toSet {
@@ -740,48 +823,7 @@ func (r *RoomsDatabase) txnResolveRoomState(
 	}
 	txn.Set(lastResolvedIDsKey, append(tuple.Tuple{}, evIDs...).Pack())
 	txn.SetVersionstampedValue(lastResolvedVersionKey, types.MustVersionstampToBytes(latestVersion))
-
 	return nil
-}
-
-func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context, ev *types.Event) error {
-	if ev.Type != event.StateMember {
-		panic("outlier event is not a member event")
-	}
-
-	// Flag the event as an outlier so we only store it without adding to the room/state
-	ev.Outlier = true
-
-	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (*struct{}, error) {
-		room, err := r.txnGetRoomForEvents(txn, ev.RoomID, []*types.PartialEvent{&ev.PartialEvent})
-		if err != nil {
-			return nil, err
-		}
-
-		r.txnStoreEvents(
-			ctx,
-			txn,
-			room,
-			[]*types.Event{ev},
-			make(map[id.UserID]struct{}, 1),
-			make(map[string]struct{}, 1),
-		)
-
-		userID := id.UserID(*ev.StateKey)
-
-		// Store user/room -> MembershipTup
-		txn.Set(
-			r.users.KeyForOutlierMembership(userID, ev.RoomID),
-			types.MembershipTupToBytes(ev.MembershipTup()),
-		)
-
-		r.notifier.SendChange(notifier.Change{
-			UserIDs: []id.UserID{userID},
-		})
-
-		return nil, nil
-	})
-	return err
 }
 
 // Store events handles writing out all the relevant event data into FoundationDB
@@ -793,13 +835,11 @@ func (r *RoomsDatabase) txnStoreEvents(
 	evs []*types.Event,
 	changedUsers map[id.UserID]struct{},
 	changedServers map[string]struct{},
-) {
-	if len(evs) >= math.MaxUint16 {
-		// Not that we'd ever hit this but sync uses userversion 65535 which is why this matches
-		// equal. FDB limit is 65535 userversions in a trsnaction.
-		panic("not safe to write >65534 events")
+) bool {
+	if len(evs) > types.MaxVersionstampUserVersion {
+		panic("not safe to write this many events in one transaction")
 	} else if len(evs) == 0 {
-		return
+		return false
 	}
 
 	zerolog.Ctx(ctx).Debug().Int("events", len(evs)).Msg("Storing batch of events")
@@ -808,21 +848,27 @@ func (r *RoomsDatabase) txnStoreEvents(
 	depthKey := r.KeyForRoomDepth(room.ID)
 	depth := types.BytesToRoomDepth(txn.Get(depthKey).MustGet())
 
+	var eventsStored bool
 	var roomChanged bool
 
 	for i, ev := range evs {
-		zerolog.Ctx(ctx).Trace().
-			Any("event", ev).
-			Str("event_id", ev.ID.String()).
-			Bool("is_outlier", ev.Outlier).
-			Bool("is_rejected", ev.Rejected).
-			Bool("is_soft_failed", ev.SoftFailed).
-			Msg("Storing event")
+		if ev.Outlier {
+			panic("cannot pass outliers to txnStoreEvents")
+		} else if ev.IsDuplicate {
+			continue
+		}
+
+		zerolog.Ctx(ctx).Trace().Any("event", ev).Msg("Storing event")
+
+		eventsStored = true
+		if ev.Type == event.StateCreate {
+			roomChanged = true
+		}
 
 		eventTupBytes := types.EventTupToBytes(ev.EventTup())
 
 		// Firstly, store the event itself
-		txn.Set(r.events.KeyForEvent(ev.ID), ev.ToMsgpack())
+		r.events.TxnStoreEvent(txn, ev)
 
 		// This is the magic FDB version which is globally ordered, we index events by this
 		version = tuple.IncompleteVersionstamp(uint16(i))
@@ -831,24 +877,17 @@ func (r *RoomsDatabase) txnStoreEvents(
 		// Store global version -> EventTup, this is our index of all events
 		txn.SetVersionstampedKey(r.events.KeyForVersion(version), eventTupBytes)
 
-		if ev.Outlier {
-			// If we're an outlier event, we're not part of the DAG and just need to store the event,
-			// so we're done. Note that we still set the global version to tup index. Nut we don't
-			// store id to version as it's not on any timeline.
-			continue
-		}
-
 		if ev.Rejected || ev.SoftFailed {
 			// We can't just point soft failed events at the new version we're
 			// about to create because they aren't valid at that point. They are
 			// valid at their prev events, however, so we point their version to
 			// the first one of those. This means we resolve the correct historical
 			// state at a soft failed event.
-			firstPrevVersion, err := r.events.TxnLookupVersionForEventID(txn, ev.PrevEventIDs[0])
-			if errors.Is(err, types.ErrEventNotFound) {
+			firstPrevVersion := r.events.TxnLookupVersionForEventID(txn, ev.PrevEventIDs[0])
+			if firstPrevVersion == types.ZeroVersionstamp {
 				// If we don't have a prev event, this event is an outlier, update it
 				ev.Outlier = true
-				txn.Set(r.events.KeyForEvent(ev.ID), ev.ToMsgpack())
+				r.events.TxnStoreEvent(txn, ev)
 			} else {
 				txn.Set(r.events.KeyForIDToVersion(ev.ID), types.MustVersionstampToBytes(firstPrevVersion))
 			}
@@ -892,7 +931,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 			if relType == event.RelThread {
 				// room-threads/root-ev-version -> root event ID - only if this
 				// doesn't already exist (so the first reply in a thread creates).
-				relEvVersion := r.events.TxnMustLookupVersionForEventID(txn, relEvID)
+				relEvVersion := r.events.TxnLookupVersionForEventID(txn, relEvID)
 				threadKey := r.events.KeyForRoomThread(room.ID, relEvVersion)
 				if txn.Get(threadKey).MustGet() == nil {
 					txn.Set(threadKey, []byte(relEvID))
@@ -924,8 +963,12 @@ func (r *RoomsDatabase) txnStoreEvents(
 		txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
 	}
 
-	// Bump the room version to the max
-	txn.SetVersionstampedValue(r.KeyForRoomVersion(room.ID), types.MustVersionstampToBytes(version))
+	if eventsStored {
+		// Bump the room version to the max
+		txn.SetVersionstampedValue(r.KeyForRoomVersion(room.ID), types.MustVersionstampToBytes(version))
+	}
+
+	return eventsStored
 }
 
 // Store references to a state event that will be used to fetch a) current state and b) versioned
@@ -941,27 +984,6 @@ func (r *RoomsDatabase) txnStoreStateEvent(
 	changedUsers map[id.UserID]struct{},
 	changedServers map[string]struct{},
 ) bool {
-	// NOT safe: auth event selection. And stateAtEvent for federation.
-	// if ev.Type == event.StateMember {
-	// 	// First let's check if this membership event is actually relevant - ie does it change the
-	// 	// membership field in the content indicating a state change, or is it just profile update:
-	// 	// https://github.com/matrix-org/matrix-spec-proposals/pull/4218
-	// 	// https://github.com/matrix-org/matrix-spec-proposals/pull/4257
-	// 	currentRoomMemberKey := r.events.KeyForCurrentRoomMember(ev.RoomID, id.UserID(*ev.StateKey))
-	// 	currentMembershipBytes := txn.Get(currentRoomMemberKey).MustGet()
-	// 	if currentMembershipBytes != nil {
-	// 		currentMembershipTup := types.BytesToMembershipTup(currentMembershipBytes)
-	// 		if currentMembershipTup.Membership == ev.Membership() {
-	// 			zerolog.Ctx(ctx).Warn().
-	// 				Str("event_id", ev.ID.String()).
-	// 				Str("user_id", *ev.StateKey).
-	// 				Str("membership", string(ev.Membership())).
-	// 				Msg("Skip handling redundant membership event (profile update only)")
-	// 			return false
-	// 		}
-	// 	}
-	// }
-
 	zerolog.Ctx(ctx).Debug().Any("state_tup", ev.StateTup()).Msg("Storing state event")
 
 	// room/version -> EventStateTup
@@ -1012,36 +1034,27 @@ func (r *RoomsDatabase) txnStoreMembershipEvent(
 	txn.Set(r.events.KeyForCurrentRoomMember(ev.RoomID, memberID), membershipTupBytes)
 
 	// Current user/room_id -> MembershipTup
-	txn.Set(r.users.KeyForMembership(memberID, ev.RoomID), membershipTupBytes)
+	r.users.TxnStoreMembership(txn, memberID, ev.RoomID, membershipTup)
 
 	// User user/member_changes/version -> MembershipTup
-	txn.SetVersionstampedKey(r.users.KeyForMembershipChange(memberID, version), membershipTupBytes)
-
-	// If this event was an outlier membership clear that for the user
-	outlierKey := r.users.KeyForOutlierMembership(id.UserID(*ev.StateKey), ev.RoomID)
-	txn.Clear(outlierKey)
+	r.users.TxnStoreMembershipChange(txn, memberID, version, membershipTup)
 
 	// Handle server room memberships (including local!)
 	username, serverName, _ := memberID.Parse()
 	serverJoinedMemberKey := r.servers.KeyForRoomJoinedMember(ev.RoomID, serverName, username)
 
+	// Check if the server is currently joined (servers are only joined or nothing)
+	wasServerJoined := r.servers.TxnIsServerJoinedRoom(txn, serverName, ev.RoomID)
 	if ev.Membership() == event.MembershipJoin {
-		// If we're joining, first check if the server is currently
-		// a member of this room.
-		wasServerJoined := r.servers.TxnMustIsServerInRoom(txn, serverName, ev.RoomID)
 		// Set the joined member key and the server membership
 		txn.Set(serverJoinedMemberKey, []byte{})
 		if !wasServerJoined {
 			zerolog.Ctx(ctx).Debug().Str("server", serverName).Msg("Server has joined room")
 			changedServers[serverName] = struct{}{}
-			// Current room/server -> MembershipTup
-			txn.Set(r.events.KeyForCurrentRoomServer(ev.RoomID, serverName), membershipTupBytes)
-			// Server name/room_id -> MembershipTup
-			txn.Set(r.servers.KeyForMembership(serverName, ev.RoomID), membershipTupBytes)
-			// Server name/member_changes/version -> MembershipTup
-			txn.SetVersionstampedKey(r.servers.KeyForMembershipChange(serverName, version), membershipTupBytes)
+			r.events.TxnStoreServerMembership(txn, ev.RoomID, serverName, membershipTup, version)
+			r.servers.TxnStoreServerMembership(txn, ev.RoomID, serverName, membershipTup, version)
 		}
-	} else {
+	} else if wasServerJoined {
 		txn.Clear(serverJoinedMemberKey)
 		// If leaving, now we've cleared the specific member key
 		// we check if the server has any other joined members.
@@ -1054,19 +1067,14 @@ func (r *RoomsDatabase) txnStoreMembershipEvent(
 		if !haveOtherJoinedMembers {
 			zerolog.Ctx(ctx).Debug().Str("server", serverName).Msg("Server has left room")
 			changedServers[serverName] = struct{}{}
-			// Clear current room/server, server membership and set change
-			txn.Clear(r.events.KeyForCurrentRoomServer(ev.RoomID, serverName))
-			txn.Clear(r.servers.KeyForMembership(serverName, ev.RoomID))
-			txn.SetVersionstampedKey(
-				r.servers.KeyForMembershipChange(serverName, version),
-				// Note any non-join membership is handled here so we
-				// create a new leave MembershipTup.
-				types.MembershipTupToBytes(types.MembershipTup{
-					EventID:    ev.ID,
-					RoomID:     ev.RoomID,
-					Membership: event.MembershipLeave,
-				}),
-			)
+			// Note any non-join membership is handled here so we  create a new leave MembershipTup
+			leaveMtup := types.MembershipTup{
+				EventID:    ev.ID,
+				RoomID:     ev.RoomID,
+				Membership: event.MembershipLeave,
+			}
+			r.events.TxnStoreServerMembership(txn, ev.RoomID, serverName, leaveMtup, version)
+			r.servers.TxnStoreServerMembership(txn, ev.RoomID, serverName, leaveMtup, version)
 		}
 	}
 }
@@ -1078,7 +1086,7 @@ func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, ev *types.Event
 	// then we must use the IncompleteVersion field.
 	version := ev.IncompleteVersion
 	if version == types.ZeroVersionstamp {
-		version = r.events.TxnMustLookupVersionForEventID(txn, ev.ID)
+		version = r.events.TxnLookupVersionForEventID(txn, ev.ID)
 	}
 
 	// Remove room version/local version
@@ -1090,11 +1098,9 @@ func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, ev *types.Event
 		memberID := id.UserID(*ev.StateKey)
 		_, serverName, _ := memberID.Parse()
 		txn.Clear(r.events.KeyForCurrentRoomMember(ev.RoomID, memberID))
-		txn.Clear(r.users.KeyForMembership(memberID, ev.RoomID))
-		txn.Clear(r.users.KeyForMembershipChange(memberID, version))
 		txn.Clear(r.events.KeyForCurrentRoomServer(ev.RoomID, serverName))
-		txn.Clear(r.servers.KeyForMembership(serverName, ev.RoomID))
-		txn.Clear(r.servers.KeyForMembershipChange(serverName, version))
+		r.users.TxnDeleteUserMembership(txn, memberID, ev.RoomID, version)
+		r.servers.TxnDeleteServerMembership(txn, ev.RoomID, serverName, version)
 	} else {
 		// Clear our room/type/state version
 		txn.Clear(r.events.KeyForRoomCurrentStateTup(ev.RoomID, ev.Type, *ev.StateKey))

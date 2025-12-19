@@ -10,14 +10,15 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/log"
 
+	"maunium.net/go/mautrix/federation"
+	"maunium.net/go/mautrix/id"
+
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/routes"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/workers"
-	"maunium.net/go/mautrix/federation"
-	"maunium.net/go/mautrix/id"
 )
 
 type Babbleserv struct {

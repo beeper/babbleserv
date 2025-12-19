@@ -14,6 +14,8 @@ import (
 	"maunium.net/go/mautrix"
 	maufederation "maunium.net/go/mautrix/federation"
 
+	"github.com/beeper/libserv/pkg/requestlog"
+
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -22,7 +24,6 @@ import (
 	"github.com/beeper/babbleserv/internal/routes/debug"
 	"github.com/beeper/babbleserv/internal/routes/federation"
 	"github.com/beeper/babbleserv/internal/util"
-	"github.com/beeper/libserv/pkg/requestlog"
 )
 
 type Routes struct {

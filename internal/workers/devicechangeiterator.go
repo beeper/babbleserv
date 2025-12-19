@@ -5,6 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
+
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/databases/transient"
@@ -12,10 +17,6 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
-	"github.com/rs/zerolog"
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 )
 
 const (

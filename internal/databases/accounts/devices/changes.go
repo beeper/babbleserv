@@ -3,8 +3,9 @@ package devices
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/types"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 func (d *DevicesDirectory) keyForDeviceChange(version tuple.Versionstamp) fdb.Key {

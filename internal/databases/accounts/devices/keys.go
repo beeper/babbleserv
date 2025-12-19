@@ -6,11 +6,12 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/beeper/babbleserv/internal/types"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 func (d *DevicesDirectory) keyForDeviceKeys(userID id.UserID, deviceID id.DeviceID) fdb.Key {

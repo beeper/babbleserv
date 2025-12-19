@@ -8,6 +8,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -21,6 +22,12 @@ type inviteRequest struct {
 
 // https://spec.matrix.org/v1.10/server-server-api/#put_matrixfederationv2inviteroomideventid
 func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	if roomID == "" {
+		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	}
+
 	var req inviteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
@@ -50,12 +57,31 @@ func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
 		keyID: signature,
 	}
 
-	// Store the event as an outlier membership, meaning we index it only for the
-	// target of the invite not the room (if any) itself. If this server is in the
-	// room already we'll get the full event over federation which will overwrite.
-	if err := f.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), req.Event); err != nil {
+	serverInRoom, err := f.db.Rooms.IsServerJoinedRoom(r.Context(), f.config.ServerName, roomID)
+	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
+	}
+
+	if serverInRoom {
+		// We're in the room - so we can just send it directly as a federated event, we'll receive
+		// it a second time over federation txn (will be ignored as dupe).
+		res, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, []*types.Event{req.Event}, rooms.SendFederatedEventsOptions{})
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		} else if len(res.Rejected) > 0 {
+			err := res.Rejected[0].Error
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
+			return
+		}
+	} else {
+		// We're not in the room - store as an outlier so the target local user sees the invite in
+		// sync, but does not form part of the room.
+		if err := f.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), req.Event); err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, struct {
@@ -107,7 +133,7 @@ func (f *FederationRoutes) SendKnock(w http.ResponseWriter, r *http.Request) {
 			return nil, err
 		}
 		return struct {
-			KnockState []*types.Event `json:"knock_room_state"`
+			KnockState []*types.PartialEvent `json:"knock_room_state"`
 		}{strippedState}, nil
 	})
 }

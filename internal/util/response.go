@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 
 	"github.com/matrix-org/gomatrix"
 	"github.com/rs/zerolog/hlog"
@@ -55,6 +56,7 @@ var errorToMeta = map[string]errorMeta{
 	MMethodNotAllowed.ErrCode: {405, "Wrong HTTP method"},
 
 	MUnknown.ErrCode:        {500, "An unknown error occurred"},
+	MNotImplemented.ErrCode: {501, "Not implemented"},
 	MNotYetUploaded.ErrCode: {504, "File not yet uploaded"},
 }
 
@@ -82,7 +84,10 @@ func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error)
 		ResponseRawJSON(w, r, httpErr.Code, httpErr.Contents)
 		return
 	}
-	hlog.FromRequest(r).Err(err).Type("type", err).Msg("Unknown error processing request")
+
+	hlog.FromRequest(r).Err(err).
+		Type("type", err).
+		Msgf("Unknown error processing request: %s", debug.Stack())
 	ResponseErrorJSON(w, r, MUnknown)
 }
 

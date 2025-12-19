@@ -6,12 +6,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
-	"github.com/rs/zerolog"
 )
 
 type Worker interface {

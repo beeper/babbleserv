@@ -23,13 +23,13 @@ type ServersDirectory struct {
 	// Room memberships by server so we list (joined) rooms for a given server
 	//
 	// key: (ServerName, RoomID)
-	// value: []byte (always empty)
+	// value: types.MembershipTup
 	memberships subspace.Subspace
 
 	// Room membership changes by server so we can handle changes during sync (for federation)
 	//
 	// key: (ServerName, Versionstamp)
-	// value: types.MembershipTup
+	// value: types.MembershipTupWithVersion
 	membershipChanges subspace.Subspace
 }
 
@@ -67,18 +67,18 @@ func (s *ServersDirectory) RangeForRoomJoinedMembers(roomID id.RoomID, serverNam
 // Server memberships (server_name, room_id) -> '' (we only care about join)
 //
 
-func (s *ServersDirectory) KeyForMembership(serverName string, roomID id.RoomID) fdb.Key {
+func (s *ServersDirectory) keyForMembership(serverName string, roomID id.RoomID) fdb.Key {
 	return s.memberships.Pack(tuple.Tuple{serverName, roomID.String()})
 }
 
-func (s *ServersDirectory) RangeForMemberships(serverName string) fdb.Range {
+func (s *ServersDirectory) rangeForMemberships(serverName string) fdb.Range {
 	return s.memberships.Sub(serverName)
 }
 
 // Server membership changes (server_name, version) -> (room_id, membership)
 //
 
-func (s *ServersDirectory) KeyToMembershipChangeVersion(key fdb.Key) tuple.Versionstamp {
+func (s *ServersDirectory) keyToMembershipChangeVersion(key fdb.Key) tuple.Versionstamp {
 	tup, err := s.membershipChanges.Unpack(key)
 	if err != nil {
 		panic(err)
@@ -86,7 +86,7 @@ func (s *ServersDirectory) KeyToMembershipChangeVersion(key fdb.Key) tuple.Versi
 	return tup[1].(tuple.Versionstamp)
 }
 
-func (s *ServersDirectory) KeyForMembershipChange(serverName string, version tuple.Versionstamp) fdb.Key {
+func (s *ServersDirectory) keyForMembershipChange(serverName string, version tuple.Versionstamp) fdb.Key {
 	key, err := s.membershipChanges.PackWithVersionstamp(tuple.Tuple{
 		serverName, version,
 	})
@@ -96,7 +96,7 @@ func (s *ServersDirectory) KeyForMembershipChange(serverName string, version tup
 	return key
 }
 
-func (s *ServersDirectory) RangeForMembershipChanges(
+func (s *ServersDirectory) rangeForMembershipChanges(
 	serverName string,
 	fromVersion, toVersion tuple.Versionstamp,
 ) fdb.Range {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/tidwall/sjson"
+	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -33,6 +34,18 @@ func EventsToPartialEvents(evs []*types.Event) []*types.PartialEvent {
 		partEvs[i] = &ev.PartialEvent
 	}
 	return partEvs
+}
+
+func EventsToMauPDUs(evs []*types.Event) []federation.PDU {
+	pdus := make([]federation.PDU, len(evs))
+	for i, ev := range evs {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			panic(err)
+		}
+		pdus[i] = b
+	}
+	return pdus
 }
 
 func SortEventList(evs []*types.Event) {

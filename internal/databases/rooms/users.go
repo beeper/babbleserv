@@ -13,35 +13,39 @@ import (
 
 func (r *RoomsDatabase) IsUserJoinedRoom(ctx context.Context, userID id.UserID, roomID id.RoomID) (bool, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
-		return r.users.TxnIsUserJoinedRoom(txn, userID, roomID)
+		return r.users.TxnIsUserJoinedRoom(txn, userID, roomID), nil
+	})
+}
+
+func (r *RoomsDatabase) GetUserMembership(ctx context.Context, userID id.UserID, roomID id.RoomID) (*types.MembershipTup, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.MembershipTup, error) {
+		return r.users.TxnGetMembership(txn, userID, roomID), nil
 	})
 }
 
 func (r *RoomsDatabase) GetUserMemberships(ctx context.Context, userID id.UserID) (types.Memberships, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Memberships, error) {
-		return r.users.TxnLookupUserMemberships(txn, userID)
+		return r.users.TxnLookupUserMemberships(txn, userID), nil
 	})
 }
 
-func (r *RoomsDatabase) GetUserOutlierMemberships(ctx context.Context, userID id.UserID) (types.Memberships, error) {
+func (r *RoomsDatabase) GetUserJoinedMembershipsWithEncryption(ctx context.Context, userID id.UserID) (types.Memberships, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Memberships, error) {
-		return r.users.TxnLookupUserOutlierMemberships(txn, userID)
+		memberships := r.users.TxnLookupUserMemberships(txn, userID)
+		return r.events.TxnFilterJoinedMembershipsWithEncryption(txn, memberships)
 	})
 }
 
 func (r *RoomsDatabase) WasUserJoinedRoomAtEvent(ctx context.Context, userID id.UserID, roomID id.RoomID, evID id.EventID) (bool, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		stateMap, err := r.events.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, []id.UserID{userID}, evID, eventsProvider)
-		if err != nil {
-			return false, err
-		}
-		ev, err := eventsProvider.Get(stateMap[types.StateTup{
+		stateMap := r.events.TxnLookupSpecificRoomMemberStateMapAtEvent(ctx, txn, roomID, []id.UserID{userID}, evID, eventsProvider)
+		ev := eventsProvider.MustGet(stateMap[types.StateTup{
 			Type:     event.StateMember,
 			StateKey: userID.String(),
 		}])
-		if err != nil {
-			return false, err
+		if ev == nil {
+			return false, nil
 		}
 		return ev.Membership() == event.MembershipJoin, nil
 	})

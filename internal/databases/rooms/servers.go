@@ -10,9 +10,9 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func (r *RoomsDatabase) IsServerInRoom(ctx context.Context, serverName string, roomID id.RoomID) (bool, error) {
+func (r *RoomsDatabase) IsServerJoinedRoom(ctx context.Context, serverName string, roomID id.RoomID) (bool, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
-		return r.servers.TxnIsServerInRoom(txn, serverName, roomID)
+		return r.servers.TxnIsServerJoinedRoom(txn, serverName, roomID), nil
 	})
 }
 

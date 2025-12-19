@@ -6,6 +6,7 @@ package rooms
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -90,10 +91,6 @@ func getUserIDList(evs []*types.PartialEvent) []id.UserID {
 func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerolog.Logger) (*SendEventsResult, error) {
 	r.notifier.SendChange(res.change)
 
-	for _, r := range res.Rejected {
-		log.Warn().Err(r.Error).Str("event_id", r.Event.ID.String()).Msg("Event rejected")
-	}
-
 	rlog := log.Info().
 		Object("change", res.change).
 		Int("events_allowed", len(res.Allowed)).
@@ -106,7 +103,7 @@ func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerol
 	return res, nil
 }
 
-func (r *RoomsDatabase) txnGetRoomForEvents(
+func (r *RoomsDatabase) txnGetOrCreateRoomForEvents(
 	txn fdb.ReadTransaction,
 	roomID id.RoomID,
 	evs []*types.PartialEvent,
@@ -118,12 +115,10 @@ func (r *RoomsDatabase) txnGetRoomForEvents(
 	// If roomBytes is nil we must be creating the room, which means the first input event
 	// *must* be the create event.
 	if evs[0].Type != event.StateCreate {
-		return nil, types.ErrRoomNotFound
+		return nil, fmt.Errorf("%w: %s", types.ErrRoomNotFound, roomID)
 	}
 
-	room := types.Room{
-		ID: roomID,
-	}
+	room := types.Room{ID: roomID}
 
 	room.Version = gjson.GetBytes(evs[0].Content, "room_version").String()
 	room.Type = gjson.GetBytes(evs[0].Content, "type").String()
@@ -218,22 +213,6 @@ func (r *RoomsDatabase) txnResolveStateForEvents(
 }
 
 func (r *RoomsDatabase) updateRoomForStateEvent(room *types.Room, ev *types.Event) bool {
-	if ev.Type == event.StateCreate {
-		room.Version = gjson.GetBytes(ev.Content, "room_version").String()
-		room.Type = gjson.GetBytes(ev.Content, "type").String()
-
-		res := gjson.GetBytes(ev.Content, "m\\.federate")
-		var canFederate bool
-		if res.Exists() {
-			canFederate = res.Bool()
-		} else {
-			canFederate = true
-		}
-		room.Federated = canFederate
-
-		return true
-	}
-
 	var changed bool
 	switch ev.Type {
 	case event.StateRoomName:

@@ -3,7 +3,6 @@ package rooms
 import (
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"sync"
 
@@ -33,15 +32,15 @@ func (r *RoomsDatabase) SyncRoomsForUser(
 		syncOpts,
 		nil,
 		func(txn fdb.ReadTransaction) (types.Memberships, error) {
-			return r.users.TxnLookupUserMemberships(txn, userID)
+			return r.users.TxnLookupUserMemberships(txn, userID), nil
 		},
 		func(txn fdb.ReadTransaction, options types.PaginationOptions) (types.MembershipChanges, error) {
-			return r.users.TxnLookupUserMembershipChanges(txn, userID, options)
+			return r.users.TxnLookupUserMembershipChanges(txn, userID, options), nil
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) ([]types.EventTupWithVersion, error) {
+		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) []types.EventTupWithVersion {
 			return r.events.TxnPaginateRoomEventTups(txn, roomID, options, eventsProvider, syncOpts.GetTimelineFilter())
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) ([]types.EventStateTupWithVersion, error) {
+		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) []types.EventStateTupWithVersion {
 			return r.events.TxnPaginateRoomStateEventTups(txn, roomID, options, eventsProvider)
 		},
 		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions) ([]*types.ReceiptWithVersion, error) {
@@ -64,6 +63,9 @@ func (r *RoomsDatabase) SyncRoomsForServer(
 	fromVersion tuple.Versionstamp,
 	syncOpts types.SyncOptions,
 ) (tuple.Versionstamp, map[types.MembershipTup]*types.SyncRoom, error) {
+	// Ensure we're configured for S2S sync
+	syncOpts.IsServerToServer = true
+
 	return r.syncRoomEvents(
 		ctx,
 		fromVersion,
@@ -75,10 +77,10 @@ func (r *RoomsDatabase) SyncRoomsForServer(
 		func(txn fdb.ReadTransaction, options types.PaginationOptions) (types.MembershipChanges, error) {
 			return r.servers.TxnLookupServerMembershipChanges(txn, serverName, options)
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) ([]types.EventTupWithVersion, error) {
+		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) []types.EventTupWithVersion {
 			return r.events.TxnPaginateLocalRoomEventTups(txn, roomID, options, eventsProvider, syncOpts.GetTimelineFilter())
 		},
-		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) ([]types.EventStateTupWithVersion, error) {
+		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions, eventsProvider *events.TxnEventsProvider) []types.EventStateTupWithVersion {
 			panic("server sync should never have gaps in state")
 		},
 		func(txn fdb.ReadTransaction, roomID id.RoomID, options types.PaginationOptions) ([]*types.ReceiptWithVersion, error) {
@@ -95,8 +97,8 @@ func (r *RoomsDatabase) syncRoomEvents(
 	lastSentPositions map[id.RoomID]tuple.Versionstamp,
 	getCurrentMembershipsFunc func(fdb.ReadTransaction) (types.Memberships, error),
 	getMembershipChanges func(fdb.ReadTransaction, types.PaginationOptions) (types.MembershipChanges, error),
-	paginateRoomEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) ([]types.EventTupWithVersion, error),
-	paginateRoomStateEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) ([]types.EventStateTupWithVersion, error),
+	paginateRoomEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) []types.EventTupWithVersion,
+	paginateRoomStateEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) []types.EventStateTupWithVersion,
 	paginateRoomReceipts func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions) ([]*types.ReceiptWithVersion, error),
 ) (tuple.Versionstamp, map[types.MembershipTup]*types.SyncRoom, error) {
 	// First stage - select the rooms, data and version range of each, we're going to pull for this
@@ -128,46 +130,51 @@ func (r *RoomsDatabase) syncRoomEvents(
 		return types.ZeroVersionstamp, nil, err
 	}
 
-	// Calculate map of room membership -> sync config. Note this includes *all* memberships, not
-	// just joined rooms. We need these so we can apply membership changes over the top safely, and
-	// to send empty left, non-forgotten rooms during init syncs.
+	isInitSync := fromVersion == types.ZeroVersionstamp
+
+	// Calculate map of room membership -> sync config
 	roomsToSync := make(map[types.MembershipTup]*roomSyncConfig, len(memberships))
 	if options.Mode == types.SyncModeSliding {
-		// TODO: calculate room IDs based on the lists + room subscriptions
+		// TODO: calculate *joined* room IDs based on the lists + room subscriptions
 		// for roomID
 		// from = lastSentVersion
 		// initial = no lastSentVersion
 	} else {
 		// Legacy or streaming sync: select all joined rooms, init if zero from, always include receipts
 		for _, membershipTup := range memberships {
-			roomVersion := roomVersions[membershipTup.RoomID]
-			if types.VersionIsAtOrBefore(roomVersion, fromVersion) {
+			if !isInitSync {
+				// We only care about joined rooms for incremental sync, any other relevant membership
+				// events (leave/ban/knock) come via membership changes.
+				if membershipTup.Membership != event.MembershipJoin {
+					continue
+				}
 				// Skip rooms that have no changes since our from version, safe even below because
 				// this guarantees no membership changes in the room as well.
-				zerolog.Ctx(ctx).Trace().Any("membership_tup", membershipTup).Msg("Skip room with no changes")
-				continue
+				roomVersion := roomVersions[membershipTup.RoomID]
+				if types.VersionIsAtOrBefore(roomVersion, fromVersion) {
+					zerolog.Ctx(ctx).Trace().Any("membership_tup", membershipTup).Msg("Skip room with no changes")
+					continue
+				}
 			}
 
-			// TODO: handle receipts being enabled/not
+			// Only get receipts if joined
 			includeReceipts := false
 			if membershipTup.Membership == event.MembershipJoin {
 				includeReceipts = true
 			}
-			// Leave, ban, kick?
 
 			roomsToSync[membershipTup] = &roomSyncConfig{
 				from:            fromVersion,
 				to:              latestVersion,
-				isInitial:       fromVersion == types.ZeroVersionstamp,
+				isInitial:       isInitSync,
 				includeReceipts: includeReceipts,
 			}
 		}
 	}
 
 	// If not init: Get membership changes options.From -> toVersion
-	var membershipChanges types.MembershipChanges
-	if fromVersion != types.ZeroVersionstamp {
-		membershipChanges, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.MembershipChanges, error) {
+	if !isInitSync {
+		membershipChanges, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.MembershipChanges, error) {
 			return getMembershipChanges(txn, types.PaginationOptions{
 				From: fromVersion,
 				To:   latestVersion,
@@ -176,31 +183,33 @@ func (r *RoomsDatabase) syncRoomEvents(
 		if err != nil {
 			return types.ZeroVersionstamp, nil, err
 		}
-	}
-	for _, membershipChange := range membershipChanges {
-		roomConfig, found := roomsToSync[membershipChange.MembershipTup]
-		if !found {
-			// This means we're no longer joined to the room, so just include *this* event, this
-			// deviates from the spec because we won't send events from token -> this leave/ban/etc.
-			from := membershipChange.Version
-			from.UserVersion -= 1
-			roomsToSync[membershipChange.MembershipTup] = &roomSyncConfig{
-				from: from,
-				to:   membershipChange.Version,
+
+		for _, membershipChange := range membershipChanges {
+			if _, found := roomsToSync[membershipChange.MembershipTup]; !found {
+				// This means we're not joined to the room currently, so place an empty sync config
+				// as we have to at least pass the membership event down.
+				roomsToSync[membershipChange.MembershipTup] = &roomSyncConfig{}
 			}
-		} else if membershipChange.Membership == event.MembershipJoin {
-			// This means we joined at this point, so fetch events from here, and flag initial
-			from := membershipChange.Version
-			from.UserVersion -= 1
-			roomConfig.from = from
-			roomConfig.to = latestVersion
-			if !options.IsServerToServer {
-				roomConfig.isInitial = true
+			roomConfig := roomsToSync[membershipChange.MembershipTup]
+
+			switch membershipChange.Membership {
+			case event.MembershipJoin:
+				// This means we joined at this point, after the since token, so fetch events from,
+				// and including, the membership join and flag the room as initial.
+				from := membershipChange.Version
+				from.UserVersion-- // ensure we include the membership event itself
+				roomConfig.from = from
+				roomConfig.to = latestVersion
+				if !options.IsServerToServer {
+					roomConfig.isInitial = true
+				}
+			case event.MembershipLeave, event.MembershipBan:
+				// This means we left at this point, after the since token, so fetch events until
+				// the leave event.
+				// TODO: unused currently, since non-joins -> syncRoomNotJoinedTups
+				roomConfig.from = fromVersion
+				roomConfig.to = membershipChange.Version
 			}
-		} else {
-			// This means we left at this point, but have since re-joined (as we already have config),
-			// the above join should thus be in a subsequent change and we can do nothing here.
-			_ = false
 		}
 	}
 
@@ -220,22 +229,16 @@ func (r *RoomsDatabase) syncRoomEvents(
 		}
 		roomResults[membershipTup] = res
 
-		switch membershipTup.Membership {
-		case event.MembershipInvite, event.MembershipKnock:
-			// https://spec.matrix.org/v1.14/client-server-api/#stripped-state
+		if membershipTup.Membership != event.MembershipJoin {
+			// For non-joined rooms we just fetch the membership event
 			wg.Add(1)
 			go func(membershipTup types.MembershipTup, res *roomSyncResult) {
 				defer wg.Done()
-				if err := r.syncRoomStrippedStateTups(ctx, options, membershipTup, res); err != nil {
+				if err := r.syncRoomNotJoinedTups(ctx, options, membershipTup, res); err != nil {
 					panic(err)
 				}
 			}(membershipTup, res)
 			continue
-		case event.MembershipLeave, event.MembershipBan:
-			if res.isInitial {
-				// TODO: include just the current state event for init sync
-				continue
-			}
 		}
 
 		wg.Add(1)
@@ -257,8 +260,6 @@ func (r *RoomsDatabase) syncRoomEvents(
 				}
 			}(membershipTup, res)
 		}
-
-		// TODO rooConfig.includeProfiles
 	}
 
 	// Wait for all the EventTups+Receipts to be fetched
@@ -268,53 +269,8 @@ func (r *RoomsDatabase) syncRoomEvents(
 	// update the latest position to that of the latest event in the selected list. This means we're
 	// over-paginating event ID tups when the since token is far behind now. Edge-case-y enough not
 	// to be a big concern.
-	if options.Mode == types.SyncModeStreaming && fromVersion != types.ZeroVersionstamp {
-		timelineLimit := options.GetTimelineLimit()
-		allEventTups := make([]types.EventTupWithVersion, 0, len(roomResults)*timelineLimit)
-		for _, res := range roomResults {
-			allEventTups = append(allEventTups, res.eventTups...)
-		}
-		if len(allEventTups) > timelineLimit {
-			// Now, overwrite the latest version with the latest selected event tup
-			types.SortVersioners(allEventTups)
-			allEventTups = allEventTups[:util.MinInt(len(allEventTups), timelineLimit)]
-			latestVersion = allEventTups[len(allEventTups)-1].Version
-		}
-
-		receiptsLimit := options.GetReceiptsLimit()
-		allReceipts := make([]*types.ReceiptWithVersion, 0, len(roomResults)*receiptsLimit)
-		for _, res := range roomResults {
-			allReceipts = append(allReceipts, res.receipts...)
-		}
-		if len(allReceipts) > receiptsLimit {
-			// Limit also applies to receipts, overwrite latest version *if* older than the one
-			// already set. If newer we'll be trimming anything ahead already.
-			types.SortVersioners(allReceipts)
-			allReceipts = allReceipts[:util.MinInt(len(allReceipts), receiptsLimit)]
-			latestReceiptVersion := allReceipts[len(allReceipts)-1].Version
-			if types.VersionIsBefore(latestReceiptVersion, latestVersion) {
-				latestVersion = latestReceiptVersion
-			}
-		}
-
-		// Now go through each room result and remove events + receipts ahead of the version
-		for _, res := range roomResults {
-			filteredTups := make([]types.EventTupWithVersion, 0, len(res.eventTups))
-			for _, tup := range res.eventTups {
-				if types.VersionIsAtOrBefore(tup.Version, latestVersion) {
-					filteredTups = append(filteredTups, tup)
-				}
-			}
-			res.eventTups = filteredTups
-
-			filteredReceipts := make([]*types.ReceiptWithVersion, 0, len(res.receipts))
-			for _, receipt := range res.receipts {
-				if types.VersionIsAtOrBefore(receipt.Version, latestVersion) {
-					filteredReceipts = append(filteredReceipts, receipt)
-				}
-			}
-			res.receipts = filteredReceipts
-		}
+	if options.Mode == types.SyncModeStreaming && !isInitSync {
+		latestVersion = r.filterStreamingSyncTups(options, roomResults, latestVersion)
 	}
 
 	// Now that we have our final set of rooms, fetch the events!
@@ -350,12 +306,12 @@ func (r *RoomsDatabase) syncRoomEvents(
 			timeline := make([]*types.Event, len(result.eventTups))
 			for i, tup := range result.eventTups {
 				timeline[i] = eventsProvider.MustGet(tup.EventID)
-				timeline[i].Unsigned["hs.order"] = types.Version(idToVersion[tup.EventID])
+				timeline[i].SetUnsigned("hs.order", types.Version(idToVersion[tup.EventID]))
 			}
 			state := make([]*types.Event, len(result.eventStateTups))
 			for i, tup := range result.eventStateTups {
 				state[i] = eventsProvider.MustGet(tup.EventID)
-				state[i].Unsigned["hs.order"] = types.Version(idToVersion[tup.EventID])
+				state[i].SetUnsigned("hs.order", types.Version(idToVersion[tup.EventID]))
 			}
 
 			rooms[membershipTup] = &types.SyncRoom{
@@ -374,43 +330,22 @@ func (r *RoomsDatabase) syncRoomEvents(
 	return latestVersion, rooms, err
 }
 
-func (r *RoomsDatabase) syncRoomStrippedStateTups(
+func (r *RoomsDatabase) syncRoomNotJoinedTups(
 	ctx context.Context,
 	options types.SyncOptions,
 	membershipTup types.MembershipTup,
 	res *roomSyncResult,
 ) error {
-	stateMap, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.StateMap, error) {
-		// Grab invite state events
-		sMap, err := r.events.TxnLookupCurrentRoomStrippedStateStateMap(txn, membershipTup.RoomID, nil)
-		if err != nil {
-			return nil, err
-		}
-		// Plus the users membership event
-		mMap, err := r.events.TxnLookupCurrentSpecificRoomMemberStateMap(
-			txn,
-			membershipTup.RoomID,
-			[]id.UserID{options.UserID},
-			nil,
-		)
-		maps.Copy(sMap, mMap)
-		return sMap, err
-	})
-	if err != nil {
-		return err
-	}
-
-	tups := make([]types.EventStateTupWithVersion, 0, len(stateMap))
-	for stateTup, eventID := range stateMap {
-		tups = append(tups, types.EventStateTupWithVersion{
-			EventStateTup: types.EventStateTup{
-				StateTup: stateTup,
-				EventID:  eventID,
+	// Super simple: just include the membership event itself as a state event
+	res.eventStateTups = []types.EventStateTupWithVersion{{
+		EventStateTup: types.EventStateTup{
+			EventID: membershipTup.EventID,
+			StateTup: types.StateTup{
+				Type:     event.StateMember,
+				StateKey: options.UserID.String(),
 			},
-		})
-	}
-	res.eventStateTups = tups
-
+		},
+	}}
 	return nil
 }
 
@@ -419,8 +354,8 @@ func (r *RoomsDatabase) syncRoomEventTups(
 	options types.SyncOptions,
 	membershipTup types.MembershipTup,
 	res *roomSyncResult,
-	paginateRoomEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) ([]types.EventTupWithVersion, error),
-	paginateRoomStateEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) ([]types.EventStateTupWithVersion, error),
+	paginateRoomEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) []types.EventTupWithVersion,
+	paginateRoomStateEvents func(fdb.ReadTransaction, id.RoomID, types.PaginationOptions, *events.TxnEventsProvider) []types.EventStateTupWithVersion,
 ) error {
 	reverse := true
 	limit := options.GetTimelineLimit()
@@ -446,15 +381,12 @@ func (r *RoomsDatabase) syncRoomEventTups(
 
 	// First grab the event IDs, most recent first unless streaming incremental
 	_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-		tups, err := paginateRoomEvents(txn, membershipTup.RoomID, types.PaginationOptions{
+		tups := paginateRoomEvents(txn, membershipTup.RoomID, types.PaginationOptions{
 			From:    res.from,
 			To:      res.to,
 			Reverse: reverse,
 			Limit:   limit,
 		}, nil)
-		if err != nil {
-			return nil, err
-		}
 		if reverse {
 			// Switch the timeline back to old -> new order
 			slices.Reverse(tups)
@@ -474,15 +406,9 @@ func (r *RoomsDatabase) syncRoomEventTups(
 		// this room. Since clients need to handle double-delivery of events anyway, who cares.
 		var stateEventID id.EventID
 		_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-			stateMap, err := r.events.TxnLookupCurrentRoomStateMap(txn, membershipTup.RoomID, nil)
-			if err != nil {
-				return nil, err
-			}
+			stateMap := r.events.TxnLookupCurrentRoomStateMap(txn, membershipTup.RoomID, nil)
 			// TODO: lazy loading members
-			memberMap, err := r.events.TxnLookupCurrentRoomMemberStateMap(txn, membershipTup.RoomID, nil)
-			if err != nil {
-				return nil, err
-			}
+			memberMap := r.events.TxnLookupCurrentRoomMemberStateMap(txn, membershipTup.RoomID, nil)
 			stateTups := make([]types.EventStateTupWithVersion, 0, len(stateMap)+len(memberMap))
 			for stateTup, evID := range stateMap {
 				if stateTup.Type == event.StateCreate {
@@ -539,14 +465,11 @@ func (r *RoomsDatabase) syncRoomEventTups(
 		if options.Mode == types.SyncModeLegacy && !options.EnableLegacyStateAfter {
 			to = res.eventTups[0].Version
 		}
-		stateEvTups, err := paginateRoomStateEvents(txn, membershipTup.RoomID, types.PaginationOptions{
+		stateEvTups := paginateRoomStateEvents(txn, membershipTup.RoomID, types.PaginationOptions{
 			From: res.from,
 			To:   to,
 			Mode: fdb.StreamingModeWantAll,
 		}, nil)
-		if err != nil {
-			return nil, err
-		}
 		res.eventStateTups = stateEvTups
 		return nil, nil
 	})
@@ -600,4 +523,59 @@ func (r *RoomsDatabase) syncRoomReceipts(
 		return nil, nil
 	})
 	return err
+}
+
+func (r *RoomsDatabase) filterStreamingSyncTups(
+	options types.SyncOptions,
+	roomResults map[types.MembershipTup]*roomSyncResult,
+	latestVersion tuple.Versionstamp,
+) tuple.Versionstamp {
+	timelineLimit := options.GetTimelineLimit()
+	allEventTups := make([]types.EventTupWithVersion, 0, len(roomResults)*timelineLimit)
+	for _, res := range roomResults {
+		allEventTups = append(allEventTups, res.eventTups...)
+	}
+	if len(allEventTups) > timelineLimit {
+		// Now, overwrite the latest version with the latest selected event tup
+		types.SortVersioners(allEventTups)
+		allEventTups = allEventTups[:min(len(allEventTups), timelineLimit)]
+		latestVersion = allEventTups[len(allEventTups)-1].Version
+	}
+
+	receiptsLimit := options.GetReceiptsLimit()
+	allReceipts := make([]*types.ReceiptWithVersion, 0, len(roomResults)*receiptsLimit)
+	for _, res := range roomResults {
+		allReceipts = append(allReceipts, res.receipts...)
+	}
+	if len(allReceipts) > receiptsLimit {
+		// Limit also applies to receipts, overwrite latest version *if* older than the one
+		// already set. If newer we'll be trimming anything ahead already.
+		types.SortVersioners(allReceipts)
+		allReceipts = allReceipts[:min(len(allReceipts), receiptsLimit)]
+		latestReceiptVersion := allReceipts[len(allReceipts)-1].Version
+		if types.VersionIsBefore(latestReceiptVersion, latestVersion) {
+			latestVersion = latestReceiptVersion
+		}
+	}
+
+	// Now go through each room result and remove events + receipts ahead of the version
+	for _, res := range roomResults {
+		filteredTups := make([]types.EventTupWithVersion, 0, len(res.eventTups))
+		for _, tup := range res.eventTups {
+			if types.VersionIsAtOrBefore(tup.Version, latestVersion) {
+				filteredTups = append(filteredTups, tup)
+			}
+		}
+		res.eventTups = filteredTups
+
+		filteredReceipts := make([]*types.ReceiptWithVersion, 0, len(res.receipts))
+		for _, receipt := range res.receipts {
+			if types.VersionIsAtOrBefore(receipt.Version, latestVersion) {
+				filteredReceipts = append(filteredReceipts, receipt)
+			}
+		}
+		res.receipts = filteredReceipts
+	}
+
+	return latestVersion
 }

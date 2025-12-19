@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -64,18 +65,20 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 	if err != nil {
 		return nil, nil, err
 	}
-	strippedPDUs := make([]gomatrixserverlib.InviteStrippedState, 0, len(inviteStateEvs))
-	for _, stateEv := range inviteStateEvs {
-		strippedPDUs = append(strippedPDUs, gomatrixserverlib.NewInviteStrippedState(stateEv.PDU()))
-	}
+	ev.SetUnsigned("invite_room_state", inviteStateEvs)
+
+	// Because GMSL hides *everything* we have to do this ridiculous dance TODO: move to mautrix
+	var strippedPDUs []gomatrixserverlib.InviteStrippedState
+	b, _ := json.Marshal(inviteStateEvs)
+	json.Unmarshal(b, &strippedPDUs)
+
 	inviteReq, err := fclient.NewInviteV2Request(ev.PDU(), strippedPDUs)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Switch to a background context here - if the client drops the request
-	// we should still send/receive the invite so the state on the remote HS
-	// and local don't end up diverged.
+	// Switch to a background context here - if the client drops the request we should still
+	// send/receive the invite so the state on the remote HS and local don't end up diverged.
 	backgroundCtx := zerolog.Ctx(ctx).With().
 		Str("background_task", "SendFederatedInvite").
 		Logger().
@@ -107,10 +110,9 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 		return nil, &mautrix.MInvalidParam, verifyErr
 	}
 
-	// Now that we've prepared, other HS signed and we verified the event we
-	// can send it. We send it as if it's a federated event which triggers
-	// all the authorization checks, accounting for any state changes in
-	// the room during the signing process above.
+	// Now that we've prepared, other HS signed and we verified the event we  can send it. We send
+	// it as if it's a federated event which triggers all the authorization checks, accounting for
+	// any state changes in the room during the signing process above.
 	results, err := c.db.Rooms.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, rooms.SendFederatedEventsOptions{})
 	if err != nil {
 		return nil, nil, err

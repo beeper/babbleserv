@@ -13,12 +13,13 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/matrix-org/gomatrixserverlib/spec"
+	"github.com/rs/zerolog/hlog"
+
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/routes/shared"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
-	"github.com/matrix-org/gomatrixserverlib/spec"
-	"github.com/rs/zerolog/hlog"
 )
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keysclaim
