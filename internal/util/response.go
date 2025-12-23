@@ -41,6 +41,7 @@ type errorMeta struct {
 var errorToMeta = map[string]errorMeta{
 	mautrix.MNotJSON.ErrCode:      {400, "Request body is not valid JSON"},
 	mautrix.MBadJSON.ErrCode:      {400, "Request body is JSON but not match schema"},
+	mautrix.MBadState.ErrCode:     {400, ""},
 	mautrix.MInvalidParam.ErrCode: {400, ""},
 
 	mautrix.MUnsupportedRoomVersion.ErrCode: {400, "Room version not supported"},
@@ -80,7 +81,7 @@ func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error)
 			Int("code", httpErr.Code).
 			Str("message", httpErr.Message).
 			Str("contents", string(httpErr.Contents)).
-			Msg("Matrix error processing request")
+			Msgf("Unknown Matrix error processing request: %s", debug.Stack())
 		ResponseRawJSON(w, r, httpErr.Code, httpErr.Contents)
 		return
 	}
