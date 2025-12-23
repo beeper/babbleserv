@@ -11,6 +11,19 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
+func (e *EventsDirectory) TxnDeleteRoomExtremEventID(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) {
+	txn.Clear(e.keyForRoomExtrem(roomID, eventID))
+}
+
+func (e *EventsDirectory) TxnSetRoomExtremEventID(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) {
+	txn.Set(e.keyForRoomExtrem(roomID, eventID), []byte{})
+}
+
+func (e *EventsDirectory) TxnResetRoomExtremEventIDs(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) {
+	txn.ClearRange(e.rangeForRoomExtrems(roomID))
+	e.TxnSetRoomExtremEventID(txn, roomID, eventID)
+}
+
 // Lookup current last event IDs for a room - note we do not start fetching the
 // events as we only need the IDs.
 func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
@@ -18,7 +31,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
 	roomID id.RoomID,
 ) []id.EventID {
 	iter := txn.GetRange(
-		e.RangeForRoomExtrems(roomID),
+		e.rangeForRoomExtrems(roomID),
 		fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		},
@@ -26,7 +39,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
 	ids := make([]id.EventID, 0, 1)
 	for iter.Advance() {
 		kv := iter.MustGet()
-		ids = append(ids, e.RoomExtremKeyToEventID(kv.Key))
+		ids = append(ids, e.roomExtremKeyToEventID(kv.Key))
 	}
 	return ids
 }

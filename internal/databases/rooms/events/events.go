@@ -356,16 +356,16 @@ func (e *EventsDirectory) TxnStoreServerMembership(
 // Room extremeties (room_id, event_id) -> ''
 //
 
-func (e *EventsDirectory) KeyForRoomExtrem(roomID id.RoomID, eventID id.EventID) fdb.Key {
+func (e *EventsDirectory) keyForRoomExtrem(roomID id.RoomID, eventID id.EventID) fdb.Key {
 	return e.roomExtremIDs.Pack(tuple.Tuple{roomID.String(), eventID.String()})
 }
 
-func (e *EventsDirectory) RoomExtremKeyToEventID(key fdb.Key) id.EventID {
+func (e *EventsDirectory) roomExtremKeyToEventID(key fdb.Key) id.EventID {
 	tup, _ := e.roomExtremIDs.Unpack(key)
 	return id.EventID(tup[1].(string))
 }
 
-func (e *EventsDirectory) RangeForRoomExtrems(roomID id.RoomID) fdb.Range {
+func (e *EventsDirectory) rangeForRoomExtrems(roomID id.RoomID) fdb.ExactRange {
 	return types.GetVersionRange(e.roomExtremIDs, types.ZeroVersionstamp, types.ZeroVersionstamp, roomID.String())
 	// return e.roomExtremIDs
 }

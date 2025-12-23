@@ -244,7 +244,7 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 			rooms.SendFederatedEventsOptions{
 				// We're joining *now* and won't have all prev event history, ultimately we have
 				// to trust the other HS is giving us the correct state.
-				IsRemoteJoin: true,
+				RemoteJoinEventID: ev.ID,
 				// We're joining, meaning we're *not* currently in the room
 				SkipServerInRoomCheck: true,
 			},

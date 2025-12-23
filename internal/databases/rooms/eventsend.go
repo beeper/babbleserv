@@ -285,7 +285,7 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 type SendFederatedEventsOptions struct {
 	// Skip stage 5 auth of the state at each events prev_events. This is required when doing remote
 	// joins where we don't have the history of the room prior to the join.
-	IsRemoteJoin bool
+	RemoteJoinEventID id.EventID
 	// By default we check, within the write txn, that this server is currently in the room - this
 	// disables that when expected (remote join).
 	SkipServerInRoomCheck bool
@@ -459,7 +459,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// Second read only transaction, second authorization check:
 	// Step 5: Passes authorization rules based on the state before the event, otherwise it is rejected.
 	if _, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-		if options.IsRemoteJoin {
+		if options.RemoteJoinEventID != "" {
 			return nil, nil
 		}
 
@@ -597,8 +597,9 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// Bonus: we must also handle state resolution here if the room now has multiple extremeties, as
 	// this affects the current room state.
 	if res, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*SendEventsResult, error) {
+		thisServerInRoom := r.servers.TxnIsServerJoinedRoom(txn, r.config.ServerName, roomID)
 		// Important to check that we're in the room inside the write txn
-		if !options.SkipServerInRoomCheck && !r.servers.TxnIsServerJoinedRoom(txn, r.config.ServerName, roomID) {
+		if !options.SkipServerInRoomCheck && !thisServerInRoom {
 			return nil, fmt.Errorf("cannot send federated events to rooms this server is not participating in")
 		}
 
@@ -645,19 +646,19 @@ func (r *RoomsDatabase) SendFederatedEvents(
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
 
-		if r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers) {
-			// If we're a remote join we'll probably have multiple extremeties because we don't
-			// have the full history of the room. For now skip state res at this point, the next
-			// event in the room will trigger it, however. To properly fix this we should overwrite
-			// the room extreme IDs to just be the join event from the join handshake.
-			if !options.IsRemoteJoin {
-				// Split into it's own method for readability, should probably only ever called here
+		if !r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers) {
+			log.Warn().Msg("No events stored in send transaction")
+		} else {
+			if options.RemoteJoinEventID != "" && !thisServerInRoom {
+				// We're joining the room for the first time, so overwrite the room extremeties to
+				// the join event just created via the make/send federation handshake.
+				r.events.TxnResetRoomExtremEventIDs(txn, roomID, options.RemoteJoinEventID)
+			} else {
+				// We're not joining (or already were) - check if we need to perform state res
 				if err := r.txnResolveRoomState(ctx, txn, room, evs, changedUsers, changedServers, eventsProvider); err != nil {
 					return nil, fmt.Errorf("failed to resolve room state: %w", err)
 				}
 			}
-		} else {
-			log.Warn().Msg("No events stored in send transaction")
 		}
 
 		return newSendEventsResults(
@@ -967,10 +968,10 @@ func (r *RoomsDatabase) txnStoreEvents(
 		// The contents of room/last/ are used at event creation time to populate
 		// prev_events, thus any DAG split can be corrected by sending an event.
 		for _, prevEventID := range ev.PrevEventIDs {
-			txn.Clear(r.events.KeyForRoomExtrem(room.ID, prevEventID))
+			r.events.TxnDeleteRoomExtremEventID(txn, room.ID, prevEventID)
 		}
 		// Set this last, so rooms always have a last event
-		txn.Set(r.events.KeyForRoomExtrem(room.ID, ev.ID), nil)
+		r.events.TxnSetRoomExtremEventID(txn, room.ID, ev.ID)
 	}
 
 	if roomChanged {
