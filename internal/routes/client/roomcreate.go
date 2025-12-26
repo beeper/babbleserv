@@ -150,7 +150,11 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	externalInvites := make(map[id.UserID]*types.PartialEvent, 0)
 	for _, uid := range req.Invite {
 		uidStr := string(uid)
-		inviteEv := types.NewPartialEvent(roomID, event.StateMember, &uidStr, userID, map[string]any{"membership": "invite"})
+		content := map[string]any{"membership": "invite"}
+		if req.IsDirect {
+			content["is_direct"] = true
+		}
+		inviteEv := types.NewPartialEvent(roomID, event.StateMember, &uidStr, userID, content)
 		// TODO: invite_room_state UNSIGNED
 		if uid.Homeserver() == c.config.ServerName {
 			evs = append(evs, inviteEv)
