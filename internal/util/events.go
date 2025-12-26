@@ -245,7 +245,7 @@ func HashAndSignEvent(ev *types.Event, serverName, keyID string, key ed25519.Pri
 			keyID: signature,
 		},
 	}
-	ev.ClientEvent.ID = refHash
+	ev.ID = refHash
 
 	return nil
 }

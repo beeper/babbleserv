@@ -8,6 +8,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"github.com/vmihailenco/msgpack/v5"
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -18,11 +19,12 @@ var _ msgpack.Marshaler = (*Event)(nil)
 
 // A partial event before hashing, signatures and prev/auth events are added
 type PartialEvent struct {
-	RoomID   id.RoomID       `msgpack:"rid" json:"room_id,omitempty"`
-	Sender   id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
-	StateKey *string         `msgpack:"sky" json:"state_key,omitempty"`
-	Content  json.RawMessage `msgpack:"cnt" json:"content"`
-	Redacts  id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
+	RoomID    id.RoomID       `msgpack:"rid" json:"room_id,omitempty"`
+	Sender    id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
+	StateKey  *string         `msgpack:"sky" json:"state_key,omitempty"`
+	Content   json.RawMessage `msgpack:"cnt" json:"content"`
+	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
+	Timestamp int64           `msgpack:"ots" json:"origin_server_ts"`
 
 	// event.Type doesn't implement msgpack marshalling, so we use TypeStr
 	TypeStr string     `msgpack:"typ" json:"-"`
@@ -33,21 +35,12 @@ type PartialEvent struct {
 	Unsigned    map[string]any  `msgpack:"-" json:"unsigned,omitempty"`
 }
 
-// The CSAPI ClientEvent type, described here:
-// https://spec.matrix.org/v1.11/client-server-api/#room-event-format
-type ClientEvent struct {
-	PartialEvent `msgpack:",inline" json:",inline"`
-
-	// Event ID is not part of the (S2S) event JSON, populated at fetch (from key)
-	ID id.EventID `msgpack:"-" json:"event_id"`
-
-	Timestamp int64 `msgpack:"ots" json:"origin_server_ts"`
-}
-
-// The S2SAPI PDU type, described here (varies slightly by room version):
 // https://spec.matrix.org/v1.11/rooms/v11/#event-format-1
 type Event struct {
-	ClientEvent `msgpack:",inline" json:",inline"`
+	PartialEvent `msgpack:",inline" json:",inline"`
+
+	// Populated at fetch from key (not stored)
+	ID id.EventID `msgpack:"-" json:"-"`
 
 	// Internal flag to indicate whether this event was generated locally
 	Local bool `msgpack:"loc" json:"-"`
@@ -68,7 +61,7 @@ type Event struct {
 	Depth int64 `msgpack:"dpt" json:"depth"`
 
 	// Only here for backwards compat ???
-	PrevState []id.EventID `msgpack:"pst" json:"prev_state,omitempty"`
+	PrevState []id.EventID `msgpack:"pst" json:"prev_state,omitzero"`
 
 	PrevEventIDs []id.EventID `msgpack:"pid" json:"prev_events"`
 	AuthEventIDs []id.EventID `msgpack:"aid" json:"auth_events"`
@@ -122,9 +115,7 @@ func NewPartialEvent(
 
 func NewEventFromPartialEvent(pev *PartialEvent) *Event {
 	return &Event{
-		ClientEvent: ClientEvent{
-			PartialEvent: *pev,
-		},
+		PartialEvent: *pev,
 	}
 }
 
@@ -146,16 +137,14 @@ func eventIDsFromProtoEvent(input any) []id.EventID {
 
 func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) *Event {
 	return &Event{
-		ClientEvent: ClientEvent{
-			PartialEvent: PartialEvent{
-				RoomID:   id.RoomID(protoEv.RoomID),
-				Sender:   id.UserID(protoEv.SenderID),
-				TypeStr:  protoEv.Type,
-				Type:     event.NewEventType(protoEv.Type),
-				StateKey: protoEv.StateKey,
-				Content:  []byte(protoEv.Content),
-				Redacts:  id.EventID(protoEv.Redacts),
-			},
+		PartialEvent: PartialEvent{
+			RoomID:   id.RoomID(protoEv.RoomID),
+			Sender:   id.UserID(protoEv.SenderID),
+			TypeStr:  protoEv.Type,
+			Type:     event.NewEventType(protoEv.Type),
+			StateKey: protoEv.StateKey,
+			Content:  []byte(protoEv.Content),
+			Redacts:  id.EventID(protoEv.Redacts),
 		},
 		Depth:        protoEv.Depth,
 		AuthEventIDs: eventIDsFromProtoEvent(protoEv.AuthEvents),
@@ -204,12 +193,11 @@ func (ev *Event) ToMsgpack() []byte {
 
 func (ev Event) MarshalJSON() ([]byte, error) {
 	if ev.IsForClientAPI {
-		b, err := json.Marshal(ev.ClientEvent)
-		if err != nil {
-			return nil, err
-		}
-		// Remove room_id, which is only included in the S2S API
-		return sjson.DeleteBytes(b, "room_id")
+		// Client API removes room_id, adds event_id
+		b := exerrors.Must(json.Marshal(ev.PartialEvent))
+		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
+		b = exerrors.Must(sjson.SetBytes(b, "event_id", ev.ID))
+		return b, nil
 	}
 
 	if ev.AuthEventIDs == nil {
@@ -218,33 +206,14 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 	if ev.PrevEventIDs == nil {
 		ev.PrevEventIDs = make([]id.EventID, 0)
 	}
-	b, err := json.Marshal((marshalEvent)(ev))
-	if err != nil {
-		return nil, err
-	}
-	if ev.PrevState != nil {
-		// Work around no omitnil in Go's JSON marshaller
-		b, err = sjson.SetBytes(b, "prev_state", []string{})
-		if err != nil {
-			return nil, err
-		}
-	}
-	// Remove event_id, which is only included in the CS API
-	return sjson.DeleteBytes(b, "event_id")
+	b := exerrors.Must(json.Marshal((marshalEvent)(ev)))
+	// Strip unsigned from any S2S API calls
+	b = exerrors.Must(sjson.DeleteBytes(b, "unsigned"))
+	return b, nil
 }
 
 func (ev *Event) UnmarshalJSON(b []byte) error {
-	err := json.Unmarshal(b, (*marshalEvent)(ev))
-	if err != nil {
-		return err
-	}
-	if gjson.GetBytes(b, "prev_state").Exists() {
-		// Work around no omitnil in Go's JSON unmarshaller
-		ev.PrevState = []id.EventID{}
-	} else {
-		ev.PrevState = nil
-	}
-	return nil
+	return json.Unmarshal(b, (*marshalEvent)(ev))
 }
 
 func (ev *Event) EventTup() EventTup {

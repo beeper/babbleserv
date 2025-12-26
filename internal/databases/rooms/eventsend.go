@@ -185,11 +185,9 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 			}
 		}
 
+		partialEv.Timestamp = originTimestamp.UnixMilli()
 		ev := &types.Event{
-			ClientEvent: types.ClientEvent{
-				PartialEvent: *partialEv,
-				Timestamp:    originTimestamp.UnixMilli(),
-			},
+			PartialEvent: *partialEv,
 			Local:        true,
 			Depth:        depth,
 			RoomVersion:  room.Version,

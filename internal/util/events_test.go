@@ -22,20 +22,18 @@ import (
 // https://spec.matrix.org/v1.10/appendices/#cryptographic-test-vectors
 func TestEventHashAndSign(t *testing.T) {
 	ev := &types.Event{
-		ClientEvent: types.ClientEvent{
-			PartialEvent: types.PartialEvent{
-				RoomID: id.RoomID("!x:domain"),
-				Sender: id.UserID("@a:domain"),
+		PartialEvent: types.PartialEvent{
+			RoomID: id.RoomID("!x:domain"),
+			Sender: id.UserID("@a:domain"),
 
-				Type:    event.NewEventType("X"),
-				Content: []byte(`{}`),
-				Unsigned: map[string]any{
-					"age_ts": 1000000,
-				},
+			Type:    event.NewEventType("X"),
+			Content: []byte(`{}`),
+			Unsigned: map[string]any{
+				"age_ts": 1000000,
 			},
-			ID:        "abc",
 			Timestamp: 1000000,
 		},
+		ID:           "abc",
 		Depth:        3,
 		PrevEventIDs: []id.EventID{},
 		AuthEventIDs: []id.EventID{},
