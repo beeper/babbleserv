@@ -11,6 +11,9 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
+// Room extremeties
+//
+
 func (e *EventsDirectory) TxnDeleteRoomExtremEventID(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) {
 	txn.Clear(e.keyForRoomExtrem(roomID, eventID))
 }
@@ -44,8 +47,76 @@ func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
 	return ids
 }
 
+// Current room state (non-member) events
+//
+
+func (e *EventsDirectory) TxnIsRoomEncrypted(txn fdb.ReadTransaction, roomID id.RoomID) bool {
+	// Note we're simply checking for the presence of an encryption event here
+	b := txn.Get(e.KeyForRoomCurrentStateTup(roomID, event.StateEncryption, "")).MustGet()
+	return b != nil
+}
+
+func (e *EventsDirectory) TxnGetCurrentRoomStateEvent(
+	txn fdb.ReadTransaction,
+	roomID id.RoomID,
+	stateTup types.StateTup,
+	eventsProvider *TxnEventsProvider,
+) *types.Event {
+	var sMap types.StateMap
+
+	// Member state events are special and are stored separately to other state events
+	if stateTup.Type == event.StateMember {
+		sMap = e.TxnLookupCurrentSpecificRoomMemberStateMap(
+			txn,
+			roomID,
+			[]id.UserID{id.UserID(stateTup.StateKey)},
+			eventsProvider,
+		)
+	} else {
+		sMap = e.TxnLookupCurrentSpecificRoomStateTupMap(
+			txn,
+			roomID,
+			[]types.StateTup{stateTup},
+			eventsProvider,
+		)
+	}
+
+	if len(sMap) == 0 {
+		return nil
+	}
+
+	eventID := sMap[stateTup]
+	return eventsProvider.MustGet(eventID)
+}
+
+func (e *EventsDirectory) TxnFilterJoinedMembershipsWithEncryption(
+	txn fdb.ReadTransaction,
+	memberships types.Memberships,
+) (types.Memberships, error) {
+	// Find joins and kick off fetches for the room encryption event state tup
+	futs := make(map[id.RoomID]fdb.FutureByteSlice, len(memberships))
+	for roomID, membershipTup := range memberships {
+		if membershipTup.Membership == event.MembershipJoin {
+			futs[roomID] = txn.Get(e.KeyForRoomCurrentStateTup(roomID, event.StateEncryption, ""))
+		}
+	}
+
+	// Now make new memberships for only rooms with an encryption event
+	newMemberships := make(types.Memberships, len(futs))
+	for roomID, fut := range futs {
+		b, err := fut.Get()
+		if err != nil {
+			return nil, err
+		} else if b != nil {
+			newMemberships[roomID] = memberships[roomID]
+		}
+	}
+
+	return newMemberships, nil
+}
+
 // Lookup specific state events
-func (e *EventsDirectory) TxnLookupCurrentStateEventIDs(
+func (e *EventsDirectory) TxnLookupCurrentSpecificRoomStateTupMap(
 	txn fdb.ReadTransaction,
 	roomID id.RoomID,
 	tups []types.StateTup,
@@ -74,7 +145,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomAuthStateMap(
 	roomID id.RoomID,
 	eventsProvider *TxnEventsProvider,
 ) types.StateMap {
-	return e.TxnLookupCurrentStateEventIDs(txn, roomID, authStateTups, eventsProvider)
+	return e.TxnLookupCurrentSpecificRoomStateTupMap(txn, roomID, authStateTups, eventsProvider)
 }
 
 func (e *EventsDirectory) TxnLookupCurrentRoomStrippedStateStateMap(
@@ -82,7 +153,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomStrippedStateStateMap(
 	roomID id.RoomID,
 	eventsProvider *TxnEventsProvider,
 ) types.StateMap {
-	return e.TxnLookupCurrentStateEventIDs(txn, roomID, strippedStateTups, eventsProvider)
+	return e.TxnLookupCurrentSpecificRoomStateTupMap(txn, roomID, strippedStateTups, eventsProvider)
 }
 
 // Lookup current state (non member) event IDs and start fetching events
@@ -109,6 +180,9 @@ func (e *EventsDirectory) TxnLookupCurrentRoomStateMap(
 	}
 	return ids
 }
+
+// Current room memberships (users & servers)
+//
 
 func (e *EventsDirectory) TxnLookupCurrentRoomMemberships(
 	txn fdb.ReadTransaction,

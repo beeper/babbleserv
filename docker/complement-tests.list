@@ -6,6 +6,7 @@ TestCannotKickNonPresentUser
 TestDemotingUsersViaUsersDefault
 TestDeviceListUpdates
 TestDisplayNameUpdate
+TestIsDirectFlagLocal
 TestKeyChangesLocal
 TestKeyClaimOrdering
 TestKeysQueryWithDeviceIDAsObjectFails
@@ -24,6 +25,7 @@ TestUploadKeyIdempotency
 TestUploadKeyIdempotencyOverlap
 TestVersionStructure
 TestWriteMDirectAccountData
+TestWriteMDirectAccountData
 
 # TestMembersLocal
 # TestLeftRoomFixture
@@ -35,11 +37,13 @@ TestCannotSendNonLeaveViaSendLeaveV2
 TestDeviceListsUpdateOverFederation
 TestDeviceListsUpdateOverFederationOnRoomJoin
 TestEventAuth
-TestFederationRejectInvite
-TestFederationStateResolution
 TestFederationKeyUploadQuery
+TestFederationRejectInvite
+TestFederationRoomsInvite
+TestFederationStateResolution
 TestGetMissingEventsGapFilling
 TestInboundFederationRejectsEventsWithRejectedAuthEvents
+TestIsDirectFlagFederation
 TestJoinFederatedRoomFailOver
 TestJoinFederatedRoomWithUnverifiableEvents
 TestJoinViaRoomIDAndServerName
@@ -50,6 +54,5 @@ TestUnbanViaInvite
 TestUnrejectRejectedEvents
 TestUserAppearsInChangedDeviceListOnJoinOverFederation
 
-# TestFederationRoomsInvite
 # TestInboundCanReturnMissingEvents
 # TestNetworkPartitionOrdering

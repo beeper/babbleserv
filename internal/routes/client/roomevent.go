@@ -61,7 +61,7 @@ func (c *ClientRoutes) GetRoomStateEvent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	stateEv, err := c.db.Rooms.GetRoomStateEvent(r.Context(), roomID, types.StateTup{
+	stateEv, err := c.db.Rooms.GetCurrentRoomStateEvent(r.Context(), roomID, types.StateTup{
 		Type:     event.NewEventType(evType),
 		StateKey: stateKey,
 	})

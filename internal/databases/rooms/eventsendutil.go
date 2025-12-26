@@ -212,6 +212,51 @@ func (r *RoomsDatabase) txnResolveStateForEvents(
 	return resolvedStateMap, nil
 }
 
+// Pre-process the unsigned map for a given event before it gets stored, notably this just removes
+// everything unexpected and injects prev_content for state events.
+func (r *RoomsDatabase) txnPreProcessEventUnsigned(
+	txn fdb.ReadTransaction,
+	eventsProvider *events.TxnEventsProvider,
+	ev *types.Event,
+) {
+	for k := range ev.Unsigned {
+		switch k {
+		case "invite_room_state", "knock_room_state":
+			// OK!
+		default:
+			delete(ev.Unsigned, k)
+		}
+	}
+
+	if ev.StateKey == nil {
+		return
+	}
+
+	stateTup := types.StateTup{
+		Type:     ev.Type,
+		StateKey: *ev.StateKey,
+	}
+	currentEv := r.events.TxnGetCurrentRoomStateEvent(txn, ev.RoomID, stateTup, eventsProvider)
+	if currentEv == nil {
+		// If we're joining now and the joiner is local - lookup any current membership for the
+		// room which may point to an outlier event to pull prev_content from.
+		userID := id.UserID(*ev.StateKey)
+		if ev.Membership() == event.MembershipJoin && userID.Homeserver() == r.config.ServerName {
+			currentMembership := r.users.TxnGetMembership(txn, userID, ev.RoomID)
+			if currentMembership != nil && currentMembership.Membership == event.MembershipInvite {
+				currentEv = r.events.TxnGetEvent(txn, currentMembership.EventID)
+			}
+		}
+	}
+	if currentEv == nil {
+		return
+	}
+
+	ev.SetUnsigned("prev_content", currentEv.Content)
+	// Note: this is not referenced anywhere in the spec but synapse does it and complement tests it
+	ev.SetUnsigned("prev_sender", currentEv.Sender)
+}
+
 func (r *RoomsDatabase) updateRoomForStateEvent(room *types.Room, ev *types.Event) bool {
 	var changed bool
 	switch ev.Type {

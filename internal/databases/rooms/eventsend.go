@@ -168,7 +168,7 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 			// If we're a state event check for any current state that is identical (by type, key
 			// and content), and dedupe.
 			stateTup := types.StateTup{Type: partialEv.Type, StateKey: *partialEv.StateKey}
-			currentStateMap := r.events.TxnLookupCurrentStateEventIDs(txn, room.ID, []types.StateTup{stateTup}, eventsProvider)
+			currentStateMap := r.events.TxnLookupCurrentSpecificRoomStateTupMap(txn, room.ID, []types.StateTup{stateTup}, eventsProvider)
 			if evID, ok := currentStateMap[stateTup]; ok {
 				currentEv := eventsProvider.MustGet(evID)
 				if currentEv != nil && util.CompareSignedJSON(partialEv.Content, currentEv.Content) {
@@ -217,8 +217,11 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 		prevEventIDs = []id.EventID{ev.ID}
 		depth += 1
 
+		r.txnPreProcessEventUnsigned(txn, eventsProvider, ev)
+
 		allowedEvs = append(allowedEvs, ev)
 		eventsProvider.Add(ev)
+
 		zerolog.Ctx(ctx).Debug().
 			Stringer("event_id", ev.ID).
 			Stringer("type", ev.Type).
@@ -284,9 +287,6 @@ type SendFederatedEventsOptions struct {
 	// Skip stage 5 auth of the state at each events prev_events. This is required when doing remote
 	// joins where we don't have the history of the room prior to the join.
 	RemoteJoinEventID id.EventID
-	// By default we check, within the write txn, that this server is currently in the room - this
-	// disables that when expected (remote join).
-	SkipServerInRoomCheck bool
 }
 
 var (
@@ -596,8 +596,8 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	// this affects the current room state.
 	if res, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*SendEventsResult, error) {
 		thisServerInRoom := r.servers.TxnIsServerJoinedRoom(txn, r.config.ServerName, roomID)
-		// Important to check that we're in the room inside the write txn
-		if !options.SkipServerInRoomCheck && !thisServerInRoom {
+		// Important to check that we're in the room inside the write txn - unless remote join
+		if options.RemoteJoinEventID == "" && !thisServerInRoom {
 			return nil, fmt.Errorf("cannot send federated events to rooms this server is not participating in")
 		}
 
@@ -636,6 +636,8 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			} else {
 				evLog.Trace().Msg("Event passed authorization step 6")
 			}
+
+			r.txnPreProcessEventUnsigned(txn, eventsProvider, ev)
 
 			eventsProvider.Add(ev)
 			evLog.Debug().Msg("Event authorized for storage")
@@ -839,8 +841,8 @@ func (r *RoomsDatabase) txnResolveRoomState(
 	return nil
 }
 
-// Store events handles writing out all the relevant event data into FoundationDB
-// assuming that all events passed in are already authenticated.
+// Store events handles writing out all the relevant event data into FoundationDB, assuming that all
+// events passed in are already authenticated.
 func (r *RoomsDatabase) txnStoreEvents(
 	ctx context.Context,
 	txn fdb.Transaction,

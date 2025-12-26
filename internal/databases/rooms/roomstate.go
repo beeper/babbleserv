@@ -3,7 +3,6 @@ package rooms
 import (
 	"context"
 
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -19,41 +18,10 @@ func (r *RoomsDatabase) IsRoomEncrypted(ctx context.Context, roomID id.RoomID) (
 	})
 }
 
-func (r *RoomsDatabase) GetRoomStateEvent(ctx context.Context, roomID id.RoomID, stateTup types.StateTup) (*types.Event, error) {
+func (r *RoomsDatabase) GetCurrentRoomStateEvent(ctx context.Context, roomID id.RoomID, stateTup types.StateTup) (*types.Event, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.Event, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-
-		var sMap types.StateMap
-
-		// Member state events are special and are stored separately to other state events
-		if stateTup.Type == event.StateMember {
-			sMap = r.events.TxnLookupCurrentSpecificRoomMemberStateMap(
-				txn,
-				roomID,
-				[]id.UserID{id.UserID(stateTup.StateKey)},
-				eventsProvider,
-			)
-		} else {
-			sMap = r.events.TxnLookupCurrentStateEventIDs(
-				txn,
-				roomID,
-				[]types.StateTup{stateTup},
-				eventsProvider,
-			)
-		}
-
-		if len(sMap) == 0 {
-			return nil, nil
-		}
-
-		eventID := sMap[stateTup]
-		ev, err := eventsProvider.Get(eventID)
-		if err != nil {
-			return nil, err
-		} else if ev == nil {
-			return nil, types.ErrEventNotFound
-		}
-		return ev, nil
+		return r.events.TxnGetCurrentRoomStateEvent(txn, roomID, stateTup, eventsProvider), nil
 	})
 }
 
