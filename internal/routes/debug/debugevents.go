@@ -28,11 +28,16 @@ func (d *DebugRoutes) DebugGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Copy the event for CSAPI marshal
+	evCopy := *ev
+	csEv := util.EventForClientAPI(&evCopy)
+
 	util.ResponseJSON(w, r, http.StatusOK, struct {
-		Event      *types.Event `json:"event"`
+		EventSSAPI *types.Event `json:"event_ssapi"`
+		EventCSAPI *types.Event `json:"event_csapi"`
 		SoftFailed bool         `json:"soft_failed"`
 		Outlier    bool         `json:"outlier"`
-	}{util.EventForClientAPI(ev), ev.SoftFailed, ev.Outlier})
+	}{ev, csEv, ev.SoftFailed, ev.Outlier})
 }
 
 func (d *DebugRoutes) DebugMakeEvents(w http.ResponseWriter, r *http.Request) {
