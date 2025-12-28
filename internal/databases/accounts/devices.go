@@ -5,8 +5,10 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/rs/zerolog/log"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
@@ -57,16 +59,16 @@ func (a *AccountsDatabase) UpdateUserDevice(
 	deviceID id.DeviceID,
 	displayName string,
 ) error {
-	_, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+	changed, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
 		device, err := a.devices.TxnGetDevice(txn, userID, deviceID)
 		if err != nil {
-			return nil, err
+			return false, err
 		} else if device == nil {
-			return nil, types.ErrUserDeviceNotFound
+			return false, types.ErrUserDeviceNotFound
 		}
 
 		if device.DisplayName == displayName {
-			return nil, nil
+			return false, nil
 		}
 
 		// Store the change
@@ -77,8 +79,19 @@ func (a *AccountsDatabase) UpdateUserDevice(
 		version := tuple.IncompleteVersionstamp(0)
 		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
 
-		return nil, nil
+		return true, nil
 	})
+
+	if err != nil {
+		return err
+	} else if changed {
+		a.notifier.SendChange(notifier.Change{
+			UserIDs: []id.UserID{userID},
+		})
+		log.Info().Msg("Updated device")
+	} else {
+		log.Warn().Msg("Ignored no change device update")
+	}
 	return err
 }
 

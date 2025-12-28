@@ -162,7 +162,7 @@ func (a *AccountsDatabase) StoreKeysForDevice(
 	log := a.getTxnLogContext(ctx, "StoreKeysForDevice").Logger()
 
 	var counts mautrix.OTKCount
-	deviceKeysChanged, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
+	changed, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
 		var changed bool
 
 		if deviceKeys != nil {
@@ -199,7 +199,7 @@ func (a *AccountsDatabase) StoreKeysForDevice(
 
 	if err != nil {
 		return counts, err
-	} else if deviceKeysChanged {
+	} else if changed {
 		a.notifier.SendChange(notifier.Change{
 			UserIDs: []id.UserID{userID},
 		})
