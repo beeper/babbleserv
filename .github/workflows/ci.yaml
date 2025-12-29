@@ -75,3 +75,43 @@ jobs:
         run: |
           cd babbleserv
           ./scripts/complement.sh
+
+  test-complement-synapse:
+    runs-on: ubuntu-latest
+    steps:
+      # Clone both babbleserv + complement branch at the same level
+      - uses: actions/checkout@v4
+        with:
+          path: babbleserv
+      - uses: actions/checkout@v4
+        with:
+          repository: beeper/complement
+          ref: babbleserv
+          path: complement
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install libolm
+        run: sudo apt-get install libolm-dev libolm3
+
+      - name: Install dependencies
+        run: |
+          go install gotest.tools/gotestsum@latest
+          export PATH="$HOME/go/bin:$PATH"
+
+      - name: Install FoundationDB clients
+        run: |
+          wget https://github.com/apple/foundationdb/releases/download/7.3.71/foundationdb-clients_7.3.71-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.71-1_amd64.deb
+
+      - name: Run complement
+        run: |
+          cd babbleserv
+          docker pull ghcr.io/element-hq/synapse/complement-synapse
+          export COMPLEMENT_BASE_IMAGE_hs2=ghcr.io/element-hq/synapse/complement-synapse
+          export BABBLESERV_COMPLEMENT_EXTRA_ARGS="-tags synapse_blacklist"
+          ./scripts/complement.sh
