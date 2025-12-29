@@ -188,7 +188,7 @@ func VerifyFederatonRequest(
 	r *http.Request,
 ) (string, error) {
 	if r.Host == "localhost:5000" {
-		return "babbleserv-dev.fizzadar.com", nil
+		return serverName, nil
 	}
 
 	b, err := io.ReadAll(r.Body)

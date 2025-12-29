@@ -24,8 +24,8 @@ routes:
       serviceGroups:
         - client
     - listenAddr: 0.0.0.0:8448
-      tlsKeyPath: SERVER_NAME.key
-      tlsCertPath: SERVER_NAME.crt
+      tlsKeyPath: SERVER_NAME.tls.key
+      tlsCertPath: SERVER_NAME.tls.crt
       serviceGroups:
         - client  # needed for versions endpoint
         - federation
