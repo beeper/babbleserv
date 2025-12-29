@@ -248,11 +248,7 @@ func (e *EventsIterator) localDeviceChangesForJoinEvent(ev *types.Event) ([]*typ
 	tds := make([]*types.ToDevice, 0, len(roomMembers))
 
 	for memberID := range roomMembers {
-		if memberID == ev.Sender {
-			// Ignore joining user
-			continue
-		} else if memberID.Homeserver() != e.config.ServerName {
-			// Ignore remote users (their HS is responsible for sending the update)
+		if memberID.Homeserver() != e.config.ServerName {
 			continue
 		}
 		devices, err := e.db.Accounts.GetUserDevices(e.ctx, memberID)

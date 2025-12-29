@@ -2,6 +2,7 @@ package rooms
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"maunium.net/go/mautrix/event"
@@ -17,10 +18,20 @@ func (r *RoomsDatabase) IsUserJoinedRoom(ctx context.Context, userID id.UserID, 
 	})
 }
 
-func (r *RoomsDatabase) GetUserMembership(ctx context.Context, userID id.UserID, roomID id.RoomID) (*types.MembershipTup, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.MembershipTup, error) {
-		return r.users.TxnGetMembership(txn, userID, roomID), nil
+func (r *RoomsDatabase) GetUserMembershipAndEvent(ctx context.Context, userID id.UserID, roomID id.RoomID) (*types.MembershipTup, *types.Event, error) {
+	var ev *types.Event
+	mtup, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.MembershipTup, error) {
+		mtup := r.users.TxnGetMembership(txn, userID, roomID)
+		if mtup == nil {
+			return nil, nil
+		}
+		ev = r.events.TxnGetEvent(txn, mtup.EventID)
+		if ev == nil {
+			panic(fmt.Errorf("missing membership event: %s", mtup.EventID))
+		}
+		return mtup, nil
 	})
+	return mtup, ev, err
 }
 
 func (r *RoomsDatabase) GetUserMemberships(ctx context.Context, userID id.UserID) (types.Memberships, error) {

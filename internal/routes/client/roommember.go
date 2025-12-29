@@ -383,7 +383,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 
 	// Find membership of the leaving user
 	var membership event.Membership
-	mtup, err := c.db.Rooms.GetUserMembership(r.Context(), leavingUserID, roomID)
+	mtup, currentMemberEv, err := c.db.Rooms.GetUserMembershipAndEvent(r.Context(), leavingUserID, roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -402,22 +402,14 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	// Find the "other" server (based on the invite/join/knock we're replacing), there's two cases
 	// - we're rejecting an invite - we want the HS from the invites sender
 	// - we're rescinding an invite - we want the HS from the invites state key
-	currentMemberEvent, err := c.db.Rooms.GetEvent(r.Context(), mtup.EventID)
-	if err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else if currentMemberEvent == nil {
-		panic("got membership tup with missing event!")
-	}
 	var otherHomeserver string
 	if isLeave {
-		// We're the leaving user, so looking for invite senders
-		otherHomeserver = currentMemberEvent.Sender.Homeserver()
+		// We're the leaving user, so looking for invite senders HS
+		otherHomeserver = currentMemberEv.Sender.Homeserver()
 	} else {
 		// We're kicking someone else, so look for membership targets
-		otherHomeserver = id.UserID(*currentMemberEvent.StateKey).Homeserver()
+		otherHomeserver = id.UserID(*currentMemberEv.StateKey).Homeserver()
 	}
-	// Assuming not us, check if the other HS is joined to the room
 	if otherHomeserver == c.config.ServerName {
 		otherHomeserver = ""
 	}
@@ -500,18 +492,8 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var roomVersion string
-	room, err := c.db.Rooms.GetRoom(r.Context(), roomID)
-	if err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	} else if room != nil {
-		roomVersion = room.Version
-	} else {
-		roomVersion = c.config.Rooms.DefaultVersion // TODO: what do we do here?
-	}
 	outlierLeaveEv := &types.Event{
-		RoomVersion:  roomVersion,
+		RoomVersion:  currentMemberEv.RoomVersion,
 		PartialEvent: *partialEv,
 	}
 

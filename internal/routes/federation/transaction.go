@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"slices"
@@ -214,9 +215,16 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 }
 
 func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string, pdus []*types.Event) (*respTransaction, error) {
-	verifyResults := rooms.SendEventsResult{
-		Allowed:  make([]*types.Event, 0, len(pdus)),
-		Rejected: make([]rooms.RejectedEvent, 0),
+	type results struct {
+		rooms.SendEventsResult
+		Outliers []*types.Event
+	}
+	verifyResults := results{
+		Outliers: make([]*types.Event, 0),
+		SendEventsResult: rooms.SendEventsResult{
+			Allowed:  make([]*types.Event, 0, len(pdus)),
+			Rejected: make([]rooms.RejectedEvent, 0),
+		},
 	}
 
 	roomVersions := make(map[id.RoomID]string, 1)
@@ -242,6 +250,25 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		}
 
 		if roomVersions[ev.RoomID] == "" {
+			// Edge case: this is a leave event rescinding a previously sent remote invite for a
+			// local user, so we don't know the room but we still need to handle the leave as an
+			// outlier so the target local user sees it.
+			if ev.Type == event.StateMember {
+				targetUserID := id.UserID(*ev.StateKey)
+				if targetUserID.Homeserver() == f.config.ServerName {
+					membershipTup, membershipEv, err := f.db.Rooms.GetUserMembershipAndEvent(r.Context(), targetUserID, ev.RoomID)
+					if err != nil {
+						return nil, err
+					} else if membershipTup != nil && membershipTup.Membership == event.MembershipInvite && membershipEv.Sender == ev.Sender {
+						// Set the romm version and flag the event as an outlier
+						roomVersions[ev.RoomID] = membershipEv.RoomVersion
+						ev.Outlier = true
+					}
+				}
+			}
+		}
+
+		if roomVersions[ev.RoomID] == "" {
 			// If we have no room version we can't calculate the reference hash,
 			// so we *silently* drop it (synapse + dendrite do this, spec unclear).
 			hlog.FromRequest(r).Warn().
@@ -255,23 +282,33 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		verifyErr, err := util.VerifyEvent(r.Context(), ev, origin, f.keyStore)
 		if err != nil {
 			return nil, err
-		} else if verifyErr == types.ErrEventRedacted {
+		} else if errors.Is(verifyErr, types.ErrEventRedacted) {
 			redactedEv, err := ev.GetRedactedEvent()
 			if err != nil {
 				return nil, err
 			}
 			redactedEv.RoomVersion = roomVersions[ev.RoomID]
 			redactedEv.ID = ev.ID
+			verifyResults.Allowed = append(verifyResults.Allowed, redactedEv)
 			hlog.FromRequest(r).Warn().
 				Stringer("room_id", ev.RoomID).
 				Stringer("event_id", ev.ID).
 				Msg("Processing redacted event over federation")
-			verifyResults.Allowed = append(verifyResults.Allowed, redactedEv)
 		} else if verifyErr != nil {
 			verifyResults.Rejected = append(verifyResults.Rejected, rooms.RejectedEvent{
 				Event: ev,
 				Error: verifyErr,
 			})
+			hlog.FromRequest(r).Err(verifyErr).
+				Stringer("room_id", ev.RoomID).
+				Stringer("event_id", ev.ID).
+				Msg("Federated event failed verification")
+		} else if ev.Outlier {
+			verifyResults.Outliers = append(verifyResults.Outliers, ev)
+			hlog.FromRequest(r).Warn().
+				Stringer("room_id", ev.RoomID).
+				Stringer("event_id", ev.ID).
+				Msg("Processing outlier event over federation")
 		} else {
 			verifyResults.Allowed = append(verifyResults.Allowed, ev)
 		}
@@ -286,28 +323,8 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		roomToEvs[pdu.RoomID] = append(roomToEvs[pdu.RoomID], pdu)
 	}
 
-	// Switch to a background context here - we've done all the event verification
-	// and fetching from remote and now we're going to pass them to the database
-	// layer, where we don't want to end up in an inconsistent state. If the
-	// sending server dies and retries the same events we'll OK the retry request
-	// with "event already exists" errors.
-	backgroundCtx := hlog.FromRequest(r).With().
-		Str("background_task", "ProcessIncomingFederatedTransaction").
-		Str("origin", origin).
-		Logger().
-		WithContext(context.Background())
-
 	var wg sync.WaitGroup
-	doneCh := make(chan struct{})
-	resultsCh := make(chan *rooms.SendEventsResult)
-	allResults := make([]*rooms.SendEventsResult, 0, len(roomToEvs))
-
-	go func() {
-		for results := range resultsCh {
-			allResults = append(allResults, results)
-		}
-		doneCh <- struct{}{}
-	}()
+	resultsCh := make(chan *rooms.SendEventsResult, len(roomToEvs)+1) // +1 for any outliers result
 
 	for roomID, evs := range roomToEvs {
 		wg.Add(1)
@@ -322,7 +339,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 				return
 			}
 			options := rooms.SendFederatedEventsOptions{}
-			results, err := f.db.Rooms.SendFederatedEvents(backgroundCtx, roomID, evs, options)
+			results, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, evs, options)
 			if err != nil {
 				// This is *BAD*, an unexpected error handling results for a room, we can't bail the
 				// request here as we'll poison other parallel room sends. So we just log and none
@@ -335,9 +352,28 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		}()
 	}
 
+	if len(verifyResults.Outliers) > 0 {
+		// Spin up another goroutine to send any outliers
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			results := &rooms.SendEventsResult{
+				Allowed: make([]*types.Event, 0, len(verifyResults.Outliers)),
+			}
+			for _, ev := range verifyResults.Outliers {
+				if err := f.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), ev); err != nil {
+					hlog.FromRequest(r).Err(err).Msg("Sending federated outlier event failed")
+					continue
+				}
+				results.Allowed = append(results.Allowed, ev)
+			}
+			resultsCh <- results
+		}()
+	}
+
 	wg.Wait()
 	close(resultsCh)
-	<-doneCh
 
 	resp := respTransaction{make(map[id.EventID]respTransactionResult, len(pdus))}
 
@@ -349,7 +385,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		}
 	}
 
-	for _, results := range allResults {
+	for results := range resultsCh {
 		for _, allowed := range results.Allowed {
 			resp.PDUs[allowed.ID] = respTransactionResult{}
 		}
