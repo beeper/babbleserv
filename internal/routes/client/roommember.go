@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -27,6 +28,7 @@ import (
 	"github.com/rs/zerolog/hlog"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms"
+	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -373,7 +375,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	isLeave := middleware.GetRequestUserID(r) == leavingUserID
 
 	// This is the CS API, we're the sender
-	sendingServerInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), c.config.ServerName, roomID)
+	serverInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), c.config.ServerName, roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -427,25 +429,35 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 
 	// We're in the room - send the event locally and then, if the other HS isn't in the room, send
 	// it over to them.
-	if sendingServerInRoom {
+	if serverInRoom {
+		otherServerInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), otherHomeserver, roomID)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
 		c.sendLocalEventHandleResults(w, r, roomID, partialEv, func(ev *types.Event) any {
-			if otherHomeserver != "" {
-				if err := c.fclient.SendLeave(
-					r.Context(),
-					spec.ServerName(c.config.ServerName),
-					spec.ServerName(otherHomeserver),
-					ev.PDU(),
-				); err != nil {
-					// Log, but don't error - the local user should still get their leave
-					hlog.FromRequest(r).Err(err).Msg("Failed to send federated leave to nonjoined server")
-				}
+			if otherServerInRoom {
+				return util.EmptyJSON
+			}
+
+			td := &types.ToDevice{
+				UserID:  id.UserID("@:" + otherHomeserver),
+				Type:    types.BabbleservRemoteOutlierEvent,
+				Content: exerrors.Must(json.Marshal(ev)),
+			}
+
+			_, err := c.db.Transient.SendToDeviceEvents(r.Context(), []*types.ToDevice{td}, transient.SendToDeviceOptions{})
+			if err != nil {
+				hlog.FromRequest(r).Err(err).
+					Msg("Failed to send federated leave event over to-device to nonjoined server")
 			}
 			return util.EmptyJSON
 		})
 		return
 	}
 
-	// We're not in the room but do know the other HS, so use them via the make_leave, send_leave
+	// We're not in the room but do know the other HS, whom we assume are in the room, so use them
+	// via the make_leave, send_leave
 	if otherHomeserver != "" {
 		leaveEv, otherServer, err := c.makeFederatedEvent(r, roomID, []string{otherHomeserver}, func(otherServer string) (federatedMakeResp, error) {
 			makeJoinResp, err := c.fclient.MakeLeave(

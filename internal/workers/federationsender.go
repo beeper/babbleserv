@@ -13,6 +13,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/gjson"
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -384,6 +385,7 @@ func (fs *FederationSender) syncTransientForServer(
 		return false, nil
 	}
 
+	allEvs := make([]*types.Event, 0)
 	allEDUs := make([]*types.EDU, 0, 100)
 
 	for _, td := range toDevice {
@@ -407,6 +409,16 @@ func (fs *FederationSender) syncTransientForServer(
 				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
 				Msg("Sending remote signing key update")
 			continue
+		case types.BabbleservRemoteOutlierEvent:
+			var ev *types.Event
+			exerrors.PanicIfNotNil(json.Unmarshal(td.Content, &ev))
+			allEvs = append(allEvs, ev)
+			log.Debug().
+				Stringer("event_id", ev.ID).
+				Stringer("type", ev.Type).
+				Stringer("sender", ev.Sender).
+				Msg("Sending remote outlier event")
+			continue
 		}
 
 		var tdContent map[string]any
@@ -414,7 +426,7 @@ func (fs *FederationSender) syncTransientForServer(
 			panic(err)
 		}
 		content := types.ToDeviceEDUContent{
-			MessageID: "",
+			MessageID: types.MustVersionstampToOrderedString(td.Version),
 			Type:      td.Type,
 			Sender:    td.Sender,
 			Messages: types.ToDeviceEDUMessages{
@@ -440,8 +452,8 @@ func (fs *FederationSender) syncTransientForServer(
 			Msg("Sending remote to-device event")
 	}
 
-	if len(allEDUs) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, nil, allEDUs); err != nil {
+	if len(allEDUs) > 0 || len(allEvs) > 0 {
+		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allEDUs); err != nil {
 			return false, fmt.Errorf("failed to send transient transaction: %w", err)
 		}
 	}
@@ -461,7 +473,7 @@ func (fs *FederationSender) sendTransactionToServer(
 
 	transactionID := types.MustVersionstampToOrderedString(version)
 
-	log.Info().
+	log.Debug().
 		Int("pdus", len(pdus)).
 		Int("edus", len(edus)).
 		Str("transaction_id", transactionID).
@@ -469,10 +481,7 @@ func (fs *FederationSender) sendTransactionToServer(
 
 	gedus := make([]gomatrixserverlib.EDU, len(edus))
 	for i, edu := range edus {
-		data, err := json.Marshal(edu.Content)
-		if err != nil {
-			panic(err)
-		}
+		data := exerrors.Must(json.Marshal(edu.Content))
 		gedus[i] = gomatrixserverlib.EDU{
 			Type:        string(edu.Type),
 			Content:     spec.RawJSON(data),

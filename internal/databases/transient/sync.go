@@ -18,9 +18,9 @@ func (t *TransientDatabase) SyncTransientForUser(
 	deviceID id.DeviceID,
 	fromVersion tuple.Versionstamp,
 	syncOpts types.SyncOptions,
-) (tuple.Versionstamp, []*types.ToDevice, error) {
+) (tuple.Versionstamp, []*types.ToDeviceWithVersion, error) {
 	var latestVersion tuple.Versionstamp
-	var toDevice []*types.ToDevice
+	var toDevice []*types.ToDeviceWithVersion
 
 	_, err := util.DoReadTransaction(ctx, t.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
 		latestVersion = util.TxnGetLatestWriteVersion(txn)
@@ -33,7 +33,7 @@ func (t *TransientDatabase) SyncTransientForUser(
 			},
 		).Iterator()
 
-		tds := make([]*types.ToDevice, 0)
+		tds := make([]*types.ToDeviceWithVersion, 0)
 
 		for iter.Advance() {
 			kv, err := iter.Get()
@@ -48,7 +48,10 @@ func (t *TransientDatabase) SyncTransientForUser(
 					Msg("Got to-device before our from version!")
 			}
 			td := types.MustBytesToToDevice(kv.Value)
-			tds = append(tds, td)
+			tds = append(tds, &types.ToDeviceWithVersion{
+				ToDevice: *td,
+				Version:  version,
+			})
 		}
 
 		toDevice = tds
@@ -76,9 +79,9 @@ func (t *TransientDatabase) SyncTransientForServer(
 	serverName string,
 	fromVersion tuple.Versionstamp,
 	syncOpts types.SyncOptions,
-) (tuple.Versionstamp, []*types.ToDevice, error) {
+) (tuple.Versionstamp, []*types.ToDeviceWithVersion, error) {
 	var latestVersion tuple.Versionstamp
-	var toDevice []*types.ToDevice
+	var toDevice []*types.ToDeviceWithVersion
 
 	_, err := util.DoReadTransaction(ctx, t.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
 		latestVersion = util.TxnGetLatestWriteVersion(txn)
@@ -90,15 +93,19 @@ func (t *TransientDatabase) SyncTransientForServer(
 			},
 		).Iterator()
 
-		tds := make([]*types.ToDevice, 0)
+		tds := make([]*types.ToDeviceWithVersion, 0)
 
 		for iter.Advance() {
 			kv, err := iter.Get()
 			if err != nil {
 				return nil, err
 			}
+			version := t.todevice.KeyToRemoteServerVersion(kv.Key)
 			td := types.MustBytesToToDevice(kv.Value)
-			tds = append(tds, td)
+			tds = append(tds, &types.ToDeviceWithVersion{
+				ToDevice: *td,
+				Version:  version,
+			})
 		}
 
 		toDevice = tds

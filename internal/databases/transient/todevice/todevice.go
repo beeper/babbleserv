@@ -111,7 +111,7 @@ func (t *ToDeviceDirectory) KeyToRemoteServerVersion(key fdb.Key) tuple.Versions
 	if err != nil {
 		panic(err)
 	}
-	return tup[2].(tuple.Versionstamp)
+	return tup[1].(tuple.Versionstamp)
 }
 
 func (t *ToDeviceDirectory) keyForRemoteServerVersion(

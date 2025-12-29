@@ -102,7 +102,7 @@ type Sync struct {
 func NewSync(
 	rooms map[MembershipTup]*SyncRoom,
 	accounts map[AccountDataTup]map[string]any,
-	toDevice []*ToDevice,
+	toDevice []*ToDeviceWithVersion,
 ) *Sync {
 	sync := &Sync{}
 

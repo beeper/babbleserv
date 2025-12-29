@@ -31,6 +31,11 @@ var (
 	BabbleservRemoteSigningKeyUpdate = event.Type{
 		Type: "babbleserv.remote_signing_key_update",
 	}
+	// These are turned into federation PDUs where the other HS is not in the room to workaround the
+	// federation sender ignoring rooms as soon as the HS leaves (ie to rescind invites).
+	BabbleservRemoteOutlierEvent = event.Type{
+		Type: "babbleserv_remote_outlier_event",
+	}
 )
 
 type ToDevice struct {
@@ -39,6 +44,10 @@ type ToDevice struct {
 	Sender   id.UserID
 	Type     event.Type
 	Content  json.RawMessage
+}
+type ToDeviceWithVersion struct {
+	ToDevice
+	Version tuple.Versionstamp
 }
 
 func (t *ToDevice) Bytes() []byte {
