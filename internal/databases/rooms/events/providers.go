@@ -126,7 +126,7 @@ func (ep *TxnEventsProvider) Get(eventID id.EventID) (*types.Event, error) {
 			Msg("Fetching event with no existing future")
 		fut = ep.txn.Get(ep.keyForEventID(eventID))
 	} else if !fut.IsReady() {
-		ep.log.Warn().
+		ep.log.Trace().
 			Stringer("event_id", eventID).
 			Msg("Fetching event using unready future")
 	}
@@ -267,8 +267,13 @@ func (ap *TxnAuthEventsProvider) GetAuthEventIDsForEvent(ev *types.Event) []id.E
 	for stateTup, eventID := range ap.stateMap {
 		var include bool
 		switch stateTup.Type {
-		case event.StateCreate, event.StateJoinRules, event.StatePowerLevels:
+		case event.StateCreate, event.StatePowerLevels:
+			// TODO: room version 12 excludes create event
 			include = true
+		case event.StateJoinRules:
+			if ev.Type == event.StateMember {
+				include = true
+			}
 		case event.StateMember:
 			if stateTup.StateKey == ev.Sender.String() || stateTup.StateKey == *ev.StateKey {
 				include = true
