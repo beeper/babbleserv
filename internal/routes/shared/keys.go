@@ -139,7 +139,9 @@ func GetUserKeys(
 				if deviceKeys.Unsigned == nil {
 					deviceKeys.Unsigned = make(map[string]any, 1)
 				}
-				deviceKeys.Unsigned["device_display_name"] = deviceIDToName[did]
+				if deviceName := deviceIDToName[did]; deviceName != "" {
+					deviceKeys.Unsigned["device_display_name"] = deviceName
+				}
 				resp.DeviceKeys[userID][did] = *deviceKeys
 			}
 		}
