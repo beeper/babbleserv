@@ -6,6 +6,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/config"
+	"github.com/beeper/babbleserv/internal/databases/transient/presence"
 	"github.com/beeper/babbleserv/internal/databases/transient/todevice"
 	"github.com/beeper/babbleserv/internal/notifier"
 )
@@ -19,6 +20,7 @@ type TransientDatabase struct {
 	notifier *notifier.Notifier
 
 	todevice *todevice.ToDeviceDirectory
+	presence *presence.PresenceDirectory
 }
 
 func NewTransientDatabase(
@@ -55,6 +57,7 @@ func NewTransientDatabase(
 		notifier: notifier,
 
 		todevice: todevice.NewToDeviceDirectory(log, db, transientDir),
+		presence: presence.NewPresenceDirectory(log, db, transientDir),
 	}
 }
 

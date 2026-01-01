@@ -409,6 +409,15 @@ func (fs *FederationSender) syncTransientForServer(
 				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
 				Msg("Sending remote signing key update")
 			continue
+		case types.BabbleservRemotePresenceChange:
+			allEDUs = append(allEDUs, &types.EDU{
+				Type:    types.EDUTypePresence,
+				Content: td.Content,
+			})
+			log.Debug().
+				Str("user_id", gjson.GetBytes(td.Content, "push[0].user_id").String()).
+				Msg("Sending remote presence update")
+			continue
 		case types.BabbleservRemoteOutlierEvent:
 			var ev *types.Event
 			exerrors.PanicIfNotNil(json.Unmarshal(td.Content, &ev))

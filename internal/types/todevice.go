@@ -23,6 +23,10 @@ var (
 	BabbleservLocalDeviceLeft = event.Type{
 		Type: "babbleserv.local_device_left",
 	}
+	// These are for local user presence updates in sync
+	BabbleservLocalPresenceChange = event.Type{
+		Type: "babbleserv.local_presence_change",
+	}
 	// These are turned into federation m.device_list_update EDUs
 	BabbleservRemoteDeviceListUpdate = event.Type{
 		Type: "babbleserv.remote_device_list_update",
@@ -30,6 +34,10 @@ var (
 	// These are turned into federation m.signing_key_update EDUs
 	BabbleservRemoteSigningKeyUpdate = event.Type{
 		Type: "babbleserv.remote_signing_key_update",
+	}
+	// These are turned into federation m.presence EDUs
+	BabbleservRemotePresenceChange = event.Type{
+		Type: "babbleserv.remote_presence_change",
 	}
 	// These are turned into federation PDUs where the other HS is not in the room to workaround the
 	// federation sender ignoring rooms as soon as the HS leaves (ie to rescind invites).

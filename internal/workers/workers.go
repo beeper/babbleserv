@@ -42,16 +42,19 @@ func NewWorkers(
 	if cfg.Accounts.Enabled {
 		// ProfileChangeIterator accounts profile changes -> room member events
 		if cfg.Rooms.Enabled {
-			workers = append(workers,
-				NewProfileChangeIterator(log, cfg, db, notifiers),
-			)
+			workers = append(workers, NewProfileChangeIterator(log, cfg, db, notifiers))
 		}
 		// DeviceChangeIterator accounts device changes -> transient to device
 		if cfg.Transient.Enabled {
-			workers = append(workers,
-				NewDeviceChangeIterator(log, cfg, db, notifiers),
-			)
+			workers = append(workers, NewDeviceChangeIterator(log, cfg, db, notifiers))
 		}
+	}
+
+	if cfg.Transient.Enabled {
+		workers = append(workers,
+			NewPresenceChangeIterator(log, cfg, db, notifiers),
+			NewPresenceTimeoutIterator(log, cfg, db, notifiers),
+		)
 	}
 
 	return &Workers{

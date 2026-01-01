@@ -11,6 +11,8 @@ TestKeyChangesLocal
 TestKeyClaimOrdering
 TestKeysQueryWithDeviceIDAsObjectFails
 TestNotPresentUserCannotBanOthers
+TestPresence
+TestPresenceSyncDifferentRooms
 TestRoomAlias
 TestRoomCreate
 TestRoomReceipts
@@ -49,6 +51,7 @@ TestJoinFederatedRoomWithUnverifiableEvents
 TestJoinViaRoomIDAndServerName
 TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 TestOutboundFederationSend
+TestRemotePresence
 TestToDeviceMessagesOverFederation
 TestUnbanViaInvite
 TestUnrejectRejectedEvents

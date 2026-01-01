@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"maps"
+	"slices"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -92,11 +93,12 @@ type syncDeviceLists struct {
 }
 
 type Sync struct {
-	NextBatch   string          `json:"next_batch"`
-	Rooms       syncRooms       `json:"rooms,omitzero"`
-	DeviceLists syncDeviceLists `json:"device_lists,omitzero"`
-	AccountData EventList       `json:"account_data,omitzero"`
-	ToDevice    EventList       `json:"to_device,omitzero"`
+	NextBatch   string           `json:"next_batch"`
+	Rooms       syncRooms        `json:"rooms,omitzero"`
+	DeviceLists syncDeviceLists  `json:"device_lists,omitzero"`
+	AccountData EventList        `json:"account_data,omitzero"`
+	ToDevice    PartialEventList `json:"to_device,omitzero"`
+	Presence    PartialEventList `json:"presence,omitzero"`
 }
 
 func NewSync(
@@ -107,8 +109,9 @@ func NewSync(
 	sync := &Sync{}
 
 	if len(toDevice) > 0 {
-		// Convert internal device list to-device events into device lists
-		toDeviceEvents := make([]*Event, 0, len(toDevice))
+		// Convert internal device list to-device events into presence and device lists
+		toDeviceEvents := make([]*PartialEvent, 0, len(toDevice))
+		presenceEventsByUser := make(map[id.UserID]*PartialEvent, len(toDevice)) // latest per user
 		changedUserIDs := make(map[id.UserID]struct{})
 		leftUserIDs := make(map[id.UserID]struct{})
 
@@ -118,14 +121,24 @@ func NewSync(
 				changedUserIDs[td.Sender] = struct{}{}
 			case BabbleservLocalDeviceLeft:
 				leftUserIDs[td.Sender] = struct{}{}
+			case BabbleservLocalPresenceChange:
+				partialEv := td.ToPartialEvent()
+				partialEv.Type = event.EphemeralEventPresence
+				presenceEventsByUser[td.Sender] = partialEv
 			default:
-				toDeviceEvents = append(toDeviceEvents, NewEventFromPartialEvent(td.ToPartialEvent()))
+				toDeviceEvents = append(toDeviceEvents, td.ToPartialEvent())
 			}
 		}
 
 		if len(toDeviceEvents) > 0 {
-			sync.ToDevice = EventList{
+			sync.ToDevice = PartialEventList{
 				Events: toDeviceEvents,
+			}
+		}
+
+		if len(presenceEventsByUser) > 0 {
+			sync.Presence = PartialEventList{
+				Events: slices.Collect(maps.Values(presenceEventsByUser)),
 			}
 		}
 
@@ -205,7 +218,8 @@ func (s *Sync) IsEmpty() bool {
 		len(s.Rooms.Join) == 0 &&
 		len(s.Rooms.Leave) == 0 &&
 		len(s.Rooms.Invite) == 0 &&
-		len(s.Rooms.Knock) == 0
+		len(s.Rooms.Knock) == 0 &&
+		len(s.Presence.Events) == 0
 }
 
 type marshalSync Sync

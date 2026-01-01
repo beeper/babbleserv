@@ -59,6 +59,11 @@ type BabbleConfig struct {
 		Enabled  bool           `yaml:"enabled"`
 		Database databaseConfig `yaml:"database"`
 		Notifier NotifierConfig `yaml:"notifier"`
+
+		// How long until we time out online presence -> unavailable
+		PresenceTimeout time.Duration `yaml:"presenceTimeout"`
+		// Now often to check for timed out presence
+		PresenceTimeoutCheckInterval time.Duration `yaml:"presenceTimeoutCheckInterval"`
 	} `yaml:"transient"`
 
 	Media struct {
@@ -142,6 +147,13 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 
 	if cfg.SigningKeyRefreshInterval == 0 {
 		cfg.SigningKeyRefreshInterval = time.Hour
+	}
+
+	if cfg.Transient.PresenceTimeout == 0 {
+		cfg.Transient.PresenceTimeout = time.Hour
+	}
+	if cfg.Transient.PresenceTimeoutCheckInterval == 0 {
+		cfg.Transient.PresenceTimeoutCheckInterval = time.Minute
 	}
 
 	return cfg

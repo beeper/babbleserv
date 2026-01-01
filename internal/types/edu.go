@@ -15,6 +15,7 @@ var (
 	EDUTypeReceipt          EDUType = "m.receipt"
 	EDUTypeDeviceListUpdate EDUType = "m.device_list_update"
 	EDUTypeSigningKeyUpdate EDUType = "m.signing_key_update"
+	EDUTypePresence         EDUType = "m.presence"
 )
 
 type EDU struct {
@@ -59,4 +60,16 @@ type DeviceListUpdateEDUContent struct {
 	DeviceKeys        *mautrix.DeviceKeys `json:"keys,omitempty"`
 	Deleted           bool                `json:"deleted,omitzero"`
 	DeviceDisplayName string              `json:"device_display_name,omitzero"`
+}
+
+type PresenceEDUItem struct {
+	UserID          id.UserID      `json:"user_id"`
+	Presence        event.Presence `json:"presence"`
+	StatusMsg       string         `json:"status_msg,omitempty"`
+	LastActiveAgo   int64          `json:"last_active_ago,omitempty"`
+	CurrentlyActive bool           `json:"currently_active,omitempty"`
+}
+
+type PresenceEDUContent struct {
+	Push []PresenceEDUItem `json:"push"`
 }

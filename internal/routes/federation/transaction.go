@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -165,6 +166,43 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 
 			case types.EDUTypeReceipt:
 				// TODO
+
+			case types.EDUTypePresence:
+				for _, edu := range edus {
+					var content types.PresenceEDUContent
+					if err := json.Unmarshal(edu.Content, &content); err != nil {
+						log.Err(err).Msg("Failed to unmarshal m.presence content")
+						return
+					}
+					for _, presenceItem := range content.Push {
+						// Calculate last active time from last_active_ago
+						lastActive := time.Now()
+						if presenceItem.LastActiveAgo > 0 {
+							lastActive = lastActive.Add(-time.Duration(presenceItem.LastActiveAgo) * time.Millisecond)
+						}
+
+						presence := &types.Presence{
+							UserID:     presenceItem.UserID,
+							Presence:   presenceItem.Presence,
+							Message:    presenceItem.StatusMsg,
+							LastActive: lastActive,
+						}
+
+						if err := f.db.Transient.UpdateUserPresence(r.Context(), presenceItem.UserID, presence); err != nil {
+							log.Err(err).
+								Str("user_id", presenceItem.UserID.String()).
+								Msg("Failed to store remote presence")
+							return
+						}
+						f.notifiers.Transient.SendChange(notifier.Change{
+							UserIDs: []id.UserID{presenceItem.UserID},
+						})
+						log.Debug().
+							Str("user_id", presenceItem.UserID.String()).
+							Str("presence", string(presenceItem.Presence)).
+							Msg("Processed remote presence update")
+					}
+				}
 
 			case types.EDUTypeToDevice:
 				tds := make([]*types.ToDevice, 0, len(edus))

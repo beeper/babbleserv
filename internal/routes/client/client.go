@@ -117,6 +117,12 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/read_markers", middleware.RequireUserAuth(c.SendRoomReadMarkers))
 	}
 
+	if c.config.Transient.Enabled {
+		// Presence routes
+		rtr.MethodFunc(http.MethodGet, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.GetPresence))
+		rtr.MethodFunc(http.MethodPut, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.PutPresence))
+	}
+
 	if c.config.Accounts.Enabled {
 		rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
 		rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)

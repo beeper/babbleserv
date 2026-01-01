@@ -50,13 +50,14 @@ This is structured like so:
     - `DevicesDirectory`
         - exposes methods that work with transactions (`TxnGetDevice`, etc)
         - these handle the translation of keys + values between go types / bytes
+        - panic if data is not in expected format
 
 ### Transactions
 
 All code execution within a transaction is wrapped by FoundationDB such that it may be re-executed
 in case of serilization errors (opportunistic concurrency). As such there are rules/guidelines:
 
-- it's ok to `panic()`: https://pkg.go.dev/github.com/apple/foundationdb/bindings/go/src/fdb#hdr-On_Panics
+- use `MustGet` + `GetSliceOrPanic`: https://pkg.go.dev/github.com/apple/foundationdb/bindings/go/src/fdb#hdr-On_Panics
 - no/minimal goroutines (exception being sync): https://pkg.go.dev/github.com/apple/foundationdb/bindings/go/src/fdb#hdr-Transactions_and_Goroutines
 
 ## Iterators (for cross-database transactions)

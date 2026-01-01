@@ -2,7 +2,7 @@
 
 Some high level flow charts describing how routes, databases and workers interact.
 
-## Events (rooms)
+## Room Events
 
 ```
                      ┌───────────────────┐     ┌──────────────────────────┐                             
@@ -15,14 +15,14 @@ Some high level flow charts describing how routes, databases and workers interac
       │                                                    │                                │           
       │                                         ┌──────────▼─────────────┐                  │           
 Federation Transaction PDUs                     │                        │                  │           
-                                                │    EventsIterator      │                  │           
+                                                │     EventsIterator     │                  │           
                                                 │                        │        ┌─────────┴──────────┐
                                                 └──────────┬─────────────┘        │                    │
-                                                           │                      │   ClientRoutes     │
+                                                           │                      │    ClientRoutes    │
                                                 ┌──────────▼─────────────┐        │                    │
                                                 │                        │        └────────────────────┘
-Federation outgoing events ◄────────────────────┤   FederationSender     │                              
-                                                │                        │                              
+Federation outgoing events ◄────────────────────┤    FederationSender    │                              
+                                                │      (per server)      │                              
                                                 └────────────────────────┘                              
 ```
 
@@ -48,7 +48,7 @@ Federation Transaction EDUs                        │                 │      
                                                    │                 │               │             │    
                                     ┌──────────────▼─────────┐ ┌─────▼──────────┐ ┌──┴─────────────┴───┐
                                     │                        │ │                │ │                    │
-                                    │  DeviceChangeIterator  │ │ EventsIterator │ │   ClientRoutes     │
+                                    │  DeviceChangeIterator  │ │ EventsIterator │ │    ClientRoutes    │
                                     │                        │ │                │ │                    │
 Federation outgoing                 └─────────────┬──────────┘ └┬───────────────┘ └────────────────────┘
     - m.device_list_update                        │             │                           ▲           
@@ -57,7 +57,35 @@ Federation outgoing                 └─────────────�
       │                                           │             │                           │           
       │            ┌───────────────────────┐    ┌─▼─────────────▼──────────┐                │           
       │            │                       │    │                          │  sync device_lists         
-      └────────────┼  FederationSender     │◄───┤   TransientDatabase      ├────────────────┘           
-                   │                       │    │                          │                            
+      └────────────┼    FederationSender   │◄───┤    TransientDatabase     ├────────────────┘           
+                   │      (per server)     │    │                          │                            
                    └───────────────────────┘    └──────────────────────────┘                            
+```
+
+## Presence
+
+```
+                                      ┌──────────────────────────┐                                       
+                                      │                          │                                       
+                                      │ PresenceTimeoutIterator  │                                       
+                                      │                          │                                       
+                                      └─────┬─────────────▲──────┘                                       
+┌────────────────────┐                      │             │                                              
+│                    │              presence changes   timeout checks                                    
+│ FederationRoutes   │ m.presence EDUs      │             │                                              
+│                    ┼─────────────┐        │             │                       
+└────────────────────┘             │    ┌───▼─────────────┼───┐     incoming reqs      ┌────────────────┐
+                                   └────►                     ◄────────────────────────|                │
+                                        │  TransientDatabase  │                        │ ClientRoutes   │
+┌────────────────────┐             ┌────┼                     |────────────────────────►                │
+│                    │             │    └───┬─────────────▲───┘  sync presence updates └────────────────┘
+│ FederationSender   ◄─────────────┘   presence changes   │       from to-device evs                  
+│                    │ m.presence EDUs      │             │                                              
+└────────────────────┘ from to-device evs   │             │                                              
+                                            │     to-device events                                       
+                                      ┌─────▼─────────────┼──────┐                                       
+                                      │                          │                                       
+                                      │  PresenceChangeIterator  │                                       
+                                      │                          │                                       
+                                      └──────────────────────────┘                                       
 ```

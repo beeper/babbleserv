@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -9,8 +10,10 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -45,6 +48,17 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 
 	userDevice := middleware.GetRequestUserDevice(r)
 	userID, deviceID := userDevice.UserID, userDevice.DeviceID
+
+	// If set_presence specified, kick that off in the background
+	presence := r.URL.Query().Get("set_presence")
+	if presence != "" {
+		go func() {
+			ctx := zerolog.Ctx(r.Context()).WithContext(context.Background())
+			if err := c.db.Transient.UpdateUserPresenceState(ctx, userID, event.Presence(presence)); err != nil {
+				zerolog.Ctx(ctx).Err(err).Msg("Failed to update presence state on sync")
+			}
+		}()
+	}
 
 	// Get filter from JSON in query or ID
 	var filter *mautrix.Filter
