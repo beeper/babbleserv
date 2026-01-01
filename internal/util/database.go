@@ -233,10 +233,14 @@ func doWriteTransactionWithRetries(
 			}
 			if canRetry {
 				retries++
-				log.Warn().Err(err).Msg("Retrying transaction error")
+				retryIn := time.Millisecond * 100 * time.Duration(retries)
+				log.Warn().Err(err).
+					Dur("retry_in", retryIn).
+					Int("retries", retries).
+					Msg("Retrying transaction error")
 				select {
 				// Sleep 100ms * retries, max 1s total
-				case <-time.After(time.Millisecond * time.Duration(retries) * 100):
+				case <-time.After(retryIn):
 					continue // retry
 				case <-ctx.Done():
 					return ctx.Err(), nil

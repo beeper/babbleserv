@@ -163,12 +163,12 @@ func (n *Notifier) Stop() {
 // Subscribe for notifier changes, which will be sent to the channel provided,
 // delivery is not guaranteed if the channel is blocked as the notifier cannot
 // wait for any downstream work.
-func (n *Notifier) Subscribe(ch chan any, req Subscription) {
+func (n *Notifier) subscribe(ch chan any, req Subscription) {
 	n.log.Trace().Any("subscription", req).Msg("Subscribe")
 	n.subscribeCh <- subscription{req, ch}
 }
 
-func (n *Notifier) Unsubscribe(ch chan any) {
+func (n *Notifier) unsubscribe(ch chan any) {
 	n.unsubscribeCh <- ch
 }
 

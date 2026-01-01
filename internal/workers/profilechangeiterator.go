@@ -48,7 +48,7 @@ func NewProfileChangeIterator(
 func (p *ProfileChangeIterator) handleProfileChangesLoop(lock lock.Lock) {
 	// Subscribe to user account changes
 	newProfilesCh := p.notifiers.Subscribe(notifier.Subscription{AllUsers: true})
-	defer p.notifiers.Accounts.Unsubscribe(newProfilesCh)
+	defer p.notifiers.Unsubscribe(newProfilesCh)
 
 	// Cold start: process any pending changes
 	p.handleProfilesChanges(lock)

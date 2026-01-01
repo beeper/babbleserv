@@ -89,16 +89,14 @@ func (e *EventsDirectory) TxnGetCurrentRoomStateEvent(
 	return eventsProvider.MustGet(eventID)
 }
 
-func (e *EventsDirectory) TxnFilterJoinedMembershipsWithEncryption(
+func (e *EventsDirectory) TxnFilterMembershipsWithEncryption(
 	txn fdb.ReadTransaction,
 	memberships types.Memberships,
 ) (types.Memberships, error) {
 	// Find joins and kick off fetches for the room encryption event state tup
 	futs := make(map[id.RoomID]fdb.FutureByteSlice, len(memberships))
-	for roomID, membershipTup := range memberships {
-		if membershipTup.Membership == event.MembershipJoin {
-			futs[roomID] = txn.Get(e.KeyForRoomCurrentStateTup(roomID, event.StateEncryption, ""))
-		}
+	for roomID := range memberships {
+		futs[roomID] = txn.Get(e.KeyForRoomCurrentStateTup(roomID, event.StateEncryption, ""))
 	}
 
 	// Now make new memberships for only rooms with an encryption event

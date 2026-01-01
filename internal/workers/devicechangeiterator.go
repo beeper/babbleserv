@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -63,7 +64,7 @@ func NewDeviceChangeIterator(
 func (d *DeviceChangeIterator) handleDeviceChangesLoop(lock lock.Lock) {
 	// Subscribe to user account changes
 	newProfilesCh := d.notifiers.Subscribe(notifier.Subscription{AllUsers: true})
-	defer d.notifiers.Accounts.Unsubscribe(newProfilesCh)
+	defer d.notifiers.Unsubscribe(newProfilesCh)
 
 	// Cold start: process any pending changes
 	d.handleDeviceChanges(lock)
@@ -161,7 +162,7 @@ func (d *DeviceChangeIterator) processRemoteDeviceChange(lock lock.Lock, change 
 		return fmt.Errorf("failed to lookup memberships: %w", err)
 	}
 
-	// Now find distinct *local* userIDs joined in those rooms
+	// Now find distinct local userIDs joined in those rooms
 	localUserIDs := make(map[id.UserID]struct{}, len(memberships))
 
 	for roomID := range memberships {
@@ -297,11 +298,10 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 				MasterKey:   keys.Master.CrossSigningKeys,
 				SelfSigning: keys.SelfSigning.CrossSigningKeys,
 			}
-			b, _ := json.Marshal(content)
 			tds = append(tds, &types.ToDevice{
 				Type:    types.BabbleservRemoteSigningKeyUpdate,
 				UserID:  serverUserID,
-				Content: b,
+				Content: exerrors.Must(json.Marshal(content)),
 			})
 		} else {
 			// Device list update, we must send the device and keys in a m.device_list_update EDU to
@@ -324,11 +324,10 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 				content.Deleted = true
 			}
 
-			b, _ := json.Marshal(content)
 			tds = append(tds, &types.ToDevice{
 				Type:    types.BabbleservRemoteDeviceListUpdate,
 				UserID:  serverUserID,
-				Content: b,
+				Content: exerrors.Must(json.Marshal(content)),
 			})
 		}
 	}

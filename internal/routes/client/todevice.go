@@ -45,7 +45,7 @@ func (c *ClientRoutes) SendToDevice(w http.ResponseWriter, r *http.Request) {
 			deviceIDs := make([]id.DeviceID, 0, 1)
 
 			if targetDeviceID == "*" && targetUserHS == c.config.ServerName {
-				// If sending to a *local* user with "*" as the device ID, fetch all the users
+				// If sending to a local user with "*" as the device ID, fetch all the users
 				// devices and create a to device for each.
 				userDevices, err := c.db.Accounts.GetUserDevices(r.Context(), targetUserID)
 				if err != nil {

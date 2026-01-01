@@ -12,8 +12,8 @@ import (
 )
 
 // The to-device directory holds versioned to-device events stored by user/device or server for
-// pagination during sync or federation sending. We also use these to store and sync/federate device
-// list changes (m.device_list_update EDU) and signing key updates (m.signing_key_update EDU).
+// pagination during sync or federation sending. Babbleserv also uses to-device events for some
+// internal changes ie generating m.device_list_update EDUs for federation.
 type ToDeviceDirectory struct {
 	log zerolog.Logger
 

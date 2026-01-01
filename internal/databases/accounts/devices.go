@@ -13,6 +13,15 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
+func (a *AccountsDatabase) PaginateDeviceChanges(
+	ctx context.Context,
+	options types.PaginationOptions,
+) ([]types.UserDeviceChange, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) ([]types.UserDeviceChange, error) {
+		return a.devices.TxnPaginateDeviceChanges(txn, options)
+	})
+}
+
 func (a *AccountsDatabase) StoreDeviceChange(ctx context.Context, userID id.UserID, deviceID id.DeviceID) error {
 	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
 		version := tuple.IncompleteVersionstamp(0)

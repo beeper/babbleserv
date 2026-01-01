@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/samber/lo"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -40,10 +41,23 @@ func (r *RoomsDatabase) GetUserMemberships(ctx context.Context, userID id.UserID
 	})
 }
 
+func (r *RoomsDatabase) GetUserJoinedMemberships(ctx context.Context, userID id.UserID) (types.Memberships, error) {
+	memberships, err := r.GetUserMemberships(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return lo.PickBy(memberships, func(uid id.RoomID, mtup types.MembershipTup) bool {
+		return mtup.Membership == event.MembershipJoin
+	}), nil
+}
+
 func (r *RoomsDatabase) GetUserJoinedMembershipsWithEncryption(ctx context.Context, userID id.UserID) (types.Memberships, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Memberships, error) {
 		memberships := r.users.TxnLookupUserMemberships(txn, userID)
-		return r.events.TxnFilterJoinedMembershipsWithEncryption(txn, memberships)
+		memberships = lo.PickBy(memberships, func(uid id.RoomID, mtup types.MembershipTup) bool {
+			return mtup.Membership == event.MembershipJoin
+		})
+		return r.events.TxnFilterMembershipsWithEncryption(txn, memberships)
 	})
 }
 

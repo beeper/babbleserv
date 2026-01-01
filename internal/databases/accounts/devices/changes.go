@@ -36,7 +36,6 @@ func (d *DevicesDirectory) TxnPaginateDeviceChanges(
 		types.GetVersionRange(d.deviceChanges, options.From, options.To),
 		options.RangeOptions(),
 	).Iterator()
-
 	ids := make([]types.UserDeviceChange, 0, options.Limit)
 
 	for iter.Advance() {

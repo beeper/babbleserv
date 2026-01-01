@@ -53,7 +53,7 @@ func NewEventsIterator(
 
 func (e *EventsIterator) handleNewEventsLoop(lock lock.Lock) {
 	newEventsCh := e.notifiers.Subscribe(notifier.Subscription{AllEvents: true})
-	defer e.notifiers.Rooms.Unsubscribe(newEventsCh)
+	defer e.notifiers.Unsubscribe(newEventsCh)
 
 	// Cold start case: handle anything waiting right away
 	e.handleNewEvents(lock)

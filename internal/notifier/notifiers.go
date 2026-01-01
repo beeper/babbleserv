@@ -38,13 +38,13 @@ func (n *Notifiers) Subscribe(req Subscription) chan any {
 
 func (n *Notifiers) SubscribeWithChannel(ch chan any, req Subscription) chan any {
 	if n.Rooms != nil {
-		n.Rooms.Subscribe(ch, req)
+		n.Rooms.subscribe(ch, req)
 	}
 	if n.Accounts != nil {
-		n.Accounts.Subscribe(ch, req)
+		n.Accounts.subscribe(ch, req)
 	}
 	if n.Transient != nil {
-		n.Transient.Subscribe(ch, req)
+		n.Transient.subscribe(ch, req)
 	}
 
 	return ch
@@ -52,13 +52,13 @@ func (n *Notifiers) SubscribeWithChannel(ch chan any, req Subscription) chan any
 
 func (n *Notifiers) Unsubscribe(ch chan any) {
 	if n.Rooms != nil {
-		n.Rooms.Unsubscribe(ch)
+		n.Rooms.unsubscribe(ch)
 	}
 	if n.Accounts != nil {
-		n.Accounts.Unsubscribe(ch)
+		n.Accounts.unsubscribe(ch)
 	}
 	if n.Transient != nil {
-		n.Transient.Unsubscribe(ch)
+		n.Transient.unsubscribe(ch)
 	}
 
 	close(ch)
