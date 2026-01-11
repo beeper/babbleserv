@@ -306,12 +306,12 @@ func (r *RoomsDatabase) syncRoomEvents(
 			timeline := make([]*types.Event, len(result.eventTups))
 			for i, tup := range result.eventTups {
 				timeline[i] = eventsProvider.MustGet(tup.EventID)
-				timeline[i].SetUnsigned("hs.order", types.Version(idToVersion[tup.EventID]))
+				timeline[i].SetUnsigned("hs.order", types.MustVersionstampToString(idToVersion[tup.EventID]))
 			}
 			state := make([]*types.Event, len(result.eventStateTups))
 			for i, tup := range result.eventStateTups {
 				state[i] = eventsProvider.MustGet(tup.EventID)
-				state[i].SetUnsigned("hs.order", types.Version(idToVersion[tup.EventID]))
+				state[i].SetUnsigned("hs.order", types.MustVersionstampToString(idToVersion[tup.EventID]))
 			}
 
 			rooms[membershipTup] = &types.SyncRoom{

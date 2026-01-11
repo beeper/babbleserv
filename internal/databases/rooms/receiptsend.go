@@ -92,7 +92,7 @@ func (r *RoomsDatabase) SendReceipts(
 					Str("event_id", rc.EventID.String()).
 					Msg("Saving receipt with unknown event version")
 			}
-			rc.EventVersion = types.Version(evVersion)
+			rc.EventVersion = evVersion
 
 			// Receipts are stored over 3x streams:
 			// 1. public receipts (m.read) by room/version (for sync)

@@ -435,7 +435,7 @@ func (fs *FederationSender) syncTransientForServer(
 			panic(err)
 		}
 		content := types.ToDeviceEDUContent{
-			MessageID: types.MustVersionstampToOrderedString(td.Version),
+			MessageID: types.MustVersionstampToString(td.Version),
 			Type:      td.Type,
 			Sender:    td.Sender,
 			Messages: types.ToDeviceEDUMessages{
@@ -480,7 +480,7 @@ func (fs *FederationSender) sendTransactionToServer(
 ) error {
 	log := zerolog.Ctx(ctx)
 
-	transactionID := types.MustVersionstampToOrderedString(version)
+	transactionID := types.MustVersionstampToString(version)
 
 	log.Debug().
 		Int("pdus", len(pdus)).

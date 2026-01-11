@@ -82,8 +82,8 @@ func (a *AccountsDatabase) getTxnLogContext(ctx context.Context, name string) ze
 		Str("transaction", name)
 }
 
-func (a *AccountsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (time.Time, error) {
-	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (time.Time, error) {
+func (a *AccountsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (*time.Time, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*time.Time, error) {
 		time := util.TxnGetTimeForVersion(txn, version)
 		return time, nil
 	})

@@ -15,9 +15,9 @@ type ReceiptTup struct {
 
 type Receipt struct {
 	ReceiptTup   `json:",inline"`
-	EventID      id.EventID `json:"event_id"`
-	EventVersion Version    `json:"event_version"`
-	Timestamp    int64      `json:"ts"`
+	EventID      id.EventID         `json:"event_id"`
+	EventVersion tuple.Versionstamp `json:"event_version"`
+	Timestamp    int64              `json:"ts"`
 }
 
 type ReceiptWithVersion struct {
@@ -54,7 +54,7 @@ func BytesToReceipt(b []byte) (*Receipt, error) {
 			UserID:   id.UserID(tup[3].(string)),
 		},
 		EventID:      id.EventID(tup[4].(string)),
-		EventVersion: Version(tup[5].(tuple.Versionstamp)),
+		EventVersion: tup[5].(tuple.Versionstamp),
 		Timestamp:    tup[6].(int64),
 	}, nil
 }

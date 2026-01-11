@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
@@ -121,6 +122,13 @@ func (r *RoomsDatabase) getTxnLogContext(ctx context.Context, name string) zerol
 		Str("component", "database").
 		Str("database", "rooms").
 		Str("transaction", name)
+}
+
+func (r *RoomsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (*time.Time, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*time.Time, error) {
+		time := util.TxnGetTimeForVersion(txn, version)
+		return time, nil
+	})
 }
 
 func (r *RoomsDatabase) GenerateRoomID(ctx context.Context) id.RoomID {

@@ -1,14 +1,19 @@
 package transient
 
 import (
+	"context"
+	"time"
+
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases/transient/presence"
 	"github.com/beeper/babbleserv/internal/databases/transient/todevice"
 	"github.com/beeper/babbleserv/internal/notifier"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 const API_VERSION = 710
@@ -62,4 +67,11 @@ func NewTransientDatabase(
 }
 
 func (t *TransientDatabase) Stop() {
+}
+
+func (t *TransientDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (*time.Time, error) {
+	return util.DoReadTransaction(ctx, t.db, func(txn fdb.ReadTransaction) (*time.Time, error) {
+		time := util.TxnGetTimeForVersion(txn, version)
+		return time, nil
+	})
 }

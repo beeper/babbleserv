@@ -2,7 +2,6 @@ package util
 
 import (
 	"context"
-	"math"
 	"runtime"
 	"strconv"
 	"time"
@@ -33,15 +32,16 @@ func TxnIterAllRange(txn fdb.ReadTransaction, rng fdb.Range, f func(fdb.KeyValue
 	return nil
 }
 
-func TxnGetTimeForVersion(txn fdb.ReadTransaction, version tuple.Versionstamp) time.Time {
-	version.UserVersion = math.MaxUint16
+func TxnGetTimeForVersion(txn fdb.ReadTransaction, version tuple.Versionstamp) *time.Time {
+	version.UserVersion = types.MaxVersionstampUserVersion // time is stored at this UserVersion
 	b := txn.Get(tuple.Tuple{versionToTimePrefix, version}).MustGet()
 	if b == nil {
-		return time.Time{}
+		return nil
 	}
 	tup, _ := tuple.Unpack(b)
 	nanos := tup[0].(int64)
-	return time.Unix(0, nanos)
+	time := time.Unix(0, nanos)
+	return &time
 }
 
 func TxnGetLatestWriteVersion(txn fdb.ReadTransaction) tuple.Versionstamp {
@@ -99,7 +99,7 @@ func DoReadTransaction[T any](
 		res, err := fn(txn.Snapshot())
 		log.Trace().
 			Err(err).
-			Str("duration", time.Since(start).String()).
+			Stringer("duration", time.Since(start)).
 			Msg("End read transaction")
 		return res, err
 	})
@@ -128,7 +128,7 @@ func DoWriteTransaction[T any](
 			res, err := fn(txn)
 			log.Trace().
 				Err(err).
-				Str("duration", time.Since(start).String()).
+				Stringer("duration", time.Since(start)).
 				Int64("size", txn.GetApproximateSize().MustGet()).
 				Msg("End write transaction")
 			return res, err
@@ -164,8 +164,7 @@ func DoWriteTransactionWithVersion[T any](
 			// We use nanos since FDB itself uses micros (ie 1M txn/s), this should avoid any conflicts
 			timeNano := time.Now().UTC().UnixNano()
 
-			// Use max uint16-1 for user version so we're at/after anything persisted, the -1 accounts
-			// for types.GetVersionRange bumping UserVersion to swap inclusivity of range.
+			// Use max for user version so we're at/after anything persisted
 			version := tuple.IncompleteVersionstamp(types.MaxVersionstampUserVersion)
 			versionBytes := types.MustVersionstampToBytes(version)
 
@@ -181,7 +180,7 @@ func DoWriteTransactionWithVersion[T any](
 
 			log.Trace().
 				Err(err).
-				Str("duration", time.Since(start).String()).
+				Stringer("duration", time.Since(start)).
 				Int64("size", txn.GetApproximateSize().MustGet()).
 				Msg("End write transaction")
 			return res, err

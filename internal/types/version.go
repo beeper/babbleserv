@@ -16,16 +16,6 @@ import (
 
 const MaxVersionstampUserVersion = math.MaxUint16 - 1
 
-type Version tuple.Versionstamp
-
-func (v Version) MarshalText() ([]byte, error) {
-	vStr, err := VersionstampToOrderedString(tuple.Versionstamp(v))
-	if err != nil {
-		return nil, err
-	}
-	return []byte(vStr), nil
-}
-
 var (
 	ZeroVersionstamp  = tuple.Versionstamp{}
 	incompleteVersion = [10]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -48,7 +38,7 @@ func DecodeRawVersionstamp(b []byte) tuple.Versionstamp {
 	}
 }
 
-func VersionstampToOrderedString(version tuple.Versionstamp) (string, error) {
+func VersionstampToString(version tuple.Versionstamp) (string, error) {
 	vstamp, err := VersionstampToBytes(version)
 	if err != nil {
 		return "", err
@@ -56,8 +46,8 @@ func VersionstampToOrderedString(version tuple.Versionstamp) (string, error) {
 	return base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(vstamp), nil
 }
 
-func MustVersionstampToOrderedString(version tuple.Versionstamp) string {
-	if vstamp, err := VersionstampToOrderedString(version); err != nil {
+func MustVersionstampToString(version tuple.Versionstamp) string {
+	if vstamp, err := VersionstampToString(version); err != nil {
 		panic(err)
 	} else {
 		return vstamp
