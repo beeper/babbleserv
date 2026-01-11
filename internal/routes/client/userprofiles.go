@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/util"
@@ -16,7 +15,7 @@ import (
 // https://spec.matrix.org/v1.10/client-server-api/#get_matrixclientv3profileuseridavatar_url
 // https://spec.matrix.org/v1.10/client-server-api/#get_matrixclientv3profileuseriddisplayname
 func (c *ClientRoutes) GetProfile(w http.ResponseWriter, r *http.Request) {
-	userID := id.UserID(chi.URLParam(r, "userID"))
+	userID := util.UserIDFromRequestURLParam(r, "userID")
 
 	profile, err := c.db.Accounts.GetUserProfile(r.Context(), userID)
 	if err != nil {
@@ -57,8 +56,8 @@ func (c *ClientRoutes) PutProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := middleware.GetRequestUserID(r)
-	userIDParam := chi.URLParam(r, "userID")
-	if userIDParam != userID.String() {
+	userIDParam := util.UserIDFromRequestURLParam(r, "userID")
+	if userIDParam != userID {
 		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
 		return
 	}

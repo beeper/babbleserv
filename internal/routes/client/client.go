@@ -107,11 +107,6 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 		rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
 		rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
 
-		// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
-		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
-		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
-		rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
-
 		// Receipts routes
 		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", middleware.RequireUserAuth(c.SendRoomReadReceipt))
 		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/read_markers", middleware.RequireUserAuth(c.SendRoomReadMarkers))
@@ -130,6 +125,11 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 		rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
 
+		// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
+		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
+		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
+		rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
+
 		rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
 		rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
 		rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
@@ -145,6 +145,9 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 		rtr.MethodFunc(http.MethodPost, "/v3/user/{userID}/filter", middleware.RequireUserAuth(c.CreateFilter))
 		rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/filter/{filterID}", middleware.RequireUserAuth(c.GetFilter))
+
+		rtr.MethodFunc(http.MethodGet, "/v3/pushrules", middleware.RequireUserAuth(c.GetPushRules))
+		rtr.MethodFunc(http.MethodGet, "/v3/pushrules/", middleware.RequireUserAuth(c.GetPushRules))
 
 		// Global account data
 		rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
@@ -179,7 +182,19 @@ func (c *ClientRoutes) AddClientMediaRoutes(rtr chi.Router) {
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientversions
 func (f *ClientRoutes) GetVersions(w http.ResponseWriter, r *http.Request) {
 	util.ResponseJSON(w, r, http.StatusOK, map[string]any{
-		"versions":          []string{"v1.11"},
+		"versions": []string{
+			"v1.1",
+			"v1.2",
+			"v1.3",
+			"v1.4",
+			"v1.5",
+			"v1.6",
+			"v1.7",
+			"v1.8",
+			"v1.9",
+			"v1.10",
+			"v1.11",
+		},
 		"unstable_features": map[string]any{},
 	})
 }

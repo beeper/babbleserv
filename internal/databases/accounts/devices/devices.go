@@ -117,31 +117,21 @@ func (d *DevicesDirectory) TxnStoreDevice(txn fdb.Transaction, userID id.UserID,
 	txn.Set(d.keyForDevice(userID, device.ID), device.ToMsgpack())
 }
 
-func (d *DevicesDirectory) txnStoreNewDevice(txn fdb.Transaction, userID id.UserID, device *types.Device) {
-	// Store a change (device list update) for this user/device
-	d.TxnStoreDeviceChange(txn, userID, device.ID, tuple.IncompleteVersionstamp(0))
-	// Store the device itself
-	d.TxnStoreDevice(txn, userID, device)
-}
-
 func (d *DevicesDirectory) TxnGetOrCreateDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, initialDisplayName string) (*types.Device, error) {
 	device, err := d.TxnGetDevice(txn, userID, deviceID)
 	if err != nil {
 		return nil, err
 	} else if device == nil {
 		device = types.NewDevice(deviceID, initialDisplayName)
-		d.txnStoreNewDevice(txn, userID, device)
+		// Store a change (device list update) for this user/device
+		d.TxnStoreDeviceChange(txn, userID, device.ID, tuple.IncompleteVersionstamp(0))
+		// Store the device itself
+		d.TxnStoreDevice(txn, userID, device)
 	}
 	return device, nil
 }
 
-func (d *DevicesDirectory) TxnSetDeviceLastSeen(
-	txn fdb.Transaction,
-	userID id.UserID,
-	deviceID id.DeviceID,
-	ip string,
-	time time.Time,
-) {
+func (d *DevicesDirectory) TxnSetDeviceLastSeen(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, ip string, time time.Time) {
 	key := d.keyForDeviceLastSeen(userID, deviceID)
 	value := tuple.Tuple{ip, time}.Pack()
 	txn.Set(key, value)

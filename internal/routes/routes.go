@@ -99,6 +99,7 @@ func (r *Routes) MakeHandler(groups []string) http.Handler {
 		r.config.ServerName,
 		r.databases.Accounts.GetUserDeviceForAuthToken,
 	))
+	rtr.Use(middleware.CORSMiddleware)
 
 	for _, group := range groups {
 		switch group {
