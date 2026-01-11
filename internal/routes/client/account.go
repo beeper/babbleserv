@@ -97,6 +97,11 @@ func (c *ClientRoutes) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Header.Get("X-Babbleserv-Register-Secret") != c.config.Accounts.RegisterSecretHeaderValue {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Invalid secret header")
+		return
+	}
+
 	if err := id.ValidateUserLocalpart(req.Username); err != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf("Invalid username; %s", err.Error()))
 		return

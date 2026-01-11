@@ -53,6 +53,9 @@ type BabbleConfig struct {
 
 		// How long to keep device changes around (/keys/changes endpoint)
 		DeviceChangesRetention time.Duration `yaml:"deviceChangesRetention"`
+
+		// Value of X-Babbleserv-Register-Secret required to register
+		RegisterSecretHeaderValue string `yaml:"registerSecretHeaderValue"`
 	} `yaml:"accounts"`
 
 	Transient struct {
