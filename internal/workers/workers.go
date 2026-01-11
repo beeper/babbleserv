@@ -34,25 +34,33 @@ func NewWorkers(
 
 	if cfg.Rooms.Enabled {
 		workers = append(workers,
+			// Wakes up relevant federation senders for new events
 			NewEventsIterator(log, cfg, db, notifiers),
+			// Federation sender per remote homeserver
 			NewFederationSender(log, cfg, db, notifiers, fclient),
 		)
 	}
 
-	if cfg.Accounts.Enabled {
-		// ProfileChangeIterator accounts profile changes -> room member events
-		if cfg.Rooms.Enabled {
-			workers = append(workers, NewProfileChangeIterator(log, cfg, db, notifiers))
-		}
-		// DeviceChangeIterator accounts device changes -> transient to device
-		if cfg.Transient.Enabled {
-			workers = append(workers, NewDeviceChangeIterator(log, cfg, db, notifiers))
-		}
+	if cfg.Accounts.Enabled && cfg.Rooms.Enabled {
+		// Profile changes from accounts -> member events in rooms
+		workers = append(workers, NewProfileChangeIterator(log, cfg, db, notifiers))
+	}
+
+	if cfg.Accounts.Enabled && cfg.Transient.Enabled {
+		// Device changes from accounts -> internal to-device change notifications
+		workers = append(workers, NewDeviceChangeIterator(log, cfg, db, notifiers))
+	}
+
+	if cfg.Accounts.Enabled && cfg.Rooms.Enabled && cfg.Transient.Enabled {
+		// Join events from rooms -> internal to-device change notifications (w/devices from accounts)
+		workers = append(workers, NewDeviceJoinEventIterator(log, cfg, db, notifiers))
 	}
 
 	if cfg.Transient.Enabled {
 		workers = append(workers,
+			// Presence change -> internal to-device presence notifications
 			NewPresenceChangeIterator(log, cfg, db, notifiers),
+			// Presence timeouts -> presence changes
 			NewPresenceTimeoutIterator(log, cfg, db, notifiers),
 		)
 	}
