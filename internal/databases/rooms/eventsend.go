@@ -54,15 +54,21 @@ func (r *RoomsDatabase) SendLocalEvents(
 			return nil, err
 		}
 
-		allowedEvs, rejectedEvs, err := r.txnPrepareLocalEvents(ctx, txn, room, partialEvs, options)
+		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+
+		allowedEvs, rejectedEvs, err := r.txnPrepareLocalEvents(ctx, txn, room, partialEvs, eventsProvider, options)
 		if err != nil {
 			return nil, err
 		}
 
+		// Get local users in the room and evaluate notifications for each event
+		localUsers := r.TxnGetLocalJoinedUsersInRoom(txn, roomID)
+		eventNotifications := txnEvaluateNotificationsForEvents(txn, eventsProvider, allowedEvs, localUsers)
+
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
 
-		if !r.txnStoreEvents(ctx, txn, room, allowedEvs, changedUsers, changedServers) {
+		if !r.txnStoreEvents(ctx, txn, room, allowedEvs, changedUsers, changedServers, eventNotifications) {
 			log.Warn().Msg("No events stored in send transaction")
 		}
 
@@ -100,12 +106,14 @@ func (r *RoomsDatabase) PrepareLocalEvents(ctx context.Context, roomID id.RoomID
 	var rejected []RejectedEvent
 
 	_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
+		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+
 		room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
 		if err != nil {
 			return nil, err
 		}
 		allowed, rejected, err = r.txnPrepareLocalEvents(
-			ctx, txn, room, partialEvs, SendLocalEventsOptions{},
+			ctx, txn, room, partialEvs, eventsProvider, SendLocalEventsOptions{},
 		)
 		return nil, err
 	})
@@ -118,10 +126,9 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 	txn fdb.ReadTransaction,
 	room *types.Room,
 	partialEvs []*types.PartialEvent,
+	eventsProvider *events.TxnEventsProvider,
 	options SendLocalEventsOptions,
 ) ([]*types.Event, []RejectedEvent, error) {
-	eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-
 	// Get the current room state which we'll use to authenticate the events
 	currentStateMap := r.events.TxnLookupCurrentRoomAuthAndSpecificMemberStateMap(
 		ctx,
@@ -643,10 +650,14 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			evLog.Debug().Msg("Event authorized for storage")
 		}
 
+		// Get local users in the room and evaluate notifications for each event
+		localUsers := r.TxnGetLocalJoinedUsersInRoom(txn, roomID)
+		eventNotifications := txnEvaluateNotificationsForEvents(txn, eventsProvider, evs, localUsers)
+
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
 
-		if !r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers) {
+		if !r.txnStoreEvents(ctx, txn, room, evs, changedUsers, changedServers, eventNotifications) {
 			log.Warn().Msg("No events stored in send transaction")
 		} else {
 			if options.RemoteJoinEventID != "" && !thisServerInRoom {
@@ -850,6 +861,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 	evs []*types.Event,
 	changedUsers map[id.UserID]struct{},
 	changedServers map[string]struct{},
+	eventNotifications map[id.EventID]map[id.UserID]types.Notifications,
 ) bool {
 	if len(evs) > types.MaxVersionstampUserVersion {
 		panic("not safe to write this many events in one transaction")
@@ -857,7 +869,14 @@ func (r *RoomsDatabase) txnStoreEvents(
 		return false
 	}
 
-	zerolog.Ctx(ctx).Debug().Int("events", len(evs)).Msg("Storing batch of events")
+	notifs := 0
+	for _, u := range eventNotifications {
+		notifs += len(u)
+	}
+	zerolog.Ctx(ctx).Debug().
+		Int("events", len(evs)).
+		Int("event_notifications", notifs).
+		Msg("Storing batch of events")
 
 	var version tuple.Versionstamp
 	depthKey := r.KeyForRoomDepth(room.ID)
@@ -957,6 +976,13 @@ func (r *RoomsDatabase) txnStoreEvents(
 				// room-ev-reactions/rel-ev/uid/key
 				// Note: dupe check is handled before we call storeEvents
 				txn.Set(r.events.KeyForRoomReaction(room.ID, relEvID, ev.Sender, ev.ReactionKey()), []byte(ev.ID))
+			}
+		}
+
+		// Store notification counts for local users
+		if userNotifs, ok := eventNotifications[ev.ID]; ok {
+			for userID, notif := range userNotifs {
+				r.users.TxnStoreNotification(txn, userID, room.ID, version, notif)
 			}
 		}
 

@@ -284,6 +284,11 @@ func (ev *Event) Membership() event.Membership {
 	return event.Membership(gjson.GetBytes(ev.Content, "membership").String())
 }
 
+func (ev *Event) Mentions() (m event.Mentions) {
+	json.Unmarshal([]byte(gjson.GetBytes(ev.Content, "m\\.mentions").Raw), &m)
+	return m
+}
+
 func (ev *Event) RelatesTo() (id.EventID, event.RelationType) {
 	relatesTo := gjson.GetBytes(ev.Content, "m\\.relates_to")
 	if !relatesTo.Exists() {

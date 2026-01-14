@@ -38,12 +38,18 @@ func NewWorkers(
 			NewEventsIterator(log, cfg, db, notifiers),
 			// Federation sender per remote homeserver
 			NewFederationSender(log, cfg, db, notifiers, fclient),
+			// Compacts notification versions for users
+			// NewCompactNotificationIterator(log, cfg, db, notifiers),
 		)
 	}
 
 	if cfg.Accounts.Enabled && cfg.Rooms.Enabled {
-		// Profile changes from accounts -> member events in rooms
-		workers = append(workers, NewProfileChangeIterator(log, cfg, db, notifiers))
+		workers = append(workers,
+			// Profile changes from accounts -> member events in rooms
+			NewProfileChangeIterator(log, cfg, db, notifiers),
+			// Uses push rules from accounts -> push notifications for new events
+			// NewPushNotificationIterator(log, cfg, db, notifiers),
+		)
 	}
 
 	if cfg.Accounts.Enabled && cfg.Transient.Enabled {

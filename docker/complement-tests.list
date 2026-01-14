@@ -21,6 +21,7 @@ TestServerCapabilities
 TestSync
 TestSyncFilter
 TestSyncOmitsStateChangeOnFilteredEvents
+TestThreadedReceipts
 TestToDeviceMessages
 TestUploadKey
 TestUploadKeyIdempotency

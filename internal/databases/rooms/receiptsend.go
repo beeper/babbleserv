@@ -138,6 +138,18 @@ func (r *RoomsDatabase) SendReceipts(
 				continue
 			}
 
+			// Clear notification counts up to the receipt's event version
+			// Both read and private read receipts mark messages as read
+			if rc.EventVersion != types.ZeroVersionstamp && rc.UserID.Homeserver() == r.config.ServerName {
+				if rc.ThreadID != "" {
+					// Thread-specific receipt: only clear notifications for this thread
+					r.users.TxnClearThreadNotificationsUpTo(txn, rc.UserID, rc.RoomID, rc.ThreadID, rc.EventVersion)
+				} else {
+					// Main timeline receipt: clear all notifications
+					r.users.TxnClearNotificationsUpTo(txn, rc.UserID, rc.RoomID, rc.EventVersion)
+				}
+			}
+
 			// Finally update the last version
 			txn.SetVersionstampedValue(versionKey, types.MustVersionstampToBytes(version))
 
@@ -145,7 +157,7 @@ func (r *RoomsDatabase) SendReceipts(
 		}
 
 		// Bump the room version ahead of any receipts sent (max userID part of versionstamp)
-		version := tuple.IncompleteVersionstamp(uint16(math.MaxUint16))
+		version := tuple.IncompleteVersionstamp(types.MaxVersionstampUserVersion)
 		txn.SetVersionstampedValue(r.KeyForRoomVersion(roomID), types.MustVersionstampToBytes(version))
 
 		return &SendReceiptsResults{
