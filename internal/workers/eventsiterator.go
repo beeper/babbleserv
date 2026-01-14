@@ -24,7 +24,6 @@ const (
 // The EventsIterator is a singleton background worker that iterates over all events ever stored
 // by Babbleserv and triggers other things:
 // - starts federation senders for servers in rooms with new events
-// - sends device change notifications for join/leave events in encrypted rooms
 type EventsIterator struct {
 	iteratorWorker
 }

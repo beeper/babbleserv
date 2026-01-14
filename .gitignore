@@ -5,4 +5,4 @@ ed25519-*
 *.pem
 babbleserv
 external/
-.claude/
+.claude/settings.local.json

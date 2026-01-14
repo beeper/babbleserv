@@ -56,6 +56,13 @@ func (o *SyncOptions) GetReceiptsLimit() int {
 	return DefaultReceiptsLimit
 }
 
+func (o *SyncOptions) UseRoomThreadedNotifications() bool {
+	if o == nil || o.Filter == nil || o.Filter.Room == nil || o.Filter.Room.Timeline == nil {
+		return false
+	}
+	return o.Filter.Room.Timeline.UnreadThreadNotifications
+}
+
 func (o *SyncOptions) GetRoomFilter() *mautrix.RoomFilter {
 	if o == nil || o.Filter == nil {
 		return nil
@@ -278,12 +285,22 @@ type syncRoomKnock struct {
 	KnockState EventList `json:"knock_state"`
 }
 
+// UnreadNotificationCounts represents the unread notification counts for a room.
+type UnreadNotificationCounts struct {
+	NotificationCount int `json:"notification_count"`
+	HighlightCount    int `json:"highlight_count"`
+}
+
 type SyncRoom struct {
 	// Rooms database
-	TimelineEvents Timeline  `json:"timeline"`
-	StateEvents    EventList `json:"state"`
-	Ephemeral      EventList `json:"ephemeral"`
-	AccountData    EventList `json:"account_data"`
+	TimelineEvents      Timeline                  `json:"timeline"`
+	StateEvents         EventList                 `json:"state"`
+	Ephemeral           EventList                 `json:"ephemeral"`
+	AccountData         EventList                 `json:"account_data"`
+	UnreadNotifications *UnreadNotificationCounts `json:"unread_notifications"`
+
+	// Per-thread notification counts (MSC3773), keyed by thread root event ID
+	UnreadThreadNotifications map[string]*UnreadNotificationCounts `json:"unread_thread_notifications,omitzero"`
 
 	Receipts          []*ReceiptWithVersion `json:"-"`
 	DeviceListChanges []id.UserID           `json:"-"`
