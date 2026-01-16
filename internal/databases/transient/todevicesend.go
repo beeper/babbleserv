@@ -37,7 +37,8 @@ type SendToDeviceOptions struct {
 	LockTxnRefresh lock.LockTxnRefreshFunc
 }
 
-func (t *TransientDatabase) SendToDeviceEvents(
+// Sends to-device events, raw meaning the DeviceIDs must be specific and not "*"
+func (t *TransientDatabase) SendRawToDeviceEvents(
 	ctx context.Context,
 	tds []*types.ToDevice,
 	options SendToDeviceOptions,

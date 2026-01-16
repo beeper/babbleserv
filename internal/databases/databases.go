@@ -22,7 +22,8 @@ import (
 )
 
 type Databases struct {
-	log zerolog.Logger
+	log    zerolog.Logger
+	config config.BabbleConfig
 
 	Rooms     *rooms.RoomsDatabase
 	Accounts  *accounts.AccountsDatabase
@@ -41,7 +42,8 @@ func NewDatabases(
 		Logger()
 
 	dbs := Databases{
-		log: log,
+		log:    log,
+		config: cfg,
 
 		System: system.NewSystemDatabase(cfg, log),
 	}
