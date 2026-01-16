@@ -38,14 +38,12 @@ type BabbleConfig struct {
 	SigningKeyRefreshInterval time.Duration        `yaml:"signingKeyRefreshInterval"`
 
 	Rooms struct {
-		Enabled        bool           `yaml:"enabled"`
 		Database       databaseConfig `yaml:"database"`
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
 	} `yaml:"rooms"`
 
 	Accounts struct {
-		Enabled  bool           `yaml:"enabled"`
 		Database databaseConfig `yaml:"database"`
 		Notifier NotifierConfig `yaml:"notifier"`
 
@@ -59,7 +57,6 @@ type BabbleConfig struct {
 	} `yaml:"accounts"`
 
 	Transient struct {
-		Enabled  bool           `yaml:"enabled"`
 		Database databaseConfig `yaml:"database"`
 		Notifier NotifierConfig `yaml:"notifier"`
 
