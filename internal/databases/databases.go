@@ -48,15 +48,10 @@ func NewDatabases(
 		System: system.NewSystemDatabase(cfg, log),
 	}
 
-	if cfg.Rooms.Enabled {
-		dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers.Rooms)
-	}
-	if cfg.Accounts.Enabled {
-		dbs.Accounts = accounts.NewAccountsDatabase(cfg, log, notifiers.Accounts)
-	}
-	if cfg.Transient.Enabled {
-		dbs.Transient = transient.NewTransientDatabase(cfg, log, notifiers.Transient)
-	}
+	dbs.Rooms = rooms.NewRoomsDatabase(cfg, log, notifiers.Rooms)
+	dbs.Accounts = accounts.NewAccountsDatabase(cfg, log, notifiers.Accounts)
+	dbs.Transient = transient.NewTransientDatabase(cfg, log, notifiers.Transient)
+
 	if cfg.Media.Enabled {
 		dbs.Media = media.NewMediaDatabase(cfg, log)
 	}
