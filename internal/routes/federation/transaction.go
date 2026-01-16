@@ -237,7 +237,7 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 					}
 				}
 
-				_, err := f.db.Transient.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{})
+				_, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{})
 				if err != nil {
 					panic(err)
 				}

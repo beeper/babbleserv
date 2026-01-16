@@ -438,7 +438,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 				Content: exerrors.Must(json.Marshal(ev)),
 			}
 
-			_, err := c.db.Transient.SendToDeviceEvents(r.Context(), []*types.ToDevice{td}, transient.SendToDeviceOptions{})
+			_, err := c.db.SendToDeviceEvents(r.Context(), []*types.ToDevice{td}, transient.SendToDeviceOptions{})
 			if err != nil {
 				hlog.FromRequest(r).Err(err).
 					Msg("Failed to send federated leave event over to-device to nonjoined server")
