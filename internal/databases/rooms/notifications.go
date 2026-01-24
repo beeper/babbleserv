@@ -2,34 +2,73 @@ package rooms
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/pushrules"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms/events"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// evaluateNotificationsForEvent evaluates (stubbed) push rules for an event against a target user.
+// evaluateNotificationsForEvent evaluates push rules for an event against a target user.
 // Returns notification deltas for this event.
 //
-// Currently stubbed to:
+// If a push ruleset is provided, it uses the ruleset to determine actions.
+// Falls back to default behavior if ruleset is nil:
 // - Count +1 notification for every message event from someone other than the target user
 // - Count +1 highlight for @mentions of the target user in the message body
-func evaluateNotificationsForEvent(ev *types.Event, targetUserID id.UserID, threadID string) types.Notifications {
+func evaluateNotificationsForEvent(
+	ev *types.Event,
+	targetUserID id.UserID,
+	threadID string,
+	ruleset *pushrules.PushRuleset,
+	roomCtx *types.PushRuleRoom,
+) types.Notifications {
+	// Always ignore our own messages
+	if ev.Sender == targetUserID {
+		return types.Notifications{}
+	}
+
+	// If we have a ruleset, use push rules evaluation
+	if ruleset != nil {
+		// Convert to mautrix event for push rules
+		mautrixEvt := &event.Event{
+			Type:      ev.Type,
+			StateKey:  ev.StateKey,
+			Sender:    ev.Sender,
+			RoomID:    ev.RoomID,
+			ID:        ev.ID,
+			Timestamp: ev.Timestamp,
+			Content:   event.Content{VeryRaw: ev.Content},
+		}
+
+		// Ensure .Raw is populated as is needed for push rule eval
+		json.Unmarshal(ev.Content, &mautrixEvt.Content.Raw)
+
+		actions := ruleset.GetActions(roomCtx, mautrixEvt)
+		should := actions.Should()
+		if !should.Notify {
+			return types.Notifications{}
+		}
+
+		notif := types.Notifications{Count: 1, ThreadID: threadID}
+		if should.Highlight {
+			notif.Highlight = 1
+		}
+		return notif
+	}
+
+	// Fallback to default behavior if no ruleset
 	switch ev.Type {
 	case event.EventMessage, event.EventEncrypted:
 		// Only count as notification for m.room.message & m.room.encrypted
 	default:
-		return types.Notifications{}
-	}
-
-	if ev.Sender == targetUserID {
-		// Ignore ourselves
 		return types.Notifications{}
 	}
 
@@ -51,7 +90,8 @@ func txnEvaluateNotificationsForEvents(
 	txn fdb.ReadTransaction,
 	eventsProvider *events.TxnEventsProvider,
 	evs []*types.Event,
-	localUsers []id.UserID,
+	userPushRules map[id.UserID]*pushrules.PushRuleset,
+	userRoomContext map[id.UserID]*types.PushRuleRoom,
 ) map[id.EventID]map[id.UserID]types.Notifications {
 	result := make(map[id.EventID]map[id.UserID]types.Notifications, len(evs))
 
@@ -64,9 +104,9 @@ func txnEvaluateNotificationsForEvents(
 		// Determine the thread root ID for this event
 		threadID := getThreadRootID(eventsProvider, ev)
 
-		userNotifs := make(map[id.UserID]types.Notifications, len(localUsers))
-		for _, userID := range localUsers {
-			notif := evaluateNotificationsForEvent(ev, userID, threadID)
+		userNotifs := make(map[id.UserID]types.Notifications, len(userPushRules))
+		for userID, ruleset := range userPushRules {
+			notif := evaluateNotificationsForEvent(ev, userID, threadID, ruleset, userRoomContext[userID])
 			if !notif.IsEmpty() {
 				userNotifs[userID] = notif
 			}

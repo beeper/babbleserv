@@ -216,7 +216,7 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 			return
 		}
 	} else {
-		if res, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, rooms.SendFederatedEventsOptions{}); err != nil {
+		if res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, rooms.SendFederatedEventsOptions{}); err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
 		} else if len(res.Rejected) > 0 {

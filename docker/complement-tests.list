@@ -13,6 +13,8 @@ TestKeysQueryWithDeviceIDAsObjectFails
 TestNotPresentUserCannotBanOthers
 TestPresence
 TestPresenceSyncDifferentRooms
+TestPushRuleCacheHealth
+TestPushSync
 TestRoomAlias
 TestRoomCreate
 TestRoomReceipts

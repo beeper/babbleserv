@@ -141,6 +141,15 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 	rtr.MethodFunc(http.MethodGet, "/v3/pushrules", middleware.RequireUserAuth(c.GetPushRules))
 	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/", middleware.RequireUserAuth(c.GetPushRulesByKind))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.GetPushRule))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.PutPushRule))
+	rtr.MethodFunc(http.MethodDelete, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.DeletePushRule))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}/enabled", middleware.RequireUserAuth(c.GetPushRuleEnabled))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}/enabled", middleware.RequireUserAuth(c.SetPushRuleEnabled))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.GetPushRuleActions))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.SetPushRuleActions))
 
 	// Global account data
 	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
