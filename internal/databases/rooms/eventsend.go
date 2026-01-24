@@ -35,6 +35,8 @@ func (r *RoomsDatabase) SendLocalEvents(
 	ctx context.Context,
 	roomID id.RoomID,
 	partialEvs []*types.PartialEvent,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
 	options SendLocalEventsOptions,
 ) (*SendEventsResult, error) {
 	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
@@ -62,8 +64,9 @@ func (r *RoomsDatabase) SendLocalEvents(
 		}
 
 		// Get local users in the room and evaluate notifications for each event
-		localUsers := r.TxnGetLocalJoinedUsersInRoom(txn, roomID)
-		eventNotifications := txnEvaluateNotificationsForEvents(txn, eventsProvider, allowedEvs, localUsers)
+		eventNotifications := txnEvaluateNotificationsForEvents(
+			txn, eventsProvider, allowedEvs, userPushRules, userRoomContext,
+		)
 
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)
@@ -312,6 +315,8 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	ctx context.Context,
 	roomID id.RoomID,
 	evs []*types.Event,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
 	options SendFederatedEventsOptions,
 ) (*SendEventsResult, error) {
 	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
@@ -650,9 +655,10 @@ func (r *RoomsDatabase) SendFederatedEvents(
 			evLog.Debug().Msg("Event authorized for storage")
 		}
 
-		// Get local users in the room and evaluate notifications for each event
-		localUsers := r.TxnGetLocalJoinedUsersInRoom(txn, roomID)
-		eventNotifications := txnEvaluateNotificationsForEvents(txn, eventsProvider, evs, localUsers)
+		// Note: federated events use fallback notification evaluation (no push rules)
+		eventNotifications := txnEvaluateNotificationsForEvents(
+			txn, eventsProvider, evs, userPushRules, userRoomContext,
+		)
 
 		changedUsers := make(map[id.UserID]struct{}, 1)
 		changedServers := make(map[string]struct{}, 1)

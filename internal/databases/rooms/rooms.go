@@ -14,7 +14,6 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/config"
@@ -195,24 +194,4 @@ func (r *RoomsDatabase) RangeForIDAliases(roomID id.RoomID) fdb.Range {
 func (r *RoomsDatabase) IDAliasKeyToRoomAlias(key fdb.Key) id.RoomAlias {
 	tup, _ := r.idAliases.Unpack(key)
 	return id.RoomAlias(tup[1].(string))
-}
-
-// GetLocalJoinedUsersInRoom returns all local users who are currently joined to the room.
-func (r *RoomsDatabase) GetLocalJoinedUsersInRoom(ctx context.Context, roomID id.RoomID) ([]id.UserID, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]id.UserID, error) {
-		return r.TxnGetLocalJoinedUsersInRoom(txn, roomID), nil
-	})
-}
-
-// TxnGetLocalJoinedUsersInRoom returns all local users who are currently joined to the room.
-func (r *RoomsDatabase) TxnGetLocalJoinedUsersInRoom(txn fdb.ReadTransaction, roomID id.RoomID) []id.UserID {
-	memberships := r.events.TxnLookupCurrentRoomMemberships(txn, roomID, nil)
-	localUsers := make([]id.UserID, 0, len(memberships))
-	for userID, membershipTup := range memberships {
-		// Only include joined users from our server
-		if membershipTup.Membership == event.MembershipJoin && userID.Homeserver() == r.config.ServerName {
-			localUsers = append(localUsers, userID)
-		}
-	}
-	return localUsers
 }

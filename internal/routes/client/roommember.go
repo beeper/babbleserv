@@ -250,7 +250,7 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 
 		util.SortEventList(allEvs)
 
-		if _, err = c.db.Rooms.SendFederatedEvents(
+		if _, err = c.db.SendFederatedEvents(
 			backgroundCtx, roomID, allEvs,
 			rooms.SendFederatedEventsOptions{
 				// We're joining *now* and won't have all prev event history, ultimately we have

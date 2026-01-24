@@ -9,6 +9,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/pushrules"
 )
 
 // Sync request
@@ -112,8 +113,16 @@ func NewSync(
 	rooms map[MembershipTup]*SyncRoom,
 	accounts map[AccountDataTup]map[string]any,
 	toDevice []*ToDeviceWithVersion,
+	pushRules *pushrules.PushRuleset,
 ) *Sync {
 	sync := &Sync{}
+
+	// If push rules changed, add them as m.push_rules global account data
+	if pushRules != nil {
+		accounts[AccountDataTup{Type: event.AccountDataPushRules}] = map[string]any{
+			"global": pushRules,
+		}
+	}
 
 	if len(toDevice) > 0 {
 		// Convert internal device list to-device events into presence and device lists

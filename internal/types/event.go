@@ -73,6 +73,7 @@ type Event struct {
 	IsForClientAPI    bool               `msgpack:"-" json:"-"`
 	IsDuplicate       bool               `msgpack:"-" json:"-"`
 	IncompleteVersion tuple.Versionstamp `msgpack:"-" json:"-"`
+	PrevStateEvent    *Event             `msgpack:"-" json:"-"`
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {

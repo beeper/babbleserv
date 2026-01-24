@@ -3,7 +3,6 @@ package rooms
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
 
 	"maunium.net/go/mautrix/event"
@@ -39,7 +38,7 @@ func (r *RoomsDatabase) SendReceipts(
 	lock.Lock()
 	defer lock.Unlock()
 
-	if len(rcs) >= math.MaxUint16 {
+	if len(rcs) >= types.MaxVersionstampUserVersion {
 		// Very unlikely! But safety first
 		panic("too many rcs")
 	}

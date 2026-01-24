@@ -127,12 +127,12 @@ func (n *CompactNotificationIterator) compactNotificationsForEvents(tups []types
 
 	// For each room, get local joined users and compact their notifications
 	for roomID, upToVersion := range roomIDs {
-		userIDs, err := n.db.Rooms.GetLocalJoinedUsersInRoom(n.ctx, roomID)
+		memberships, err := n.db.Rooms.GetCurrentRoomLocalJoinedMemberships(n.ctx, roomID)
 		if err != nil {
 			return err
 		}
 
-		for _, userID := range userIDs {
+		for userID := range memberships {
 			if err := n.db.Rooms.CompactNotifications(n.ctx, userID, roomID, upToVersion); err != nil {
 				return err
 			}
