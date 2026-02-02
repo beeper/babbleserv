@@ -66,7 +66,7 @@ func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
 	if serverInRoom {
 		// We're in the room - so we can just send it directly as a federated event, we'll receive
 		// it a second time over federation txn (will be ignored as dupe).
-		res, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, []*types.Event{req.Event}, rooms.SendFederatedEventsOptions{})
+		res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{req.Event}, rooms.SendFederatedEventsOptions{})
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return

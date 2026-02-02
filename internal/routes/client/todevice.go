@@ -7,7 +7,6 @@ import (
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -42,32 +41,13 @@ func (c *ClientRoutes) SendToDevice(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for targetDeviceID, content := range devices {
-			deviceIDs := make([]id.DeviceID, 0, 1)
-
-			if targetDeviceID == "*" && targetUserHS == c.config.ServerName {
-				// If sending to a local user with "*" as the device ID, fetch all the users
-				// devices and create a to device for each.
-				userDevices, err := c.db.Accounts.GetUserDevices(r.Context(), targetUserID)
-				if err != nil {
-					util.ResponseErrorUnknownJSON(w, r, err)
-					return
-				}
-				for _, d := range userDevices {
-					deviceIDs = append(deviceIDs, d.ID)
-				}
-			} else {
-				deviceIDs = append(deviceIDs, targetDeviceID)
-			}
-
-			for _, did := range deviceIDs {
-				tds = append(tds, &types.ToDevice{
-					UserID:   targetUserID,
-					DeviceID: did,
-					Sender:   userDevice.UserID,
-					Type:     eventType,
-					Content:  content.VeryRaw,
-				})
-			}
+			tds = append(tds, &types.ToDevice{
+				UserID:   targetUserID,
+				DeviceID: targetDeviceID,
+				Sender:   userDevice.UserID,
+				Type:     eventType,
+				Content:  content.VeryRaw,
+			})
 		}
 	}
 
@@ -77,7 +57,7 @@ func (c *ClientRoutes) SendToDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := c.db.Transient.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{
+	_, err := c.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{
 		TransactionID: txnID,
 		DeviceID:      userDevice.DeviceID,
 	})

@@ -73,6 +73,7 @@ type Event struct {
 	IsForClientAPI    bool               `msgpack:"-" json:"-"`
 	IsDuplicate       bool               `msgpack:"-" json:"-"`
 	IncompleteVersion tuple.Versionstamp `msgpack:"-" json:"-"`
+	PrevStateEvent    *Event             `msgpack:"-" json:"-"`
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
@@ -282,6 +283,11 @@ func (ev *Event) IsProfileUpdate() bool {
 
 func (ev *Event) Membership() event.Membership {
 	return event.Membership(gjson.GetBytes(ev.Content, "membership").String())
+}
+
+func (ev *Event) Mentions() (m event.Mentions) {
+	json.Unmarshal([]byte(gjson.GetBytes(ev.Content, "m\\.mentions").Raw), &m)
+	return m
 }
 
 func (ev *Event) RelatesTo() (id.EventID, event.RelationType) {

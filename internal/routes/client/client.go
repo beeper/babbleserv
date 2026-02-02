@@ -66,100 +66,102 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/versions", c.GetVersions)
 	rtr.MethodFunc(http.MethodGet, "/v3/capabilities", middleware.RequireUserAuth(c.GetCapabilities))
 
-	if c.config.Rooms.Enabled && c.config.Accounts.Enabled && c.config.Transient.Enabled {
-		// Legacy (v2/3) sync witb init and increment variants and basic filters, all rooms
-		rtr.MethodFunc(http.MethodGet, "/v3/sync", middleware.RequireUserAuth(c.SyncLegacy))
-		// Simplified sliding "native" sync MSC4186, same as v2 with room filters, roughly
-		rtr.MethodFunc(http.MethodGet, "/unstable/org.matrix.simplified_msc3575/sync", middleware.RequireUserAuth(c.SyncSliding))
-		// Beeper's streaming sync, no gaps, firehose style
-		rtr.MethodFunc(http.MethodGet, "/unstable/com.beeper.streaming/sync", middleware.RequireUserAuth(c.SyncStreaming))
-	}
+	// Legacy (v2/3) sync witb init and increment variants and basic filters, all rooms
+	rtr.MethodFunc(http.MethodGet, "/v3/sync", middleware.RequireUserAuth(c.SyncLegacy))
+	// Simplified sliding "native" sync MSC4186, same as v2 with room filters, roughly
+	rtr.MethodFunc(http.MethodGet, "/unstable/org.matrix.simplified_msc3575/sync", middleware.RequireUserAuth(c.SyncSliding))
+	// Beeper's streaming sync, no gaps, firehose style
+	rtr.MethodFunc(http.MethodGet, "/unstable/com.beeper.streaming/sync", middleware.RequireUserAuth(c.SyncStreaming))
 
-	if c.config.Rooms.Enabled {
-		rtr.MethodFunc(http.MethodPost, "/v3/createRoom", middleware.RequireUserAuth(c.CreateRoom))
-		// Send events
-		rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}", middleware.RequireUserAuth(c.SendRoomStateEvent))
-		rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}/", middleware.RequireUserAuth(c.SendRoomStateEvent))
-		rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.SendRoomStateEvent))
-		rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/send/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendRoomEvent))
-		// Send membership events
-		rtr.MethodFunc(http.MethodGet, "/v3/joined_rooms", middleware.RequireUserAuth(c.GetJoinedRooms))
-		rtr.MethodFunc(http.MethodPost, "/v3/join/{roomID}", middleware.RequireUserAuth(c.SendRoomJoinAlias))
-		rtr.MethodFunc(http.MethodPost, "/v3/knock/{roomID}", middleware.RequireUserAuth(c.SendRoomKnockAlias))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/invite", middleware.RequireUserAuth(c.SendRoomInvite))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/join", middleware.RequireUserAuth(c.SendRoomJoin))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/forget", middleware.RequireUserAuth(c.ForgetRoom))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/leave", middleware.RequireUserAuth(c.SendRoomLeave))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/kick", middleware.RequireUserAuth(c.SendRoomKick))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/ban", middleware.RequireUserAuth(c.SendRoomBan))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/unban", middleware.RequireUserAuth(c.SendRoomUnban))
-		// Get events/state
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/event/{eventID}", middleware.RequireUserAuth(c.GetRoomEvent))
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}", middleware.RequireUserAuth(c.GetRoomStateEvent))
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/", middleware.RequireUserAuth(c.GetRoomStateEvent))
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.GetRoomStateEvent))
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state", middleware.RequireUserAuth(c.GetRoomState))
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/members", middleware.RequireUserAuth(c.GetRoomMembers))
+	rtr.MethodFunc(http.MethodPost, "/v3/createRoom", middleware.RequireUserAuth(c.CreateRoom))
+	// Send events
+	rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}", middleware.RequireUserAuth(c.SendRoomStateEvent))
+	rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}/", middleware.RequireUserAuth(c.SendRoomStateEvent))
+	rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.SendRoomStateEvent))
+	rtr.MethodFunc(http.MethodPut, "/v3/rooms/{roomID}/send/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendRoomEvent))
+	// Send membership events
+	rtr.MethodFunc(http.MethodGet, "/v3/joined_rooms", middleware.RequireUserAuth(c.GetJoinedRooms))
+	rtr.MethodFunc(http.MethodPost, "/v3/join/{roomID}", middleware.RequireUserAuth(c.SendRoomJoinAlias))
+	rtr.MethodFunc(http.MethodPost, "/v3/knock/{roomID}", middleware.RequireUserAuth(c.SendRoomKnockAlias))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/invite", middleware.RequireUserAuth(c.SendRoomInvite))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/join", middleware.RequireUserAuth(c.SendRoomJoin))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/forget", middleware.RequireUserAuth(c.ForgetRoom))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/leave", middleware.RequireUserAuth(c.SendRoomLeave))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/kick", middleware.RequireUserAuth(c.SendRoomKick))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/ban", middleware.RequireUserAuth(c.SendRoomBan))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/unban", middleware.RequireUserAuth(c.SendRoomUnban))
+	// Get events/state
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/event/{eventID}", middleware.RequireUserAuth(c.GetRoomEvent))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}", middleware.RequireUserAuth(c.GetRoomStateEvent))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/", middleware.RequireUserAuth(c.GetRoomStateEvent))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.GetRoomStateEvent))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state", middleware.RequireUserAuth(c.GetRoomState))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/members", middleware.RequireUserAuth(c.GetRoomMembers))
 
-		// Room aliases
-		rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/aliases", middleware.RequireUserAuth(c.GetAliasesForRoom))
-		rtr.MethodFunc(http.MethodGet, "/v3/directory/room/{roomAlias}", c.GetAlias)
-		rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
-		rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
+	// Room aliases
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/aliases", middleware.RequireUserAuth(c.GetAliasesForRoom))
+	rtr.MethodFunc(http.MethodGet, "/v3/directory/room/{roomAlias}", c.GetAlias)
+	rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
+	rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
 
-		// Receipts routes
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", middleware.RequireUserAuth(c.SendRoomReadReceipt))
-		rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/read_markers", middleware.RequireUserAuth(c.SendRoomReadMarkers))
-	}
+	// Receipts routes
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", middleware.RequireUserAuth(c.SendRoomReadReceipt))
+	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/read_markers", middleware.RequireUserAuth(c.SendRoomReadMarkers))
 
-	if c.config.Transient.Enabled {
-		// Presence routes
-		rtr.MethodFunc(http.MethodGet, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.GetPresence))
-		rtr.MethodFunc(http.MethodPut, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.PutPresence))
-	}
+	// Presence routes
+	rtr.MethodFunc(http.MethodGet, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.GetPresence))
+	rtr.MethodFunc(http.MethodPut, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.PutPresence))
 
-	if c.config.Accounts.Enabled {
-		rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
-		rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
-		rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
+	rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
+	rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
+	rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
 
-		rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
+	rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
 
-		// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
-		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
-		rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
-		rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
+	// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
+	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
+	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
+	rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
 
-		rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
-		rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
-		rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
-		rtr.MethodFunc(http.MethodDelete, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.DeleteDevice))
-		rtr.MethodFunc(http.MethodDelete, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
+	rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
+	rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
+	rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
+	rtr.MethodFunc(http.MethodDelete, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.DeleteDevice))
+	rtr.MethodFunc(http.MethodDelete, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
 
-		rtr.MethodFunc(http.MethodGet, "/v3/keys/changes", middleware.RequireUserAuth(c.GetKeyChanges))
-		rtr.MethodFunc(http.MethodPost, "/v3/keys/query", middleware.RequireUserAuth(c.QueryKeys))
-		rtr.MethodFunc(http.MethodPost, "/v3/keys/upload", middleware.RequireUserAuth(c.UploadKeys))
-		rtr.MethodFunc(http.MethodPost, "/v3/keys/claim", middleware.RequireUserAuth(c.ClaimKeys))
-		rtr.MethodFunc(http.MethodPost, "/v3/keys/signatures/upload", middleware.RequireUserAuth(c.UploadSignatures))
-		rtr.MethodFunc(http.MethodPost, "/v3/keys/device_signing/upload", middleware.RequireUserAuth(c.UploadCrossSigningKeys))
+	rtr.MethodFunc(http.MethodGet, "/v3/keys/changes", middleware.RequireUserAuth(c.GetKeyChanges))
+	rtr.MethodFunc(http.MethodPost, "/v3/keys/query", middleware.RequireUserAuth(c.QueryKeys))
+	rtr.MethodFunc(http.MethodPost, "/v3/keys/upload", middleware.RequireUserAuth(c.UploadKeys))
+	rtr.MethodFunc(http.MethodPost, "/v3/keys/claim", middleware.RequireUserAuth(c.ClaimKeys))
+	rtr.MethodFunc(http.MethodPost, "/v3/keys/signatures/upload", middleware.RequireUserAuth(c.UploadSignatures))
+	rtr.MethodFunc(http.MethodPost, "/v3/keys/device_signing/upload", middleware.RequireUserAuth(c.UploadCrossSigningKeys))
 
-		rtr.MethodFunc(http.MethodPost, "/v3/user/{userID}/filter", middleware.RequireUserAuth(c.CreateFilter))
-		rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/filter/{filterID}", middleware.RequireUserAuth(c.GetFilter))
+	rtr.MethodFunc(http.MethodPost, "/v3/user/{userID}/filter", middleware.RequireUserAuth(c.CreateFilter))
+	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/filter/{filterID}", middleware.RequireUserAuth(c.GetFilter))
 
-		rtr.MethodFunc(http.MethodGet, "/v3/pushrules", middleware.RequireUserAuth(c.GetPushRules))
-		rtr.MethodFunc(http.MethodGet, "/v3/pushrules/", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/", middleware.RequireUserAuth(c.GetPushRules))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/", middleware.RequireUserAuth(c.GetPushRulesByKind))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.GetPushRule))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.PutPushRule))
+	rtr.MethodFunc(http.MethodDelete, "/v3/pushrules/{scope}/{kind}/{ruleId}", middleware.RequireUserAuth(c.DeletePushRule))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}/enabled", middleware.RequireUserAuth(c.GetPushRuleEnabled))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}/enabled", middleware.RequireUserAuth(c.SetPushRuleEnabled))
+	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.GetPushRuleActions))
+	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.SetPushRuleActions))
 
-		// Global account data
-		rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
-		rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
-		// Room account data
-		rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
-		rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
-	}
+	rtr.MethodFunc(http.MethodGet, "/v3/pushers", middleware.RequireUserAuth(c.GetPushers))
+	rtr.MethodFunc(http.MethodPost, "/v3/pushers/set", middleware.RequireUserAuth(c.SetPusher))
 
-	if c.config.Transient.Enabled {
-		rtr.MethodFunc(http.MethodPut, "/v3/sendToDevice/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendToDevice))
-	}
+	// Global account data
+	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
+	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
+	// Room account data
+	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
+	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
+
+	rtr.MethodFunc(http.MethodPut, "/v3/sendToDevice/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendToDevice))
 
 	if c.config.Media.Enabled {
 		rtr.MethodFunc(http.MethodGet, "/v1/media/config", middleware.RequireUserAuth(c.GetMediaConfig))

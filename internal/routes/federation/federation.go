@@ -64,39 +64,31 @@ func (f *FederationRoutes) AddFederationRoutes(rtr chi.Router) {
 
 	requireServerAuth := middleware.NewServerAuthMiddleware(f.config.ServerName, f.keyStore)
 
-	if f.config.Rooms.Enabled {
-		rtr.MethodFunc(http.MethodPut, "/v1/send/{txnID}", requireServerAuth(f.SendTransaction))
+	rtr.MethodFunc(http.MethodPut, "/v1/send/{txnID}", requireServerAuth(f.SendTransaction))
 
-		rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
-		rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
-		rtr.MethodFunc(http.MethodPost, "/v1/get_missing_events/{roomID}", requireServerAuth(f.GetMissingEvents))
+	rtr.MethodFunc(http.MethodGet, "/v1/event/{eventID}", requireServerAuth(f.GetEvent))
+	rtr.MethodFunc(http.MethodGet, "/v1/event_auth/{roomID}/{eventID}", requireServerAuth(f.GetEventAuth))
+	rtr.MethodFunc(http.MethodPost, "/v1/get_missing_events/{roomID}", requireServerAuth(f.GetMissingEvents))
 
-		rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
-		rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))
+	rtr.MethodFunc(http.MethodGet, "/v1/state/{roomID}", requireServerAuth(f.GetState))
+	rtr.MethodFunc(http.MethodGet, "/v1/state_ids/{roomID}", requireServerAuth(f.GetStateIDs))
 
-		rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
+	rtr.MethodFunc(http.MethodPut, "/v2/invite/{roomID}/{eventID}", requireServerAuth(f.SignInvite))
 
-		rtr.MethodFunc(http.MethodGet, "/v1/make_join/{roomID}/{userID}", requireServerAuth(f.MakeJoin))
-		rtr.MethodFunc(http.MethodGet, "/v1/make_leave/{roomID}/{userID}", requireServerAuth(f.MakeLeave))
-		rtr.MethodFunc(http.MethodGet, "/v1/make_knock/{roomID}/{userID}", requireServerAuth(f.MakeKnock))
+	rtr.MethodFunc(http.MethodGet, "/v1/make_join/{roomID}/{userID}", requireServerAuth(f.MakeJoin))
+	rtr.MethodFunc(http.MethodGet, "/v1/make_leave/{roomID}/{userID}", requireServerAuth(f.MakeLeave))
+	rtr.MethodFunc(http.MethodGet, "/v1/make_knock/{roomID}/{userID}", requireServerAuth(f.MakeKnock))
 
-		rtr.MethodFunc(http.MethodPut, "/v2/send_join/{roomID}/{eventID}", requireServerAuth(f.SendJoin))
-		rtr.MethodFunc(http.MethodPut, "/v2/send_leave/{roomID}/{eventID}", requireServerAuth(f.SendLeave))
-		rtr.MethodFunc(http.MethodPut, "/v1/send_knock/{roomID}/{eventID}", requireServerAuth(f.SendKnock))
-	}
+	rtr.MethodFunc(http.MethodPut, "/v2/send_join/{roomID}/{eventID}", requireServerAuth(f.SendJoin))
+	rtr.MethodFunc(http.MethodPut, "/v2/send_leave/{roomID}/{eventID}", requireServerAuth(f.SendLeave))
+	rtr.MethodFunc(http.MethodPut, "/v1/send_knock/{roomID}/{eventID}", requireServerAuth(f.SendKnock))
 
-	if f.config.Accounts.Enabled {
-		rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
+	rtr.MethodFunc(http.MethodGet, "/v1/user/devices/{userID}", requireServerAuth(f.GetUserDevices))
 
-		rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
+	rtr.MethodFunc(http.MethodGet, "/v1/query/profile", requireServerAuth(f.QueryProfile))
 
-		rtr.MethodFunc(http.MethodPost, "/v1/user/keys/query", requireServerAuth(f.QueryUserKeys))
-		rtr.MethodFunc(http.MethodPost, "/v1/user/keys/claim", requireServerAuth(f.ClaimUserKeys))
-	}
-
-	if f.config.Transient.Enabled {
-
-	}
+	rtr.MethodFunc(http.MethodPost, "/v1/user/keys/query", requireServerAuth(f.QueryUserKeys))
+	rtr.MethodFunc(http.MethodPost, "/v1/user/keys/claim", requireServerAuth(f.ClaimUserKeys))
 
 	if f.config.Media.Enabled {
 		rtr.MethodFunc(http.MethodGet, "/v1/media/download/{mediaID}", requireServerAuth(f.DownloadMedia))
