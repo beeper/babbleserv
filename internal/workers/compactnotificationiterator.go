@@ -63,7 +63,7 @@ func (n *CompactNotificationIterator) handleNotificationsLoop(lock lock.Lock) {
 			lock.Release()
 			return
 		case change := <-newEventsCh:
-			n.unlockedHandleChange(lock, change.(notifier.Change))
+			n.unlockedHandleChange(lock, change)
 		case roomID := <-n.timedOutRooms:
 			n.log.Debug().
 				Stringer("room_id", roomID).
