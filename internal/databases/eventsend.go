@@ -5,6 +5,8 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
+	"github.com/rs/zerolog"
+
 	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/types"
 )
@@ -61,18 +63,26 @@ func (d *Databases) sendEventsFunc(
 	userRoomContext := make(types.UserRoomContextMap, len(memberships))
 
 	for userID := range memberships {
-		// TODO: GetRulesForUsers
+		// TODO: GetRulesForUsers in parallel
 		ruleset, err := d.Accounts.GetPushRulesForUser(ctx, userID)
 		if err != nil {
-			// Log but continue - we'll use fallback notification behavior for this user
-			continue
+			return nil, err
 		}
+
+		context := &types.PushRuleRoom{
+			MemberCount:    memberCount,
+			OwnDisplayname: userID.String(),
+		}
+
+		// TODO: GetProfilesForUsers in parallel
+		if profile, err := d.Accounts.GetUserProfile(ctx, userID); err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to get user profile, falling back to userID")
+		} else if profile != nil && profile.DisplayName != "" {
+			context.OwnDisplayname = profile.DisplayName
+		}
+
 		userPushRules[userID] = ruleset
-		userRoomContext[userID] = &types.PushRuleRoom{
-			MemberCount: memberCount,
-			// TODO: use GetSpecificMemberEventsForRoom
-			OwnDisplayname: "", // Can be enhanced later to fetch user's displayname
-		}
+		userRoomContext[userID] = context
 	}
 
 	return fn(userPushRules, userRoomContext)

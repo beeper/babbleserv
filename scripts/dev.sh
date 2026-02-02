@@ -5,7 +5,7 @@ if [ $(uname -s) = "Darwin" ]; then
     export DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib
 fi
 
-CMD="gow"
+CMD="gow -e go,sql,yaml"
 if [ -n "${ONESHOT}" ]; then
     CMD="go"
 fi

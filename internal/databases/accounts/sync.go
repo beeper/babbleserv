@@ -52,7 +52,7 @@ func (a *AccountsDatabase) SyncAccountsForuser(
 			fetchRules = true
 		} else {
 			pushVersion := a.pushrules.TxnGetUserPushVersion(txn, userID)
-			if pushVersion == types.ZeroVersionstamp || (types.VersionIsAfter(pushVersion, fromVersion) && types.VersionIsAtOrBefore(pushVersion, latestVersion)) {
+			if types.VersionIsAfter(pushVersion, fromVersion) && types.VersionIsAtOrBefore(pushVersion, latestVersion) {
 				fetchRules = true
 			}
 		}

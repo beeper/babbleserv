@@ -36,13 +36,13 @@ func NewWorkers(
 		// Federation sender per remote homeserver
 		NewFederationSender(log, cfg, db, notifiers, fclient),
 		// Compacts notification versions for users
-		// NewCompactNotificationIterator(log, cfg, db, notifiers),
+		NewCompactNotificationIterator(log, cfg, db, notifiers),
 
 		// Profile changes from accounts -> member events in rooms
 		NewProfileChangeIterator(log, cfg, db, notifiers),
 
 		// Uses push rules from accounts -> push notifications for new events
-		// NewPushNotificationIterator(log, cfg, db, notifiers),
+		NewPushNotificationIterator(log, cfg, db, notifiers),
 
 		// Device changes from accounts -> internal to-device change notifications
 		NewDeviceChangeIterator(log, cfg, db, notifiers),

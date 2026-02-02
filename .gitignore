@@ -6,3 +6,4 @@ ed25519-*
 babbleserv
 external/
 .claude/settings.local.json
+*.frpc

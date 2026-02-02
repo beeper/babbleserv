@@ -151,6 +151,9 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.GetPushRuleActions))
 	rtr.MethodFunc(http.MethodPut, "/v3/pushrules/{scope}/{kind}/{ruleId}/actions", middleware.RequireUserAuth(c.SetPushRuleActions))
 
+	rtr.MethodFunc(http.MethodGet, "/v3/pushers", middleware.RequireUserAuth(c.GetPushers))
+	rtr.MethodFunc(http.MethodPost, "/v3/pushers/set", middleware.RequireUserAuth(c.SetPusher))
+
 	// Global account data
 	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
 	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
