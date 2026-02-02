@@ -10,14 +10,13 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
 type UsersDirectory struct {
-	log    zerolog.Logger
-	db     fdb.Database
-	config config.BabbleConfig
+	log        zerolog.Logger
+	db         fdb.Database
+	serverName string
 
 	/// version -> user index
 	//
@@ -81,13 +80,19 @@ type UsersDirectory struct {
 	// key: (Username, Versionstamp)
 	// value: matruix.Filter
 	userFilters subspace.Subspace
+
+	// User push notification endpoints (pushers)
+	//
+	// key: (id.UserID, pushKey)
+	// value: pushgateway.Pusher (JSON)
+	userPushers subspace.Subspace
 }
 
 func NewUsersDirectory(
-	cfg config.BabbleConfig,
 	logger zerolog.Logger,
 	db fdb.Database,
 	parentDir directory.Directory,
+	serverName string,
 ) *UsersDirectory {
 	usersDir, err := parentDir.CreateOrOpen(db, []string{"users"}, nil)
 	if err != nil {
@@ -100,9 +105,9 @@ func NewUsersDirectory(
 		Msg("Init accounts/users directory")
 
 	return &UsersDirectory{
-		log:    log,
-		db:     db,
-		config: cfg,
+		log:        log,
+		db:         db,
+		serverName: serverName,
 
 		byVersion:            usersDir.Sub("uvr"),
 		localUsers:           usersDir.Sub("unm"),
@@ -113,6 +118,7 @@ func NewUsersDirectory(
 		userCrossSigningKeys: usersDir.Sub("uxs"),
 		userKeySignatures:    usersDir.Sub("uks"),
 		userFilters:          usersDir.Sub("ufl"),
+		userPushers:          usersDir.Sub("upk"),
 	}
 }
 
@@ -122,7 +128,7 @@ func (u *UsersDirectory) TxnGetLocalUserPasswordHash(txn fdb.ReadTransaction, us
 }
 
 func (u *UsersDirectory) keyForUser(userID id.UserID) fdb.Key {
-	if userID.Homeserver() == u.config.ServerName {
+	if userID.Homeserver() == u.serverName {
 		return u.localUsers.Pack(tuple.Tuple{userID.String()})
 	}
 	return u.remoteUsers.Pack(tuple.Tuple{userID.String()})
@@ -137,14 +143,14 @@ func (u *UsersDirectory) keyForUserVersion(version tuple.Versionstamp) fdb.Key {
 }
 
 func (u *UsersDirectory) TxnGetLocalUser(txn fdb.ReadTransaction, userID id.UserID) (*types.User, error) {
-	if userID.Homeserver() != u.config.ServerName {
+	if userID.Homeserver() != u.serverName {
 		return nil, fmt.Errorf("userid is not local: %s", userID)
 	}
 	return u.txnGetUser(txn, userID)
 }
 
 func (u *UsersDirectory) TxnGetRemoteUser(txn fdb.ReadTransaction, userID id.UserID) (*types.User, error) {
-	if userID.Homeserver() == u.config.ServerName {
+	if userID.Homeserver() == u.serverName {
 		return nil, fmt.Errorf("userid is not remote: %s", userID)
 	}
 	return u.txnGetUser(txn, userID)
@@ -163,7 +169,7 @@ func (u *UsersDirectory) txnGetUser(txn fdb.ReadTransaction, userID id.UserID) (
 func (u *UsersDirectory) TxnCreateLocalUser(txn fdb.Transaction, user *types.User, hashedPassword []byte) error {
 	userID := user.UserID()
 
-	if userID.Homeserver() != u.config.ServerName {
+	if userID.Homeserver() != u.serverName {
 		return fmt.Errorf("userid is not local: %s", userID)
 	}
 
@@ -202,7 +208,7 @@ func (u *UsersDirectory) TxnIncrementUserDeviceListVersion(txn fdb.Transaction, 
 	if err != nil {
 		return nil
 	} else if user == nil {
-		if userID.Homeserver() == u.config.ServerName {
+		if userID.Homeserver() == u.serverName {
 			return fmt.Errorf("user not found for local userid: %s", userID)
 		}
 

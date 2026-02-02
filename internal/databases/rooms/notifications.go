@@ -150,10 +150,27 @@ func getThreadRootID(eventsProvider *events.TxnEventsProvider, ev *types.Event) 
 
 // CompactNotifications compacts notification entries for a user in a room.
 // If there are 2+ entries, they are merged into a single entry with summed counts.
-func (r *RoomsDatabase) CompactNotifications(ctx context.Context, userID id.UserID, roomID id.RoomID, upToVersion tuple.Versionstamp) error {
-	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (struct{}, error) {
-		r.users.TxnCompactNotifications(txn, userID, roomID, upToVersion)
-		return struct{}{}, nil
+func (r *RoomsDatabase) CompactNotifications(ctx context.Context, userID id.UserID, roomID id.RoomID) error {
+	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (*struct{}, error) {
+		r.users.TxnCompactNotifications(txn, userID, roomID, r.config.Rooms.MaxNotificationsPerUserRoom)
+		return nil, nil
 	})
 	return err
+}
+
+// GetNotificationAtVersion gets a notification entry at an exact version.
+// Returns nil if no notification exists at that version.
+func (r *RoomsDatabase) GetNotificationAtVersion(ctx context.Context, userID id.UserID, roomID id.RoomID, version tuple.Versionstamp) (*types.Notifications, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.Notifications, error) {
+		return r.users.TxnGetNotificationAtVersion(txn, userID, roomID, version), nil
+	})
+}
+
+// SumNotifications sums all notification deltas for a user in a room.
+func (r *RoomsDatabase) SumNotifications(ctx context.Context, userID id.UserID, roomID id.RoomID, upToVersion tuple.Versionstamp) (notifCount int, highlightCount int, err error) {
+	_, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (struct{}, error) {
+		notifCount, highlightCount = r.users.TxnSumNotifications(txn, userID, roomID, upToVersion)
+		return struct{}{}, nil
+	})
+	return
 }

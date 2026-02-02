@@ -41,6 +41,18 @@ type BabbleConfig struct {
 		Database       databaseConfig `yaml:"database"`
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
+
+		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
+		// may go over this before being trimmed back down after the timeout below or sufficient
+		// traffic in the room.
+		// Default: 100
+		MaxNotificationsPerUserRoom int `yaml:"maxNotificationsPerUserRoom"`
+
+		// Timeout after which we compact a rooms notifications even if less than max notifications
+		// have been sent. This accounts for process restarts - the notification compactor stores
+		// events sent per room in memory only.
+		// Default: 3h
+		CompactRoomNotificationsTimeout time.Duration `yaml:"compactRoomNotificationsTimeout"`
 	} `yaml:"rooms"`
 
 	Accounts struct {
@@ -81,9 +93,6 @@ type BabbleConfig struct {
 	Routes struct {
 		Servers []serverConfig `yaml:"servers"`
 	} `yaml:"routes"`
-
-	Workers struct {
-	} `yaml:"workers"`
 
 	Federation struct {
 		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
@@ -154,6 +163,13 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 	if cfg.Transient.PresenceTimeoutCheckInterval == 0 {
 		cfg.Transient.PresenceTimeoutCheckInterval = time.Minute
+	}
+
+	if cfg.Rooms.MaxNotificationsPerUserRoom == 0 {
+		cfg.Rooms.MaxNotificationsPerUserRoom = 100
+	}
+	if cfg.Rooms.CompactRoomNotificationsTimeout == 0 {
+		cfg.Rooms.CompactRoomNotificationsTimeout = 3 * time.Hour
 	}
 
 	return cfg

@@ -165,77 +165,55 @@ func (u *UsersDirectory) TxnSumNotificationsByThread(
 	return mainNotifCount, mainHighlightCount, threadCounts
 }
 
-// TxnCompactNotifications reads all notification entries for a user+room,
-// and if there are 2+ entries with the same ThreadID, compacts them into a single entry.
-// Notifications with different ThreadIDs are NOT merged together.
-// Returns true if any compaction occurred.
-func (u *UsersDirectory) TxnCompactNotifications(
-	txn fdb.Transaction,
+// TxnGetNotificationAtVersion gets a notification entry at an exact version.
+// Returns nil if no notification exists at that version.
+func (u *UsersDirectory) TxnGetNotificationAtVersion(
+	txn fdb.ReadTransaction,
 	userID id.UserID,
 	roomID id.RoomID,
-	upToVersion tuple.Versionstamp,
-) bool {
-	rng := u.rangeForNotifications(userID, roomID, upToVersion)
+	version tuple.Versionstamp,
+) *types.Notifications {
+	key := u.notificationVersions.Pack(tuple.Tuple{userID.String(), roomID.String(), version})
+	b := txn.Get(key).MustGet()
+	if b == nil {
+		return nil
+	}
+	notif := types.BytesToNotifications(b)
+	return &notif
+}
+
+// Clear the oldest notifications per thread to a given limit
+func (u *UsersDirectory) TxnCompactNotifications(txn fdb.Transaction, userID id.UserID, roomID id.RoomID, limitPerThread int) int {
+	rng := u.rangeForNotifications(userID, roomID, types.ZeroVersionstamp)
 	iter := txn.GetRange(rng, fdb.RangeOptions{
 		Mode: fdb.StreamingModeWantAll,
 	}).Iterator()
 
-	// Group entries by ThreadID
-	type entryWithVersion struct {
-		kv      fdb.KeyValue
-		version tuple.Versionstamp
-	}
-	byThread := make(map[string][]entryWithVersion)
+	// Generate thread ID -> ordered list of notifications
+	byThread := make(map[string][]fdb.KeyValue)
 
 	for iter.Advance() {
 		kv := iter.MustGet()
 		notif := types.BytesToNotifications(kv.Value)
 
-		// Extract versionstamp from key
-		tup, err := u.notificationVersions.Unpack(kv.Key)
-		if err != nil {
-			panic(err)
+		if _, ok := byThread[notif.ThreadID]; !ok {
+			byThread[notif.ThreadID] = make([]fdb.KeyValue, 0, 1)
 		}
-		version := tup[2].(tuple.Versionstamp)
-
-		byThread[notif.ThreadID] = append(byThread[notif.ThreadID], entryWithVersion{kv, version})
+		byThread[notif.ThreadID] = append(byThread[notif.ThreadID], kv)
 	}
 
-	var compacted bool
-	for threadID, entries := range byThread {
-		// Nothing to compact if 0 or 1 entries for this thread
-		if len(entries) < 2 {
+	var deleted int
+	for _, keys := range byThread {
+		// We need to clear the first N to keep the total as configured
+		toDelete := len(keys) - limitPerThread
+		if toDelete < 1 {
 			continue
 		}
-
-		// Sum all notification counts and find the latest versionstamp for this thread
-		var totalNotif types.Notifications
-		totalNotif.ThreadID = threadID
-		var latestVersion tuple.Versionstamp
-
-		for _, entry := range entries {
-			notif := types.BytesToNotifications(entry.kv.Value)
-			totalNotif.Count += notif.Count
-			totalNotif.Highlight += notif.Highlight
-
-			if types.VersionIsAfter(entry.version, latestVersion) {
-				latestVersion = entry.version
-			}
+		for _, kv := range keys[:toDelete] {
+			txn.Clear(kv.Key)
 		}
-
-		// Clear all entries for this thread
-		for _, entry := range entries {
-			txn.Clear(entry.kv.Key)
-		}
-
-		// Write single compacted entry at the latest versionstamp
-		txn.Set(
-			u.keyForNotificationVersion(userID, roomID, latestVersion),
-			types.NotificationsToBytes(totalNotif),
-		)
-
-		compacted = true
+		deleted += toDelete
 	}
 
-	return compacted
+	return deleted
 }

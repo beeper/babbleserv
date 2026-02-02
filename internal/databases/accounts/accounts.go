@@ -67,7 +67,7 @@ func NewAccountsDatabase(
 		config:   cfg,
 		notifier: notifier,
 
-		users:       users.NewUsersDirectory(cfg, log, db, accountsDir),
+		users:       users.NewUsersDirectory(log, db, accountsDir, cfg.ServerName),
 		tokens:      tokens.NewTokensDirectory(log, db, accountsDir),
 		devices:     devices.NewDevicesDirectory(log, db, accountsDir),
 		accountdata: accountdata.NewAccountDataDirectory(log, db, accountsDir),

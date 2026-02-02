@@ -21,15 +21,22 @@ Ingesting federated events is a good example of this - all the network fetching 
 
 ## Module Layout
 
+Babbleserv is roughly divided in three:
+
+- databases talk to FoundationDB, no access to network/federation, implements Matrix spec on top of the databases (event auth, state res) using FDB transactions
+- routes implement the client/federation Matrix APIs, pre-fetch anything before passing to relevant database call
+- workers handle asynchronous tasks after database changes (federation outgoing, profile updates, presence, push notifications)
+
 ### `internal/databases/*/`
 
 - each represents a FDB cluster containing a logical group of sub-databases
 - top level database transactions called by routes
 - call through to the domain specific directories nested modules
+- each database lives under a key prefix
 
 #### `internal/databases/*/*/`
 
-- individual database "directories" (FDB thing)
+- individual database "directories" (key prefix)
 - group together common key prefix operations (ie events, users)
 - not exported/available outside of database
 
