@@ -30,7 +30,7 @@ type Subscription struct {
 type subscription struct {
 	Subscription
 	// The callback channel to send results to - we key subscriptions by this
-	channel chan any
+	channel chan Change
 }
 
 // A change represents one or more changes to entities
@@ -42,6 +42,13 @@ type Change struct {
 	RoomIDs  []id.RoomID  `msgpack:"r,omitempty"`
 	UserIDs  []id.UserID  `msgpack:"u,omitempty"`
 	Servers  []string     `msgpack:"s,omitempty"`
+}
+
+func (c Change) IsEmpty() bool {
+	return len(c.EventIDs) == 0 &&
+		len(c.RoomIDs) == 0 &&
+		len(c.UserIDs) == 0 &&
+		len(c.Servers) == 0
 }
 
 func (c Change) MarshalZerologObject(ev *zerolog.Event) {
@@ -75,21 +82,21 @@ type Notifier struct {
 
 	// Subscribe/unsubscribe channels
 	subscribeCh   chan subscription
-	unsubscribeCh chan chan any
+	unsubscribeCh chan chan Change
 	// Send change channels
-	userChangeCh   chan id.UserID
-	roomChangeCh   chan id.RoomID
-	eventsChangeCh chan id.EventID
-	serverChangeCh chan string
+	userChangeCh   chan Change
+	roomChangeCh   chan Change
+	eventsChangeCh chan Change
+	serverChangeCh chan Change
 	// Map channels to subscriptions
-	chanToSubscription map[chan any]subscription
+	chanToSubscription map[chan Change]subscription
 	// Map user/room/event IDs to channels
-	userIDToChan map[id.UserID]map[chan any]struct{}
-	roomIDToChan map[id.RoomID]map[chan any]struct{}
+	userIDToChan map[id.UserID]map[chan Change]struct{}
+	roomIDToChan map[id.RoomID]map[chan Change]struct{}
 	// Map channels for all event/server subscribers
-	eventChs  map[chan any]struct{}
-	serverChs map[chan any]struct{}
-	userChs   map[chan any]struct{}
+	eventChs  map[chan Change]struct{}
+	serverChs map[chan Change]struct{}
+	userChs   map[chan Change]struct{}
 }
 
 func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) *Notifier {
@@ -115,18 +122,18 @@ func NewNotifier(name string, cfg config.NotifierConfig, logger zerolog.Logger) 
 		instanceID:   instanceID,
 
 		subscribeCh:    make(chan subscription),
-		unsubscribeCh:  make(chan chan any),
-		userChangeCh:   make(chan id.UserID),
-		roomChangeCh:   make(chan id.RoomID),
-		eventsChangeCh: make(chan id.EventID),
-		serverChangeCh: make(chan string),
+		unsubscribeCh:  make(chan chan Change),
+		userChangeCh:   make(chan Change),
+		roomChangeCh:   make(chan Change),
+		eventsChangeCh: make(chan Change),
+		serverChangeCh: make(chan Change),
 
-		chanToSubscription: make(map[chan any]subscription),
-		userIDToChan:       make(map[id.UserID]map[chan any]struct{}),
-		roomIDToChan:       make(map[id.RoomID]map[chan any]struct{}),
-		eventChs:           make(map[chan any]struct{}),
-		serverChs:          make(map[chan any]struct{}),
-		userChs:            make(map[chan any]struct{}),
+		chanToSubscription: make(map[chan Change]subscription),
+		userIDToChan:       make(map[id.UserID]map[chan Change]struct{}),
+		roomIDToChan:       make(map[id.RoomID]map[chan Change]struct{}),
+		eventChs:           make(map[chan Change]struct{}),
+		serverChs:          make(map[chan Change]struct{}),
+		userChs:            make(map[chan Change]struct{}),
 	}
 }
 
@@ -163,16 +170,19 @@ func (n *Notifier) Stop() {
 // Subscribe for notifier changes, which will be sent to the channel provided,
 // delivery is not guaranteed if the channel is blocked as the notifier cannot
 // wait for any downstream work.
-func (n *Notifier) subscribe(ch chan any, req Subscription) {
+func (n *Notifier) subscribe(ch chan Change, req Subscription) {
 	n.log.Trace().Any("subscription", req).Msg("Subscribe")
 	n.subscribeCh <- subscription{req, ch}
 }
 
-func (n *Notifier) unsubscribe(ch chan any) {
+func (n *Notifier) unsubscribe(ch chan Change) {
 	n.unsubscribeCh <- ch
 }
 
 func (n *Notifier) SendChange(change Change) {
+	if change.IsEmpty() {
+		return
+	}
 	n.log.Trace().Any("change", change).Msg("Sending change")
 	n.sendInternalChange(change)
 	// Fire of the Redis change asynchronously, as pubsub is best-effort + unordered
@@ -182,17 +192,17 @@ func (n *Notifier) SendChange(change Change) {
 }
 
 func (n *Notifier) sendInternalChange(change Change) {
-	for _, evID := range change.EventIDs {
-		n.eventsChangeCh <- evID
+	if len(change.EventIDs) > 0 {
+		n.eventsChangeCh <- change
 	}
-	for _, roomID := range change.RoomIDs {
-		n.roomChangeCh <- roomID
+	if len(change.RoomIDs) > 0 {
+		n.roomChangeCh <- change
 	}
-	for _, userID := range change.UserIDs {
-		n.userChangeCh <- userID
+	if len(change.UserIDs) > 0 {
+		n.userChangeCh <- change
 	}
-	for _, server := range change.Servers {
-		n.serverChangeCh <- server
+	if len(change.Servers) > 0 {
+		n.serverChangeCh <- change
 	}
 }
 
@@ -236,29 +246,33 @@ func (n *Notifier) internalLoop(ctx context.Context) {
 		case ch := <-n.unsubscribeCh:
 			n.unlockedUnusbscribe(ch)
 		// Handle subscriptions
-		case eventID := <-n.eventsChangeCh:
+		case change := <-n.eventsChangeCh:
 			// All event subscribers
-			n.unlockedSendChanges(n.eventChs, eventID)
-		case server := <-n.serverChangeCh:
+			n.unlockedSendChanges(n.eventChs, change)
+		case change := <-n.serverChangeCh:
 			// All server subscribers
-			n.unlockedSendChanges(n.serverChs, server)
-		case userID := <-n.userChangeCh:
+			n.unlockedSendChanges(n.serverChs, change)
+		case change := <-n.userChangeCh:
 			// All user subscribers
-			n.unlockedSendChanges(n.userChs, userID)
+			n.unlockedSendChanges(n.userChs, change)
 			// Per-user subscribers
-			if chs, found := n.userIDToChan[userID]; found {
-				n.unlockedSendChanges(chs, userID)
+			for _, userID := range change.UserIDs {
+				if chs, found := n.userIDToChan[userID]; found {
+					n.unlockedSendChanges(chs, change)
+				}
 			}
-		case roomID := <-n.roomChangeCh:
+		case change := <-n.roomChangeCh:
 			// Per-room subscribers
-			if chs, found := n.roomIDToChan[roomID]; found {
-				n.unlockedSendChanges(chs, roomID)
+			for _, roomID := range change.RoomIDs {
+				if chs, found := n.roomIDToChan[roomID]; found {
+					n.unlockedSendChanges(chs, change)
+				}
 			}
 		}
 	}
 }
 
-func (n *Notifier) unlockedSendChanges(chs map[chan any]struct{}, item any) {
+func (n *Notifier) unlockedSendChanges(chs map[chan Change]struct{}, item Change) {
 	for ch := range chs {
 		select {
 		case ch <- item:
@@ -286,19 +300,19 @@ func (n *Notifier) unlockedSubscribe(sub subscription) {
 	// Add specific subscription channels
 	for _, userID := range sub.UserIDs {
 		if _, found := n.userIDToChan[userID]; !found {
-			n.userIDToChan[userID] = make(map[chan any]struct{})
+			n.userIDToChan[userID] = make(map[chan Change]struct{})
 		}
 		n.userIDToChan[userID][sub.channel] = struct{}{}
 	}
 	for _, roomID := range sub.RoomIDs {
 		if _, found := n.roomIDToChan[roomID]; !found {
-			n.roomIDToChan[roomID] = make(map[chan any]struct{})
+			n.roomIDToChan[roomID] = make(map[chan Change]struct{})
 		}
 		n.roomIDToChan[roomID][sub.channel] = struct{}{}
 	}
 }
 
-func (n *Notifier) unlockedUnusbscribe(ch chan any) {
+func (n *Notifier) unlockedUnusbscribe(ch chan Change) {
 	sub, found := n.chanToSubscription[ch]
 	if !found {
 		n.log.Warn().Msg("Unsubscribe using non-existent channel")
