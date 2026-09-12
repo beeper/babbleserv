@@ -54,6 +54,14 @@ func MustVersionstampToString(version tuple.Versionstamp) string {
 	}
 }
 
+func StringToVersionstamp(s string) (tuple.Versionstamp, error) {
+	b, err := base32.HexEncoding.WithPadding(base32.NoPadding).DecodeString(s)
+	if err != nil {
+		return ZeroVersionstamp, err
+	}
+	return BytesToVersionstamp(b)
+}
+
 func VersionstampToBytes(version tuple.Versionstamp) ([]byte, error) {
 	if IsIncompleteVersionstamp(version) {
 		// Note that this seems to result in bytes that unpack to 4 tuple values (v, nil, nil, nil)

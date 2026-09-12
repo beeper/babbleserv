@@ -44,7 +44,7 @@ func MustNewDeviceFromBytes(b []byte) *Device {
 	}
 }
 
-func (d *Device) ToMsgpack() []byte {
+func (d *Device) ToBytes() []byte {
 	if b, err := msgpack.Marshal(d); err != nil {
 		panic(err)
 	} else {

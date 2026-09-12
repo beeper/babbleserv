@@ -255,6 +255,9 @@ func (r *RoomsDatabase) txnPreProcessEventUnsigned(
 	ev.SetUnsigned("prev_content", currentEv.Content)
 	// Note: this is not referenced anywhere in the spec but synapse does it and complement tests it
 	ev.SetUnsigned("prev_sender", currentEv.Sender)
+
+	// Internal cache of the prev state event object, used when updating room below
+	ev.PrevStateEvent = currentEv
 }
 
 func (r *RoomsDatabase) updateRoomForStateEvent(room *types.Room, ev *types.Event) bool {
@@ -269,6 +272,18 @@ func (r *RoomsDatabase) updateRoomForStateEvent(room *types.Room, ev *types.Even
 	case event.StateRoomAvatar:
 		room.AvatarURL = gjson.GetBytes(ev.Content, "url").String()
 		changed = true
+	case event.StateMember:
+		if ev.Membership() == event.MembershipJoin {
+			// We're joining new if no prev or prev wasn't join
+			if ev.PrevStateEvent == nil || ev.PrevStateEvent.Membership() != event.MembershipJoin {
+				room.MemberCount++
+			}
+		} else {
+			// We're leaving if prev was join
+			if ev.PrevStateEvent != nil && ev.PrevStateEvent.Membership() == event.MembershipJoin {
+				room.MemberCount--
+			}
+		}
 	}
 
 	return changed

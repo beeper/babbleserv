@@ -23,7 +23,7 @@ func (d *Databases) SyncForUser(
 		versions[types.RoomsVersionKey] = nextRoomsVersion
 	}
 
-	nextAccountsVersion, accounts, err := d.Accounts.SyncAccountsForuser(ctx, userID, versions[types.AccountsVersionKey], options)
+	nextAccountsVersion, accounts, pushRules, err := d.Accounts.SyncAccountsForuser(ctx, userID, versions[types.AccountsVersionKey], options)
 	if err != nil {
 		return nil, err
 	} else {
@@ -37,7 +37,7 @@ func (d *Databases) SyncForUser(
 		versions[types.TransientVersionKey] = nextTransientVersion
 	}
 
-	sync := types.NewSync(rooms, accounts, toDevice)
+	sync := types.NewSync(rooms, accounts, toDevice, pushRules)
 
 	sync.NextBatch = util.VersionMapToString(versions)
 	return sync, nil

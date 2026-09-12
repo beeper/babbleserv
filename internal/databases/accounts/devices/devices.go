@@ -114,7 +114,7 @@ func (d *DevicesDirectory) TxnGetDevice(txn fdb.ReadTransaction, userID id.UserI
 }
 
 func (d *DevicesDirectory) TxnStoreDevice(txn fdb.Transaction, userID id.UserID, device *types.Device) {
-	txn.Set(d.keyForDevice(userID, device.ID), device.ToMsgpack())
+	txn.Set(d.keyForDevice(userID, device.ID), device.ToBytes())
 }
 
 func (d *DevicesDirectory) TxnGetOrCreateDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, initialDisplayName string) (*types.Device, error) {

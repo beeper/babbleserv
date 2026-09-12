@@ -19,11 +19,18 @@ func (c *ClientRoutes) SendRoomReadReceipt(w http.ResponseWriter, r *http.Reques
 	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 	receiptType := chi.URLParam(r, "receiptType")
 
+	req, respErr := util.ParseRequestJSON[mautrix.ReqSendReceipt](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
+		return
+	}
+
 	rc := types.Receipt{
 		ReceiptTup: types.ReceiptTup{
-			UserID: middleware.GetRequestUserID(r),
-			RoomID: roomID,
-			Type:   event.ReceiptType(receiptType),
+			UserID:   middleware.GetRequestUserID(r),
+			RoomID:   roomID,
+			Type:     event.ReceiptType(receiptType),
+			ThreadID: req.ThreadID,
 		},
 		EventID:   eventID,
 		Timestamp: time.Now().UTC().UnixMilli(),

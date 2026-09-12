@@ -3,6 +3,7 @@ package rooms
 import (
 	"context"
 
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -28,6 +29,19 @@ func (r *RoomsDatabase) GetCurrentRoomStateEvent(ctx context.Context, roomID id.
 func (r *RoomsDatabase) GetCurrentRoomMemberships(ctx context.Context, roomID id.RoomID) (types.RoomMemberships, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.RoomMemberships, error) {
 		return r.events.TxnLookupCurrentRoomMemberships(txn, roomID, nil), nil
+	})
+}
+
+func (r *RoomsDatabase) GetCurrentRoomLocalJoinedMemberships(ctx context.Context, roomID id.RoomID) (types.RoomMemberships, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.RoomMemberships, error) {
+		memberships := r.events.TxnLookupCurrentRoomMemberships(txn, roomID, nil)
+		localMemberships := make(types.RoomMemberships, len(memberships))
+		for userID, mTup := range memberships {
+			if userID.Homeserver() == r.config.ServerName && mTup.Membership == event.MembershipJoin {
+				localMemberships[userID] = mTup
+			}
+		}
+		return localMemberships, nil
 	})
 }
 

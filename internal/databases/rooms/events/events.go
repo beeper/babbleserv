@@ -440,11 +440,5 @@ func (e *EventsDirectory) KeyForRoomReaction(roomID id.RoomID, relEvID id.EventI
 }
 
 func (e *EventsDirectory) KeyForRoomThread(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
-	if key, err := e.roomThreadVersionToID.PackWithVersionstamp(tuple.Tuple{
-		roomID.String(), version,
-	}); err != nil {
-		panic(err)
-	} else {
-		return key
-	}
+	return e.roomThreadVersionToID.Pack(tuple.Tuple{roomID.String(), version})
 }

@@ -5,11 +5,17 @@ Some high level flow charts describing how routes, databases and workers interac
 ## Room Events
 
 ```
+                            ┌─────────────────────────────┐  ┌──────────────────────────┐               
+                            │                             │  │                          │               
+                            │ CompactNotificationIterator │  │ PushNotificationIterator │               
+                            │                             │  │                          │               
+                            └─────────────────────────────┘  └──────────────────────────┘               
+                                                                                                        
                      ┌───────────────────┐     ┌──────────────────────────┐                             
                      │                   │     │                          │                             
       ┌─────────────►│ FederationRoutes  ├────►│  RoomsDatabase           │◄────────────────┐           
       │              │                   │     │   - SendLocalEvents      │                 │           
-      │              └───────────────────┘     │   - SendFederatedEvents  │             send events        
+      │              └───────────────────┘     │   - SendFederatedEvents  │             send events     
       │                                        │                          │                 │           
       │                                        └───────────┬──────────────┘                 │           
       │                                                    │                                │           
@@ -23,7 +29,7 @@ Federation Transaction PDUs                     │                        │  
                                                 │                        │        └────────────────────┘
 Federation outgoing events ◄────────────────────┤    FederationSender    │                              
                                                 │      (per server)      │                              
-                                                └────────────────────────┘                              
+                                                └────────────────────────┘                                                 
 ```
 
 ## Key & device management (user xs keys, device list updates)
@@ -37,20 +43,20 @@ Federation outgoing events ◄────────────────�
                               │                                      │                 user send events 
                      ┌────────┼──────────┐  ┌───────────────────┐    │                             │    
                      │                   │  │                   │    │                             │    
-      ┌─────────────►│ FederationRoutes  ├─►│ AccountsDatabase  │◄───┼───────────────┐             │    
-      │              │                   │  │                   │    │               │             │    
-      │              └───────────────────┘  └──────┬────────────┘    │           user upload keys  │    
-      │                                            │           member events         │             │    
-      │                                            │                 │               │             │    
-      │                                            │device change    │               │             │    
-      │                                            │                 │               │             │    
-Federation Transaction EDUs                        │                 │               │             │    
-                                                   │                 │               │             │    
-                                    ┌──────────────▼─────────┐ ┌─────▼──────────┐ ┌──┴─────────────┴───┐
-                                    │                        │ │                │ │                    │
-                                    │  DeviceChangeIterator  │ │ EventsIterator │ │    ClientRoutes    │
-                                    │                        │ │                │ │                    │
-Federation outgoing                 └─────────────┬──────────┘ └┬───────────────┘ └────────────────────┘
+      ┌─────────────►│ FederationRoutes  ├─►│ AccountsDatabase  │◄───┼──────────────────┐          │   
+      │              │                   │  │                   │    │                  │          │   
+      │              └───────────────────┘  └──────┬────────────┘    │           user upload keys  │   
+      │                                            │           member events            │          │     
+      │                                            │                 │                  │          │     
+      │                                            │device change    │                  │          │      
+      │                                            │                 │                  │          │      
+Federation Transaction EDUs                        │                 │                  │          │  
+                                                   │                 │                  │          │      
+                               ┌───────────────────▼────┐ ┌──────────▼─────────────┐ ┌──┴──────────┴──────┐
+                               │                        │ │                        │ │                    │
+                               │  DeviceChangeIterator  │ │DeviceJoinEventIterator │ │    ClientRoutes    │
+                               │                        │ │                        │ │                    │
+Federation outgoing            └──────────────────┬─────┘ └─────┬──────────────────┘ └────────────────────┘
     - m.device_list_update                        │             │                           ▲           
     - m.signing_key_update                        │  to-device  │                           │           
       ▲                                           │             │                           │           

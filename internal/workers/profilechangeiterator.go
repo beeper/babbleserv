@@ -168,7 +168,7 @@ func (p *ProfileChangeIterator) processProfileChange(lock lock.Lock, change type
 		)
 
 		// Send event to room
-		results, err := p.db.Rooms.SendLocalEvents(
+		results, err := p.db.SendLocalEvents(
 			p.ctx,
 			roomID,
 			[]*types.PartialEvent{partialEv},

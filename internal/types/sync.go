@@ -9,6 +9,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/pushrules"
 )
 
 // Sync request
@@ -54,6 +55,13 @@ func (o *SyncOptions) GetReceiptsLimit() int {
 		return o.Filter.Room.Ephemeral.Limit
 	}
 	return DefaultReceiptsLimit
+}
+
+func (o *SyncOptions) UseRoomThreadedNotifications() bool {
+	if o == nil || o.Filter == nil || o.Filter.Room == nil || o.Filter.Room.Timeline == nil {
+		return false
+	}
+	return o.Filter.Room.Timeline.UnreadThreadNotifications
 }
 
 func (o *SyncOptions) GetRoomFilter() *mautrix.RoomFilter {
@@ -105,8 +113,16 @@ func NewSync(
 	rooms map[MembershipTup]*SyncRoom,
 	accounts map[AccountDataTup]map[string]any,
 	toDevice []*ToDeviceWithVersion,
+	pushRules *pushrules.PushRuleset,
 ) *Sync {
 	sync := &Sync{}
+
+	// If push rules changed, add them as m.push_rules global account data
+	if pushRules != nil {
+		accounts[AccountDataTup{Type: event.AccountDataPushRules}] = map[string]any{
+			"global": pushRules,
+		}
+	}
 
 	if len(toDevice) > 0 {
 		// Convert internal device list to-device events into presence and device lists
@@ -278,12 +294,22 @@ type syncRoomKnock struct {
 	KnockState EventList `json:"knock_state"`
 }
 
+// UnreadNotificationCounts represents the unread notification counts for a room.
+type UnreadNotificationCounts struct {
+	NotificationCount int `json:"notification_count"`
+	HighlightCount    int `json:"highlight_count"`
+}
+
 type SyncRoom struct {
 	// Rooms database
-	TimelineEvents Timeline  `json:"timeline"`
-	StateEvents    EventList `json:"state"`
-	Ephemeral      EventList `json:"ephemeral"`
-	AccountData    EventList `json:"account_data"`
+	TimelineEvents      Timeline                  `json:"timeline"`
+	StateEvents         EventList                 `json:"state"`
+	Ephemeral           EventList                 `json:"ephemeral"`
+	AccountData         EventList                 `json:"account_data"`
+	UnreadNotifications *UnreadNotificationCounts `json:"unread_notifications"`
+
+	// Per-thread notification counts (MSC3773), keyed by thread root event ID
+	UnreadThreadNotifications map[string]*UnreadNotificationCounts `json:"unread_thread_notifications,omitzero"`
 
 	Receipts          []*ReceiptWithVersion `json:"-"`
 	DeviceListChanges []id.UserID           `json:"-"`

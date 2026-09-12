@@ -30,39 +30,29 @@ func NewWorkers(
 		Str("component", "workers").
 		Logger()
 
-	workers := []Worker{}
+	workers := []Worker{
+		// Wakes up relevant federation senders for new events
+		NewEventsIterator(log, cfg, db, notifiers),
+		// Federation sender per remote homeserver
+		NewFederationSender(log, cfg, db, notifiers, fclient),
+		// Compacts notification versions for users
+		NewCompactNotificationIterator(log, cfg, db, notifiers),
 
-	if cfg.Rooms.Enabled {
-		workers = append(workers,
-			// Wakes up relevant federation senders for new events
-			NewEventsIterator(log, cfg, db, notifiers),
-			// Federation sender per remote homeserver
-			NewFederationSender(log, cfg, db, notifiers, fclient),
-		)
-	}
-
-	if cfg.Accounts.Enabled && cfg.Rooms.Enabled {
 		// Profile changes from accounts -> member events in rooms
-		workers = append(workers, NewProfileChangeIterator(log, cfg, db, notifiers))
-	}
+		NewProfileChangeIterator(log, cfg, db, notifiers),
 
-	if cfg.Accounts.Enabled && cfg.Transient.Enabled {
+		// Uses push rules from accounts -> push notifications for new events
+		NewPushNotificationIterator(log, cfg, db, notifiers),
+
 		// Device changes from accounts -> internal to-device change notifications
-		workers = append(workers, NewDeviceChangeIterator(log, cfg, db, notifiers))
-	}
-
-	if cfg.Accounts.Enabled && cfg.Rooms.Enabled && cfg.Transient.Enabled {
+		NewDeviceChangeIterator(log, cfg, db, notifiers),
 		// Join events from rooms -> internal to-device change notifications (w/devices from accounts)
-		workers = append(workers, NewDeviceJoinEventIterator(log, cfg, db, notifiers))
-	}
+		NewDeviceJoinEventIterator(log, cfg, db, notifiers),
 
-	if cfg.Transient.Enabled {
-		workers = append(workers,
-			// Presence change -> internal to-device presence notifications
-			NewPresenceChangeIterator(log, cfg, db, notifiers),
-			// Presence timeouts -> presence changes
-			NewPresenceTimeoutIterator(log, cfg, db, notifiers),
-		)
+		// Presence change -> internal to-device presence notifications
+		NewPresenceChangeIterator(log, cfg, db, notifiers),
+		// Presence timeouts -> presence changes
+		NewPresenceTimeoutIterator(log, cfg, db, notifiers),
 	}
 
 	return &Workers{

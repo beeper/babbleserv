@@ -163,7 +163,7 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
+	_, err := c.db.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error sending local events: %w", err))
 		return

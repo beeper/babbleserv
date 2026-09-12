@@ -22,6 +22,13 @@ type UsersDirectory struct {
 	// key: (id.UserID, tuple.Versionstamp)
 	// value: types.MembershipTupWithVersion
 	membershipChanges subspace.Subspace
+
+	// Notification counts per event version
+	// Stored as deltas, summed for total counts, cleared on receipt
+	//
+	// key: (id.UserID, id.RoomID, tuple.Versionstamp)
+	// value: types.Notifications (msgpack)
+	notificationVersions subspace.Subspace
 }
 
 func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *UsersDirectory {
@@ -42,7 +49,8 @@ func NewUsersDirectory(logger zerolog.Logger, db fdb.Database, parentDir directo
 		// Init data model subspaces, subspace prefixes are intentionally short
 		// "When using the tuple layer to encode keys (as is recommended), select short strings or small integers for tuple elements."
 		// https://apple.github.io/foundationdb/data-modeling.html#key-and-value-sizes
-		memberships:       usersDir.Sub("mem"),
-		membershipChanges: usersDir.Sub("mch"),
+		memberships:          usersDir.Sub("mem"),
+		membershipChanges:    usersDir.Sub("mch"),
+		notificationVersions: usersDir.Sub("nv"),
 	}
 }

@@ -25,7 +25,7 @@ func (u *UsersDirectory) keyForUserFilter(username string, version tuple.Version
 }
 
 func (u *UsersDirectory) TxnGetUserFilter(txn fdb.ReadTransaction, userID id.UserID, version tuple.Versionstamp) (*mautrix.Filter, error) {
-	if userID.Homeserver() != u.config.ServerName {
+	if userID.Homeserver() != u.serverName {
 		return nil, fmt.Errorf("userid is not local: %s", userID)
 	}
 
@@ -46,7 +46,7 @@ func (u *UsersDirectory) TxnGetUserFilter(txn fdb.ReadTransaction, userID id.Use
 }
 
 func (u *UsersDirectory) TxnStoreUserFilter(txn fdb.Transaction, userID id.UserID, filter mautrix.Filter, version tuple.Versionstamp) error {
-	if userID.Homeserver() != u.config.ServerName {
+	if userID.Homeserver() != u.serverName {
 		return fmt.Errorf("userid is not local: %s", userID)
 	}
 
