@@ -12,6 +12,7 @@ import (
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases/accounts/accountdata"
 	"github.com/beeper/babbleserv/internal/databases/accounts/devices"
+	"github.com/beeper/babbleserv/internal/databases/accounts/keybackup"
 	"github.com/beeper/babbleserv/internal/databases/accounts/pushrules"
 	"github.com/beeper/babbleserv/internal/databases/accounts/tokens"
 	"github.com/beeper/babbleserv/internal/databases/accounts/users"
@@ -32,6 +33,7 @@ type AccountsDatabase struct {
 	devices     *devices.DevicesDirectory
 	accountdata *accountdata.AccountDataDirectory
 	pushrules   *pushrules.PushRulesDirectory
+	keybackup   *keybackup.KeyBackupDirectory
 }
 
 func NewAccountsDatabase(
@@ -72,6 +74,7 @@ func NewAccountsDatabase(
 		devices:     devices.NewDevicesDirectory(log, db, accountsDir),
 		accountdata: accountdata.NewAccountDataDirectory(log, db, accountsDir),
 		pushrules:   pushrules.NewPushRulesDirectory(log, db, accountsDir),
+		keybackup:   keybackup.NewKeyBackupDirectory(log, db, accountsDir),
 	}
 }
 

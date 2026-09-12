@@ -154,6 +154,25 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/pushers", middleware.RequireUserAuth(c.GetPushers))
 	rtr.MethodFunc(http.MethodPost, "/v3/pushers/set", middleware.RequireUserAuth(c.SetPusher))
 
+	// Key backup version management
+	rtr.MethodFunc(http.MethodPost, "/v3/room_keys/version", middleware.RequireUserAuth(c.PostKeyBackupVersion))
+	rtr.MethodFunc(http.MethodGet, "/v3/room_keys/version", middleware.RequireUserAuth(c.GetKeyBackupVersionCurrent))
+	rtr.MethodFunc(http.MethodGet, "/v3/room_keys/version/{version}", middleware.RequireUserAuth(c.GetKeyBackupVersion))
+	rtr.MethodFunc(http.MethodPut, "/v3/room_keys/version/{version}", middleware.RequireUserAuth(c.PutKeyBackupVersion))
+	rtr.MethodFunc(http.MethodDelete, "/v3/room_keys/version/{version}", middleware.RequireUserAuth(c.DeleteKeyBackupVersion))
+	// Key backup - all keys
+	rtr.MethodFunc(http.MethodPut, "/v3/room_keys/keys", middleware.RequireUserAuth(c.PutRoomKeys))
+	rtr.MethodFunc(http.MethodGet, "/v3/room_keys/keys", middleware.RequireUserAuth(c.GetRoomKeys))
+	rtr.MethodFunc(http.MethodDelete, "/v3/room_keys/keys", middleware.RequireUserAuth(c.DeleteRoomKeys))
+	// Key backup - room keys
+	rtr.MethodFunc(http.MethodPut, "/v3/room_keys/keys/{roomId}", middleware.RequireUserAuth(c.PutRoomKeysByRoomID))
+	rtr.MethodFunc(http.MethodGet, "/v3/room_keys/keys/{roomId}", middleware.RequireUserAuth(c.GetRoomKeysByRoomID))
+	rtr.MethodFunc(http.MethodDelete, "/v3/room_keys/keys/{roomId}", middleware.RequireUserAuth(c.DeleteRoomKeysByRoomID))
+	// Key backup - session keys
+	rtr.MethodFunc(http.MethodPut, "/v3/room_keys/keys/{roomId}/{sessionId}", middleware.RequireUserAuth(c.PutRoomKeyBySessionID))
+	rtr.MethodFunc(http.MethodGet, "/v3/room_keys/keys/{roomId}/{sessionId}", middleware.RequireUserAuth(c.GetRoomKeyBySessionID))
+	rtr.MethodFunc(http.MethodDelete, "/v3/room_keys/keys/{roomId}/{sessionId}", middleware.RequireUserAuth(c.DeleteRoomKeyBySessionID))
+
 	// Global account data
 	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
 	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
