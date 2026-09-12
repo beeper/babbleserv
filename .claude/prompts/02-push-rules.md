@@ -25,7 +25,7 @@ Now we need to evaluate the push rules during event sending.
 
 Explore the codebase and come up with a plan to implement.
 
-... implemented, second prompt:
+... implemented, third prompt:
 
 Now we need to implement Matrix pushers APIs:
 
@@ -37,7 +37,7 @@ Now we need to implement Matrix pushers APIs:
 
 Explore the codebase with a few agents (databases, routes) and come up with a plan to implement.
 
-... implemented, second prompt:
+... implemented, fourth prompt:
 
 Finally, now that we've implemented the various push components, let's actually send some push notifications!
 
