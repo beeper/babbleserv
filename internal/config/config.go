@@ -64,7 +64,10 @@ type BabbleConfig struct {
 		// How long to keep device changes around (/keys/changes endpoint)
 		DeviceChangesRetention time.Duration `yaml:"deviceChangesRetention"`
 
-		// Value of X-Babbleserv-Register-Secret required to register
+		// Allow public registration. If unset, registration is public only when no secret is configured.
+		PublicRegistration *bool `yaml:"publicRegistration"`
+
+		// Value of X-Babbleserv-Register-Secret that permits registration even when public registration is disabled.
 		RegisterSecretHeaderValue string `yaml:"registerSecretHeaderValue"`
 	} `yaml:"accounts"`
 

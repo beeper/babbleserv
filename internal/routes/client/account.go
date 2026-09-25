@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -77,7 +77,7 @@ func (c *ClientRoutes) Login(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := c.db.Accounts.LoginWithPassword(
 		r.Context(),
-		username,
+		strings.ToLower(username),
 		req.Password,
 		req.RefreshToken,
 		req.DeviceID,
@@ -94,42 +94,255 @@ func (c *ClientRoutes) Login(w http.ResponseWriter, r *http.Request) {
 	util.ResponseJSON(w, r, http.StatusOK, resp)
 }
 
-// https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3register
-func (c *ClientRoutes) Register(w http.ResponseWriter, r *http.Request) {
-	var req mautrix.ReqRegister
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+type registrationAuthData struct {
+	Type    mautrix.AuthType `json:"type"`
+	Session string           `json:"session,omitempty"`
+}
+
+type reqRegister struct {
+	Username                 string      `json:"username,omitempty"`
+	Password                 string      `json:"password,omitempty"`
+	DeviceID                 id.DeviceID `json:"device_id,omitempty"`
+	InitialDeviceDisplayName string      `json:"initial_device_display_name,omitempty"`
+	InhibitLogin             bool        `json:"inhibit_login,omitempty"`
+	RefreshToken             bool        `json:"refresh_token,omitempty"`
+}
+
+type storedRegisterRequest struct {
+	Username                 string      `json:"username"`
+	UsernameProvided         bool        `json:"username_provided"`
+	PasswordHash             []byte      `json:"password_hash,omitempty"`
+	DeviceID                 id.DeviceID `json:"device_id,omitempty"`
+	InitialDeviceDisplayName string      `json:"initial_device_display_name,omitempty"`
+	InhibitLogin             bool        `json:"inhibit_login,omitempty"`
+	RefreshToken             bool        `json:"refresh_token,omitempty"`
+}
+
+func (c *ClientRoutes) registrationAllowed(r *http.Request) bool {
+	if public := c.config.Accounts.PublicRegistration; public != nil {
+		if *public {
+			return true
+		}
+	} else if c.config.Accounts.RegisterSecretHeaderValue == "" {
+		return true
+	}
+	return c.registrationSecretAuthorized(r)
+}
+
+func (c *ClientRoutes) registrationSecretAuthorized(r *http.Request) bool {
+	secret := c.config.Accounts.RegisterSecretHeaderValue
+	return secret != "" && r.Header.Get("X-Babbleserv-Register-Secret") == secret
+}
+
+func normalizeRegistrationUsername(username, serverName string) (string, error) {
+	username = strings.ToLower(username)
+	if err := id.ValidateUserLocalpart(username); err != nil {
+		return "", err
+	}
+	if len(id.NewUserID(username, serverName)) > id.UserIDMaxLength {
+		return "", id.ErrUserIDTooLong
+	}
+	return username, nil
+}
+
+func prepareRegistrationRequest(req reqRegister, serverName string) (storedRegisterRequest, error) {
+	stored := storedRegisterRequest{
+		UsernameProvided:         req.Username != "",
+		DeviceID:                 req.DeviceID,
+		InitialDeviceDisplayName: req.InitialDeviceDisplayName,
+		InhibitLogin:             req.InhibitLogin,
+		RefreshToken:             req.RefreshToken,
+	}
+	var err error
+	if req.Username == "" {
+		stored.Username = strings.ToLower(util.GenerateRandomStringBase32Hex(16))
+	} else if stored.Username, err = normalizeRegistrationUsername(req.Username, serverName); err != nil {
+		return stored, err
+	}
+	if req.Password != "" {
+		stored.PasswordHash, err = bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	}
+	return stored, err
+}
+
+func registrationRequestMatches(req reqRegister, stored storedRegisterRequest) bool {
+	username := strings.ToLower(req.Username)
+	if (req.Username != "") != stored.UsernameProvided || stored.UsernameProvided && username != stored.Username {
+		return false
+	}
+	if (req.Password == "") != (len(stored.PasswordHash) == 0) ||
+		req.Password != "" && bcrypt.CompareHashAndPassword(stored.PasswordHash, []byte(req.Password)) != nil {
+		return false
+	}
+	return req.DeviceID == stored.DeviceID &&
+		req.InitialDeviceDisplayName == stored.InitialDeviceDisplayName &&
+		req.InhibitLogin == stored.InhibitLogin && req.RefreshToken == stored.RefreshToken
+}
+
+func respondRegistrationUIA(w http.ResponseWriter, r *http.Request, session, errCode, message string) {
+	util.ResponseJSON(w, r, http.StatusUnauthorized, uiaResponse{
+		Flows:   []mautrix.UIAFlow{{Stages: []mautrix.AuthType{mautrix.AuthTypeDummy}}},
+		Params:  map[string]any{},
+		Session: session,
+		ErrCode: errCode,
+		Error:   message,
+	})
+}
+
+func (c *ClientRoutes) validateRegistrationAvailability(
+	w http.ResponseWriter,
+	r *http.Request,
+	username string,
+) bool {
+	available, err := c.db.Accounts.IsLocalUsernameAvailable(r.Context(), username)
+	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
+		return false
+	} else if !available {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MUserInUse, "Username is already taken")
+		return false
+	}
+	return true
+}
+
+// https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv3registeravailable
+func (c *ClientRoutes) GetRegisterAvailable(w http.ResponseWriter, r *http.Request) {
+	if !c.registrationAllowed(r) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Registration is disabled")
+		return
+	}
+	username, err := normalizeRegistrationUsername(r.URL.Query().Get("username"), c.config.ServerName)
+	if err != nil || username == "" {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidUsername, "Invalid username")
+		return
+	}
+	if !c.validateRegistrationAvailability(w, r, username) {
+		return
+	}
+	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespRegisterAvailable{Available: true})
+}
+
+// https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3register
+func (c *ClientRoutes) Register(w http.ResponseWriter, r *http.Request) {
+	if !c.registrationAllowed(r) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Registration is disabled")
+		return
+	}
+	if kind := r.URL.Query().Get("kind"); kind != "" && kind != "user" {
+		if kind == "guest" {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Guest registration is not supported")
+		} else {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid registration kind")
+		}
 		return
 	}
 
-	if r.Header.Get("X-Babbleserv-Register-Secret") != c.config.Accounts.RegisterSecretHeaderValue {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Invalid secret header")
+	params, rawAuth, respErr := parseUIARequestBody(r, false)
+	if respErr != nil {
+		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
+			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
+		} else {
+			util.ResponseErrorJSON(w, r, *respErr)
+		}
+		return
+	}
+	var req reqRegister
+	if err := json.Unmarshal(params, &req); err != nil {
+		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+		return
+	}
+	var auth registrationAuthData
+	if len(rawAuth) > 0 && string(rawAuth) != "null" && string(rawAuth) != "{}" {
+		if err := json.Unmarshal(rawAuth, &auth); err != nil {
+			util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+			return
+		}
+	}
+
+	if len(req.Password) > 72 {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Password must be at most 72 bytes")
 		return
 	}
 
-	if err := id.ValidateUserLocalpart(req.Username); err != nil {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf("Invalid username; %s", err.Error()))
-		return
+	var stored storedRegisterRequest
+	if auth.Session != "" {
+		saved, err := c.db.Accounts.GetUIASessionRequest(
+			r.Context(), auth.Session, types.UserDevice{}, r.Method, r.URL.Path,
+		)
+		if errors.Is(err, types.ErrUIASessionNotFound) || errors.Is(err, types.ErrUIASessionExpired) ||
+			errors.Is(err, types.ErrUIASessionMismatch) {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Unknown or mismatched UIA session")
+			return
+		} else if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		} else if err := json.Unmarshal(saved, &stored); err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
+		if string(params) != "{}" && !registrationRequestMatches(req, stored) {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Request parameters changed during UIA")
+			return
+		}
+	} else {
+		if req.Username != "" {
+			if _, err := normalizeRegistrationUsername(req.Username, c.config.ServerName); err != nil {
+				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidUsername, "Invalid username")
+				return
+			}
+		}
+		var err error
+		stored, err = prepareRegistrationRequest(req, c.config.ServerName)
+		if err != nil {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid password")
+			return
+		}
 	}
 
-	if req.Password == "" {
+	if !c.validateRegistrationAvailability(w, r, stored.Username) {
+		return
+	}
+	if auth.Type != mautrix.AuthTypeDummy && !c.registrationSecretAuthorized(r) {
+		if auth.Session == "" {
+			// Incomplete requests discover flows without binding an unusable session.
+			if len(stored.PasswordHash) == 0 {
+				respondRegistrationUIA(w, r, "", "", "")
+				return
+			}
+			storedParams, err := json.Marshal(stored)
+			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			}
+			session, err := c.db.Accounts.CreateUIASession(
+				r.Context(), types.UserDevice{}, r.Method, r.URL.Path, storedParams,
+			)
+			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			}
+			respondRegistrationUIA(w, r, session, "", "")
+		} else {
+			respondRegistrationUIA(w, r, auth.Session, mautrix.MForbidden.ErrCode, "Invalid authentication data")
+		}
+		return
+	}
+	if len(stored.PasswordHash) == 0 {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing or empty password")
 		return
 	}
 
-	if resp, err := c.db.Accounts.RegisterWithPassword(
-		r.Context(),
-		req.Username,
-		[]byte(req.Password),
-		req.RefreshToken,
-		req.DeviceID,
-		req.InitialDeviceDisplayName,
-	); err == types.ErrUserAlreadyExists {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Username already taken")
-		return
+	resp, err := c.db.Accounts.RegisterWithPasswordHash(
+		r.Context(), stored.Username, stored.PasswordHash, stored.RefreshToken, stored.DeviceID,
+		stored.InitialDeviceDisplayName, stored.InhibitLogin, auth.Session, r.Method, r.URL.Path,
+	)
+	if errors.Is(err, types.ErrUserAlreadyExists) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MUserInUse, "Username is already taken")
+	} else if errors.Is(err, types.ErrUIASessionNotFound) || errors.Is(err, types.ErrUIASessionExpired) ||
+		errors.Is(err, types.ErrUIASessionMismatch) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "UIA session is no longer valid")
 	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
-		return
 	} else {
 		util.ResponseJSON(w, r, http.StatusOK, resp)
 	}
@@ -183,16 +396,16 @@ func storedUIAParamsMatch(path string, submitted, stored json.RawMessage) bool {
 		bcrypt.CompareHashAndPassword(saved.NewPasswordHash, []byte(req.NewPassword)) == nil
 }
 
-type passwordUIAResponse struct {
+type uiaResponse struct {
 	Flows   []mautrix.UIAFlow `json:"flows"`
 	Params  map[string]any    `json:"params"`
-	Session string            `json:"session"`
+	Session string            `json:"session,omitempty"`
 	ErrCode string            `json:"errcode,omitempty"`
 	Error   string            `json:"error,omitempty"`
 }
 
 func respondPasswordUIA(w http.ResponseWriter, r *http.Request, session, errCode, message string) {
-	util.ResponseJSON(w, r, http.StatusUnauthorized, passwordUIAResponse{
+	util.ResponseJSON(w, r, http.StatusUnauthorized, uiaResponse{
 		Flows:   []mautrix.UIAFlow{{Stages: []mautrix.AuthType{mautrix.AuthTypePassword}}},
 		Params:  map[string]any{},
 		Session: session,

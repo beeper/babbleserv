@@ -31,6 +31,12 @@ func (a *AccountsDatabase) GetLocalUser(ctx context.Context, userID id.UserID) (
 	})
 }
 
+func (a *AccountsDatabase) IsLocalUsernameAvailable(ctx context.Context, username string) (bool, error) {
+	userID := id.NewUserID(username, a.config.ServerName)
+	user, err := a.GetLocalUser(ctx, userID)
+	return user == nil, err
+}
+
 func (a *AccountsDatabase) GetUserDeviceForAuthToken(ctx context.Context, token string) (types.UserDevice, error) {
 	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.UserDevice, error) {
 		authToken, err := a.tokens.TxnGetAuthTokenTup(txn, token)
@@ -150,8 +156,8 @@ func (a *AccountsDatabase) CleanupExpiredUIASessions(ctx context.Context, limit 
 
 type authResp struct {
 	UserID       id.UserID   `json:"user_id"`
-	DeviceID     id.DeviceID `json:"device_id"`
-	AccessToken  string      `json:"access_token"`
+	DeviceID     id.DeviceID `json:"device_id,omitempty"`
+	AccessToken  string      `json:"access_token,omitempty"`
 	RefreshToken string      `json:"refresh_token,omitempty"`
 	ExpiresInMS  int64       `json:"expires_in_ms,omitempty"`
 }
@@ -216,70 +222,56 @@ func (a *AccountsDatabase) LoginWithPassword(
 
 // Registers a user with a given username/password combination, note the username is not checked
 // for Matrix localpart validity, caller is responsible.
-func (a *AccountsDatabase) RegisterWithPassword(
+func (a *AccountsDatabase) RegisterWithPasswordHash(
 	ctx context.Context,
 	username string,
-	password []byte,
+	hashedPassword []byte,
 	withRefreshToken bool,
 	deviceID id.DeviceID,
 	initialDeviceDisplayName string,
+	inhibitLogin bool,
+	uiaSession, method, path string,
 ) (authResp, error) {
-	if deviceID == "" {
+	if !inhibitLogin && deviceID == "" {
 		deviceID = generateDeviceID()
 	}
-	resp := authResp{
-		DeviceID: deviceID,
+	user := types.User{
+		Username:   username,
+		ServerName: a.config.ServerName,
+		CreatedAt:  time.Now().UTC(),
 	}
-
-	hashedPassword, err := bcrypt.GenerateFromPassword(password, 12)
+	resp, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (authResp, error) {
+		resp := authResp{UserID: user.UserID()}
+		if err := a.txnConsumeUIASession(txn, uiaSession, types.UserDevice{}, method, path); err != nil {
+			return resp, err
+		}
+		if err := a.users.TxnCreateLocalUser(txn, &user, hashedPassword); err != nil {
+			return resp, err
+		}
+		if !inhibitLogin {
+			resp.DeviceID = deviceID
+			resp.AccessToken, resp.RefreshToken = a.tokens.TxnCreateNewTokensForUserDevice(
+				txn, resp.UserID, deviceID, withRefreshToken, a.config.Accounts.RefreshAccessTokenExpire,
+			)
+			if expiry := a.config.Accounts.RefreshAccessTokenExpire; withRefreshToken && expiry > 0 {
+				resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
+			}
+			if _, err := a.devices.TxnGetOrCreateDevice(txn, resp.UserID, deviceID, initialDeviceDisplayName); err != nil {
+				return resp, err
+			}
+		}
+		return resp, nil
+	})
 	if err != nil {
 		return resp, err
 	}
 
-	if _, err = util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (*struct{}, error) {
-		user := types.User{
-			Username:   username,
-			ServerName: a.config.ServerName,
-			CreatedAt:  time.Now().UTC(),
-		}
-
-		if err := a.users.TxnCreateLocalUser(txn, &user, hashedPassword); err != nil {
-			return nil, err
-		}
-
-		userID := user.UserID()
-		resp.UserID = userID
-
-		resp.AccessToken, resp.RefreshToken = a.tokens.TxnCreateNewTokensForUserDevice(
-			txn,
-			userID,
-			deviceID,
-			withRefreshToken,
-			a.config.Accounts.RefreshAccessTokenExpire,
-		)
-
-		if expiry := a.config.Accounts.RefreshAccessTokenExpire; withRefreshToken && expiry > 0 {
-			resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
-		}
-
-		if _, err = a.devices.TxnGetOrCreateDevice(txn, userID, deviceID, initialDeviceDisplayName); err != nil {
-			return nil, err
-		}
-
-		return nil, nil
-	}); err != nil {
-		return resp, err
-	}
-
-	a.notifier.SendChange(notifier.Change{
-		UserIDs: []id.UserID{resp.UserID},
-	})
+	a.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{resp.UserID}})
 	zerolog.Ctx(ctx).
 		Info().
 		Str("username", username).
-		Str("device_id", deviceID.String()).
+		Str("device_id", resp.DeviceID.String()).
 		Msg("Registered new user")
-
 	return resp, nil
 }
 

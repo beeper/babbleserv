@@ -39,10 +39,12 @@ type errorMeta struct {
 }
 
 var errorToMeta = map[string]errorMeta{
-	mautrix.MNotJSON.ErrCode:      {400, "Request body is not valid JSON"},
-	mautrix.MBadJSON.ErrCode:      {400, "Request body is JSON but not match schema"},
-	mautrix.MBadState.ErrCode:     {400, ""},
-	mautrix.MInvalidParam.ErrCode: {400, ""},
+	mautrix.MNotJSON.ErrCode:         {400, "Request body is not valid JSON"},
+	mautrix.MBadJSON.ErrCode:         {400, "Request body is JSON but not match schema"},
+	mautrix.MBadState.ErrCode:        {400, ""},
+	mautrix.MInvalidParam.ErrCode:    {400, ""},
+	mautrix.MInvalidUsername.ErrCode: {400, "Invalid username"},
+	mautrix.MUserInUse.ErrCode:       {400, "Username is already taken"},
 
 	mautrix.MUnsupportedRoomVersion.ErrCode: {400, "Room version not supported"},
 	mautrix.MRoomInUse.ErrCode:              {409, "Room alias taken"},

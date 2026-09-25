@@ -113,6 +113,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodPut, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.PutPresence))
 
 	rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
+	rtr.MethodFunc(http.MethodGet, "/v3/register/available", c.GetRegisterAvailable)
 	rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
 	rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
 	rtr.MethodFunc(http.MethodPost, "/v3/refresh", c.Refresh)
