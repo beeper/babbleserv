@@ -116,7 +116,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
 	rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
 
-	rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
+	rtr.MethodFunc(http.MethodGet, "/v3/account/whoami", middleware.RequireUserAuth(c.GetWhoami))
 
 	// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
@@ -127,7 +127,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
 	rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
 	rtr.MethodFunc(http.MethodDelete, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.DeleteDevice))
-	rtr.MethodFunc(http.MethodDelete, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
+	rtr.MethodFunc(http.MethodPost, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
 
 	rtr.MethodFunc(http.MethodGet, "/v3/keys/changes", middleware.RequireUserAuth(c.GetKeyChanges))
 	rtr.MethodFunc(http.MethodPost, "/v3/keys/query", middleware.RequireUserAuth(c.QueryKeys))
