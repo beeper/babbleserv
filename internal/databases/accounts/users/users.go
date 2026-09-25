@@ -86,6 +86,14 @@ type UsersDirectory struct {
 	// key: (id.UserID, appID, pushKey)
 	// value: pushgateway.Pusher (JSON)
 	userPushers subspace.Subspace
+
+	// key: (id.UserID, appID, pushKey)
+	// value: id.DeviceID which last set the pusher
+	userPusherDevices subspace.Subspace
+
+	// key: (appID, pushKey, id.UserID)
+	// value: empty; finds owners of exactly one pusher identity
+	pusherUsersByIdentity subspace.Subspace
 }
 
 func NewUsersDirectory(
@@ -109,16 +117,18 @@ func NewUsersDirectory(
 		db:         db,
 		serverName: serverName,
 
-		byVersion:            usersDir.Sub("uvr"),
-		localUsers:           usersDir.Sub("unm"),
-		remoteUsers:          usersDir.Sub("rus"),
-		userProfiles:         usersDir.Sub("upr"),
-		profileChanges:       usersDir.Sub("pch"),
-		userPasswordHashes:   usersDir.Sub("uph"),
-		userCrossSigningKeys: usersDir.Sub("uxs"),
-		userKeySignatures:    usersDir.Sub("uks"),
-		userFilters:          usersDir.Sub("ufl"),
-		userPushers:          usersDir.Sub("upk"),
+		byVersion:             usersDir.Sub("uvr"),
+		localUsers:            usersDir.Sub("unm"),
+		remoteUsers:           usersDir.Sub("rus"),
+		userProfiles:          usersDir.Sub("upr"),
+		profileChanges:        usersDir.Sub("pch"),
+		userPasswordHashes:    usersDir.Sub("uph"),
+		userCrossSigningKeys:  usersDir.Sub("uxs"),
+		userKeySignatures:     usersDir.Sub("uks"),
+		userFilters:           usersDir.Sub("ufl"),
+		userPushers:           usersDir.Sub("upk"),
+		userPusherDevices:     usersDir.Sub("upd"),
+		pusherUsersByIdentity: usersDir.Sub("upi"),
 	}
 }
 
