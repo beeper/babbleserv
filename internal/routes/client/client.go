@@ -202,6 +202,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 func (c *ClientRoutes) AddClientMediaRoutes(rtr chi.Router) {
 	if c.config.Media.Enabled {
+		rtr.MethodFunc(http.MethodGet, "/v3/config", middleware.RequireUserAuth(c.GetMediaConfig))
 		rtr.MethodFunc(http.MethodPost, "/v1/create", middleware.RequireUserAuth(c.CreateMedia))
 		rtr.MethodFunc(http.MethodPost, "/v1/complete", middleware.RequireUserAuth(c.CompleteMedia))
 		rtr.MethodFunc(http.MethodPost, "/v3/upload", middleware.RequireUserAuth(c.UploadMedia))

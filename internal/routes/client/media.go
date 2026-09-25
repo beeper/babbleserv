@@ -18,7 +18,9 @@ import (
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediaconfig
 func (c *ClientRoutes) GetMediaConfig(w http.ResponseWriter, r *http.Request) {
-	util.ResponseErrorJSON(w, r, util.MNotImplemented)
+	util.ResponseJSON(w, r, http.StatusOK, map[string]int64{
+		"m.upload.size": c.maxUploadSize(),
+	})
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid
