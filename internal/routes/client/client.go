@@ -179,6 +179,10 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	// Room account data
 	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
 	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
+	// Room tags are stored as room account data (m.tag).
+	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/tags", middleware.RequireUserAuth(c.GetRoomTags))
+	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/tags/{tag}", middleware.RequireUserAuth(c.PutRoomTag))
+	rtr.MethodFunc(http.MethodDelete, "/v3/user/{userID}/rooms/{roomID}/tags/{tag}", middleware.RequireUserAuth(c.DeleteRoomTag))
 
 	rtr.MethodFunc(http.MethodPut, "/v3/sendToDevice/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendToDevice))
 
