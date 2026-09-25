@@ -90,6 +90,8 @@ type BabbleConfig struct {
 		MaxUploadSize            int64                     `yaml:"maxUploadSize"`            // Defaults to 50 MiB.
 		MaxThumbnailPixels       int64                     `yaml:"maxThumbnailPixels"`       // Defaults to 20 million pixels.
 		MaxThumbnailSourcePixels int64                     `yaml:"maxThumbnailSourcePixels"` // Defaults to 40 million pixels.
+		PendingUploadTimeout     time.Duration             `yaml:"pendingUploadTimeout"`     // Defaults to 24 hours.
+		MaxPendingUploadWait     time.Duration             `yaml:"maxPendingUploadWait"`     // Defaults to 1 minute.
 	} `yaml:"media"`
 
 	System struct {

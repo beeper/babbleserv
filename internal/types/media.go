@@ -23,6 +23,7 @@ type Media struct {
 
 	CreatedAt  time.Time `msgpack:"ct"`
 	UploadedAt time.Time `msgpack:"ut,omitempty"`
+	ExpiresAt  time.Time `msgpack:"et,omitempty"`
 }
 
 func NewMediaFromBytes(b []byte, serverName, mediaID string) (*Media, error) {

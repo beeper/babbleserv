@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -25,10 +26,15 @@ func (c *ClientRoutes) GetMediaConfig(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediadownloadservernamemediaidfilename
 func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
+	wait, err := c.pendingWait(r)
+	if err != nil {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+		return
+	}
 	serverName := decodedURLParam(r, "serverName")
 	mediaID := decodedURLParam(r, "mediaID")
 
-	if media, err := c.db.Media.GetMedia(r.Context(), serverName, mediaID); err != nil {
+	if media, err := c.waitForMedia(r, serverName, mediaID, wait); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if media == nil {
@@ -41,6 +47,11 @@ func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediathumbnailservernamemediaid
 func (c *ClientRoutes) DownloadThumbnail(w http.ResponseWriter, r *http.Request) {
+	wait, err := c.pendingWait(r)
+	if err != nil {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+		return
+	}
 	width, height, method, ok := c.thumbnailRequest(w, r)
 	if !ok {
 		return
@@ -54,7 +65,7 @@ func (c *ClientRoutes) DownloadThumbnail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if thumbnail == nil {
-		original, err := c.db.Media.GetMedia(r.Context(), serverName, mediaID)
+		original, err := c.waitForMedia(r, serverName, mediaID, wait)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
@@ -91,7 +102,10 @@ func (c *ClientRoutes) CreateMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := map[string]any{"content_uri": media.ToContentURI().String()}
+	response := map[string]any{
+		"content_uri":       media.ToContentURI().String(),
+		"unused_expires_at": media.ExpiresAt.UnixMilli(),
+	}
 	presignedURL, err := c.datastores.PresignedPutURLForMedia(r.Context(), media)
 	if err == nil {
 		response["upload_url"] = presignedURL
@@ -105,37 +119,76 @@ func (c *ClientRoutes) CreateMedia(w http.ResponseWriter, r *http.Request) {
 
 // https://github.com/matrix-org/matrix-spec-proposals/pull/3870
 func (c *ClientRoutes) CompleteMedia(w http.ResponseWriter, r *http.Request) {
-	serverName := decodedURLParam(r, "serverName")
-	mediaID := decodedURLParam(r, "mediaID")
-
+	serverName, mediaID := decodedURLParam(r, "serverName"), decodedURLParam(r, "mediaID")
+	if serverName != c.config.ServerName || mediaID == "" {
+		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	}
 	media, err := c.db.Media.GetMedia(r.Context(), serverName, mediaID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
-	} else if media == nil || media.Sender != middleware.GetRequestUserID(r) {
-		// Change from spec: 404 wrong user so we don't leak that this media exists
+	} else if media == nil {
+		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	} else if media.Sender != middleware.GetRequestUserID(r) {
+		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
+		return
+	} else if !media.UploadedAt.IsZero() {
+		util.ResponseErrorJSON(w, r, util.MCannotOverwriteMedia)
+		return
+	} else if !media.ExpiresAt.IsZero() && !time.Now().Before(media.ExpiresAt) {
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
 		return
 	}
-
-	// Get object info from datastore
 	info, err := c.datastores.GetObjectInfoForMedia(r.Context(), media)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
-
-	// TODO: validate size/content-type allowed
-
-	media.Size = info.Size
-	media.ContentType = info.ContentType
-	media.UploadedAt = time.Now().UTC()
-
-	if err := c.db.Media.SetMedia(r.Context(), media); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
+	if info.Size > c.maxUploadSize() {
+		util.ResponseErrorJSON(w, r, mautrix.MTooLarge)
 		return
 	}
 
+	// A presigned URL remains usable until it expires, so its object path is only
+	// a staging location. Publish a unique copy which later PUTs through that URL
+	// cannot replace.
+	staged, err := c.datastores.GetObjectForMedia(r.Context(), media)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	if closer, ok := staged.(io.Closer); ok {
+		defer closer.Close()
+	}
+	candidate := *media
+	candidate.StorePath = uploadObjectPath(media, c.db.Media.GenerateMediaID())
+	candidate.ContentType = info.ContentType
+	if candidate.ContentType == "" {
+		candidate.ContentType = "application/octet-stream"
+	}
+	reader := &maxBytesReader{reader: staged, remaining: c.maxUploadSize()}
+	if err = c.datastores.PutObjectForMedia(r.Context(), &candidate, reader, datastores.ObjectInfo{
+		Size: -1, ContentType: candidate.ContentType,
+	}); err != nil {
+		if errors.Is(err, errMediaTooLarge) {
+			util.ResponseErrorJSON(w, r, mautrix.MTooLarge)
+		} else {
+			util.ResponseErrorUnknownJSON(w, r, err)
+		}
+		return
+	}
+	info, err = c.datastores.GetObjectInfoForMedia(r.Context(), &candidate)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	candidate.Size = info.Size
+	candidate.UploadedAt = time.Now().UTC()
+	if err = c.db.Media.CompleteMediaUpload(r.Context(), &candidate, middleware.GetRequestUserID(r)); !c.handleMediaCompletionError(w, r, err) {
+		return
+	}
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
 
@@ -167,6 +220,9 @@ func (c *ClientRoutes) UploadMedia(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if !media.UploadedAt.IsZero() {
 			util.ResponseErrorJSON(w, r, util.MCannotOverwriteMedia)
+			return
+		} else if !media.ExpiresAt.IsZero() && !time.Now().Before(media.ExpiresAt) {
+			util.ResponseErrorJSON(w, r, mautrix.MNotFound)
 			return
 		}
 	} else {

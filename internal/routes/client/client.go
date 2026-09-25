@@ -205,7 +205,9 @@ func (c *ClientRoutes) AddClientMediaRoutes(rtr chi.Router) {
 		rtr.MethodFunc(http.MethodGet, "/v3/config", middleware.RequireUserAuth(c.GetMediaConfig))
 		rtr.MethodFunc(http.MethodGet, "/v3/thumbnail/{serverName}/{mediaID}", middleware.RequireUserAuth(c.DownloadThumbnail))
 		rtr.MethodFunc(http.MethodPost, "/v1/create", middleware.RequireUserAuth(c.CreateMedia))
-		rtr.MethodFunc(http.MethodPost, "/v1/complete", middleware.RequireUserAuth(c.CompleteMedia))
+		rtr.MethodFunc(http.MethodPost, "/v1/complete/{serverName}/{mediaID}", middleware.RequireUserAuth(c.CompleteMedia))
+		rtr.MethodFunc(http.MethodGet, "/v3/download/{serverName}/{mediaID}", middleware.RequireUserAuth(c.DownloadMedia))
+		rtr.MethodFunc(http.MethodGet, "/v3/download/{serverName}/{mediaID}/{filename}", middleware.RequireUserAuth(c.DownloadMedia))
 		rtr.MethodFunc(http.MethodPost, "/v3/upload", middleware.RequireUserAuth(c.UploadMedia))
 		rtr.MethodFunc(http.MethodPut, "/v3/upload/{serverName}/{mediaID}", middleware.RequireUserAuth(c.UploadMedia))
 	}

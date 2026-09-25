@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"errors"
+	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
@@ -140,6 +141,8 @@ func (m *MediaDatabase) CompleteMediaUpload(ctx context.Context, candidate *type
 			return nil, ErrMediaForbidden
 		} else if !current.UploadedAt.IsZero() {
 			return nil, ErrMediaAlreadyUploaded
+		} else if !current.ExpiresAt.IsZero() && !time.Now().Before(current.ExpiresAt) {
+			return nil, ErrMediaNotFound
 		}
 
 		current.StoreKey = candidate.StoreKey

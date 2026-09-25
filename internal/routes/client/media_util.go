@@ -21,11 +21,16 @@ import (
 
 const (
 	defaultMaxUploadSize            = int64(50 * 1024 * 1024)
+	defaultPendingUploadTimeout     = 24 * time.Hour
+	defaultMaxPendingUploadWait     = time.Minute
 	defaultMaxThumbnailPixels       = int64(20_000_000)
 	defaultMaxThumbnailSourcePixels = int64(40_000_000)
 )
 
-var errMediaTooLarge = errors.New("media upload exceeds configured maximum size")
+var (
+	errMediaTooLarge       = errors.New("media upload exceeds configured maximum size")
+	errInvalidMediaTimeout = errors.New("timeout_ms must be a non-negative integer")
+)
 
 var inlineMediaTypes = map[string]struct{}{
 	"text/css": {}, "text/plain": {}, "text/csv": {},
@@ -98,6 +103,7 @@ func (c *ClientRoutes) generateAndSaveNewMedia(r *http.Request) (*types.Media, e
 	}
 
 	media := types.NewMedia(c.config.ServerName, mediaID, datastore.Key(), userID)
+	media.ExpiresAt = media.CreatedAt.Add(c.pendingUploadTimeout())
 	if err := c.db.Media.CreateMedia(r.Context(), media); err != nil {
 		return nil, err
 	}
@@ -201,4 +207,63 @@ func (c *ClientRoutes) generateThumbnail(r *http.Request, original *types.Media,
 		return nil, err
 	}
 	return thumbnail, nil
+}
+
+func (c *ClientRoutes) pendingUploadTimeout() time.Duration {
+	if c.config.Media.PendingUploadTimeout > 0 {
+		return c.config.Media.PendingUploadTimeout
+	}
+	return defaultPendingUploadTimeout
+}
+
+func (c *ClientRoutes) maxPendingUploadWait() time.Duration {
+	if c.config.Media.MaxPendingUploadWait > 0 {
+		return c.config.Media.MaxPendingUploadWait
+	}
+	return defaultMaxPendingUploadWait
+}
+
+func (c *ClientRoutes) pendingWait(r *http.Request) (time.Duration, error) {
+	wait := 20 * time.Second
+	if raw := r.URL.Query().Get("timeout_ms"); raw != "" {
+		milliseconds, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return 0, errInvalidMediaTimeout
+		}
+		maximumMilliseconds := uint64(c.maxPendingUploadWait() / time.Millisecond)
+		if milliseconds > maximumMilliseconds {
+			return c.maxPendingUploadWait(), nil
+		}
+		wait = time.Duration(milliseconds) * time.Millisecond
+	}
+	if maximum := c.maxPendingUploadWait(); wait > maximum {
+		return maximum, nil
+	}
+	return wait, nil
+}
+
+func (c *ClientRoutes) waitForMedia(r *http.Request, serverName, mediaID string, wait time.Duration) (*types.Media, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		media, err := c.db.Media.GetMedia(r.Context(), serverName, mediaID)
+		if err != nil || media == nil || !media.UploadedAt.IsZero() {
+			return media, err
+		}
+		if !media.ExpiresAt.IsZero() && !time.Now().Before(media.ExpiresAt) {
+			return nil, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return media, nil
+		}
+		pause := 50 * time.Millisecond
+		if remaining < pause {
+			pause = remaining
+		}
+		select {
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		case <-time.After(pause):
+		}
+	}
 }
