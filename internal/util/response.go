@@ -13,7 +13,8 @@ import (
 )
 
 var (
-	MUnknown = mautrix.RespError{
+	MCannotOverwriteMedia = mautrix.RespError{ErrCode: "M_CANNOT_OVERWRITE_MEDIA"}
+	MUnknown              = mautrix.RespError{
 		ErrCode: "M_UNKNOWN",
 	}
 	MNotImplemented = mautrix.RespError{
@@ -55,8 +56,10 @@ var errorToMeta = map[string]errorMeta{
 	mautrix.MForbidden.ErrCode:    {403, ""},
 	MUnprocessableContent.ErrCode: {422, ""},
 
-	mautrix.MNotFound.ErrCode: {404, "Nothing found here"},
-	MMethodNotAllowed.ErrCode: {405, "Wrong HTTP method"},
+	mautrix.MNotFound.ErrCode:     {404, "Nothing found here"},
+	MCannotOverwriteMedia.ErrCode: {409, "Media ID already has content"},
+	mautrix.MTooLarge.ErrCode:     {413, "Media upload exceeds configured maximum size"},
+	MMethodNotAllowed.ErrCode:     {405, "Wrong HTTP method"},
 
 	MUnknown.ErrCode:        {500, "An unknown error occurred"},
 	MNotImplemented.ErrCode: {501, "Not implemented"},

@@ -87,6 +87,7 @@ type BabbleConfig struct {
 		Notifier            NotifierConfig            `yaml:"notifier"`
 		Datastores          map[string]map[string]any `yaml:"datastores"`
 		PresignedURLTimeout time.Duration             `yaml:"presignedURLTimeout"`
+		MaxUploadSize       int64                     `yaml:"maxUploadSize"` // Defaults to 50 MiB.
 	} `yaml:"media"`
 
 	System struct {

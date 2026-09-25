@@ -17,6 +17,7 @@ type Media struct {
 
 	Size        int64  `msgpack:"sz,omitempty"`
 	ContentType string `msgpack:"ty,omitempty"`
+	FileName    string `msgpack:"fn,omitempty"`
 
 	Sender id.UserID `msgpack:"snd"`
 

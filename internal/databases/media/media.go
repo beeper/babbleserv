@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
@@ -10,6 +11,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
@@ -17,6 +19,13 @@ import (
 )
 
 const API_VERSION = 710
+
+var (
+	ErrMediaNotFound        = errors.New("media not found")
+	ErrMediaForbidden       = errors.New("media belongs to another user")
+	ErrMediaAlreadyExists   = errors.New("media ID already exists")
+	ErrMediaAlreadyUploaded = errors.New("media already uploaded")
+)
 
 type MediaDatabase struct {
 	log zerolog.Logger
@@ -89,15 +98,14 @@ func (m *MediaDatabase) CreateMedia(ctx context.Context, media *types.Media) err
 		if err != nil {
 			return nil, err
 		} else if existing != nil {
-			// This should never happen!
-			panic("media already exists with this ID!")
+			return nil, ErrMediaAlreadyExists
 		}
 
 		txn.Set(key, media.ToMsgpack())
 
 		version := tuple.IncompleteVersionstamp(0)
 		kv := m.keyValueForMediaVersion(media.ServerName, media.MediaID, version)
-		txn.Set(kv.Key, kv.Value)
+		txn.SetVersionstampedKey(kv.Key, kv.Value)
 
 		return nil, nil
 	})
@@ -107,6 +115,40 @@ func (m *MediaDatabase) CreateMedia(ctx context.Context, media *types.Media) err
 func (m *MediaDatabase) SetMedia(ctx context.Context, media *types.Media) error {
 	_, err := util.DoWriteTransaction(ctx, m.db, func(txn fdb.Transaction) (*struct{}, error) {
 		txn.Set(m.keyForMedia(media.ServerName, media.MediaID), media.ToMsgpack())
+		return nil, nil
+	})
+	return err
+}
+
+// CompleteMediaUpload atomically publishes an object which has already been
+// durably written to a datastore. The candidate uses a unique object path, so
+// concurrent uploads cannot overwrite the object selected by this transaction.
+func (m *MediaDatabase) CompleteMediaUpload(ctx context.Context, candidate *types.Media, sender id.UserID) error {
+	_, err := util.DoWriteTransaction(ctx, m.db, func(txn fdb.Transaction) (*struct{}, error) {
+		key := m.keyForMedia(candidate.ServerName, candidate.MediaID)
+		b, err := txn.Get(key).Get()
+		if err != nil {
+			return nil, err
+		} else if b == nil {
+			return nil, ErrMediaNotFound
+		}
+
+		current, err := types.NewMediaFromBytes(b, candidate.ServerName, candidate.MediaID)
+		if err != nil {
+			return nil, err
+		} else if current.Sender != sender {
+			return nil, ErrMediaForbidden
+		} else if !current.UploadedAt.IsZero() {
+			return nil, ErrMediaAlreadyUploaded
+		}
+
+		current.StoreKey = candidate.StoreKey
+		current.StorePath = candidate.StorePath
+		current.Size = candidate.Size
+		current.ContentType = candidate.ContentType
+		current.FileName = candidate.FileName
+		current.UploadedAt = candidate.UploadedAt
+		txn.Set(key, current.ToMsgpack())
 		return nil, nil
 	})
 	return err
