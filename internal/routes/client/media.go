@@ -2,7 +2,6 @@ package client
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -42,28 +41,46 @@ func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediathumbnailservernamemediaid
 func (c *ClientRoutes) DownloadThumbnail(w http.ResponseWriter, r *http.Request) {
+	width, height, method, ok := c.thumbnailRequest(w, r)
+	if !ok {
+		return
+	}
 	serverName := decodedURLParam(r, "serverName")
 	mediaID := decodedURLParam(r, "mediaID")
-
-	query := r.URL.Query()
-	method := query.Get("method")
-
-	requestWidth := query.Get("width")
-	requestHeight := query.Get("height")
-
-	// Find matching size from: https://spec.matrix.org/v1.11/client-server-api/#thumbnails
-
-	key := fmt.Sprintf("%s/%s-%s-%s", mediaID, requestWidth, requestHeight, method)
-
-	media, err := c.db.Media.GetMedia(r.Context(), serverName, key)
+	key := thumbnailMediaID(mediaID, width, height, method)
+	thumbnail, err := c.db.Media.GetMedia(r.Context(), serverName, key)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
-	} else if media == nil {
-		// TODO: generate thumbnail using image processor
 	}
-
-	c.downloadMedia(w, r, media)
+	if thumbnail == nil {
+		original, err := c.db.Media.GetMedia(r.Context(), serverName, mediaID)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		} else if original == nil {
+			util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+			return
+		} else if original.UploadedAt.IsZero() {
+			util.ResponseErrorJSON(w, r, util.MNotYetUploaded)
+			return
+		}
+		thumbnail, err = c.generateThumbnail(r, original, key, width, height, method)
+		if err != nil {
+			switch {
+			case errors.Is(err, util.ErrThumbnailTooLarge):
+				util.ResponseErrorJSON(w, r, mautrix.MTooLarge)
+			case errors.Is(err, util.ErrThumbnailUnsupported):
+				util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+					"errcode": mautrix.MUnknown.ErrCode, "error": err.Error(),
+				})
+			default:
+				util.ResponseErrorUnknownJSON(w, r, err)
+			}
+			return
+		}
+	}
+	c.downloadMedia(w, r, thumbnail)
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixmediav1create

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -8,15 +9,21 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix"
 
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/datastores"
 )
 
-const defaultMaxUploadSize = int64(50 * 1024 * 1024)
+const (
+	defaultMaxUploadSize            = int64(50 * 1024 * 1024)
+	defaultMaxThumbnailPixels       = int64(20_000_000)
+	defaultMaxThumbnailSourcePixels = int64(40_000_000)
+)
 
 var errMediaTooLarge = errors.New("media upload exceeds configured maximum size")
 
@@ -120,4 +127,78 @@ func (r *maxBytesReader) Read(p []byte) (int, error) {
 		return 0, errMediaTooLarge
 	}
 	return n, err
+}
+
+func (c *ClientRoutes) maxThumbnailPixels() int64 {
+	if c.config.Media.MaxThumbnailPixels > 0 {
+		return c.config.Media.MaxThumbnailPixels
+	}
+	return defaultMaxThumbnailPixels
+}
+
+func (c *ClientRoutes) maxThumbnailSourcePixels() int64 {
+	if c.config.Media.MaxThumbnailSourcePixels > 0 {
+		return c.config.Media.MaxThumbnailSourcePixels
+	}
+	return defaultMaxThumbnailSourcePixels
+}
+
+func (c *ClientRoutes) thumbnailRequest(w http.ResponseWriter, r *http.Request) (int, int, string, bool) {
+	width, widthErr := strconv.Atoi(r.URL.Query().Get("width"))
+	height, heightErr := strconv.Atoi(r.URL.Query().Get("height"))
+	method := r.URL.Query().Get("method")
+	if method == "" {
+		method = "scale"
+	}
+	animated := r.URL.Query().Get("animated")
+	if animated != "" && animated != "true" && animated != "false" {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid animated flag")
+		return 0, 0, "", false
+	}
+	tooManyPixels := width > 0 && height > 0 && int64(width) > c.maxThumbnailPixels()/int64(height)
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 ||
+		(method != "crop" && method != "scale") || tooManyPixels {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid thumbnail dimensions or method")
+		return 0, 0, "", false
+	}
+	return width, height, method, true
+}
+
+func thumbnailMediaID(mediaID string, width, height int, method string) string {
+	return mediaID + "/thumbnail/" + strconv.Itoa(width) + "x" + strconv.Itoa(height) + "-" + method
+}
+
+func (c *ClientRoutes) generateThumbnail(r *http.Request, original *types.Media, key string, width, height int, method string) (*types.Media, error) {
+	input, err := c.datastores.GetObjectForMedia(r.Context(), original)
+	if err != nil {
+		return nil, err
+	}
+	if closer, ok := input.(io.Closer); ok {
+		defer closer.Close()
+	}
+	encoded, err := util.GenerateThumbnail(
+		input, c.maxUploadSize(), c.maxThumbnailSourcePixels(), width, height, method,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	thumbnail := types.NewMedia(original.ServerName, key, original.StoreKey, original.Sender)
+	// Keep derived objects next to the original object path. Treating the original
+	// object's key as a directory works in S3, but cannot work in a filesystem store
+	// where that path is already a regular file.
+	thumbnail.StorePath = original.StorePath + ".thumbnails/" + strconv.Itoa(width) + "x" + strconv.Itoa(height) + "-" + method + ".png"
+	thumbnail.Size = int64(len(encoded))
+	thumbnail.ContentType = "image/png"
+	thumbnail.FileName = "thumbnail.png"
+	thumbnail.UploadedAt = time.Now().UTC()
+	if err = c.datastores.PutObjectForMedia(r.Context(), thumbnail, bytes.NewReader(encoded), datastores.ObjectInfo{
+		Size: thumbnail.Size, ContentType: thumbnail.ContentType,
+	}); err != nil {
+		return nil, err
+	}
+	if err = c.db.Media.SetMedia(r.Context(), thumbnail); err != nil {
+		return nil, err
+	}
+	return thumbnail, nil
 }

@@ -82,12 +82,14 @@ type BabbleConfig struct {
 	} `yaml:"transient"`
 
 	Media struct {
-		Enabled             bool                      `yaml:"enabled"`
-		Database            databaseConfig            `yaml:"database"`
-		Notifier            NotifierConfig            `yaml:"notifier"`
-		Datastores          map[string]map[string]any `yaml:"datastores"`
-		PresignedURLTimeout time.Duration             `yaml:"presignedURLTimeout"`
-		MaxUploadSize       int64                     `yaml:"maxUploadSize"` // Defaults to 50 MiB.
+		Enabled                  bool                      `yaml:"enabled"`
+		Database                 databaseConfig            `yaml:"database"`
+		Notifier                 NotifierConfig            `yaml:"notifier"`
+		Datastores               map[string]map[string]any `yaml:"datastores"`
+		PresignedURLTimeout      time.Duration             `yaml:"presignedURLTimeout"`
+		MaxUploadSize            int64                     `yaml:"maxUploadSize"`            // Defaults to 50 MiB.
+		MaxThumbnailPixels       int64                     `yaml:"maxThumbnailPixels"`       // Defaults to 20 million pixels.
+		MaxThumbnailSourcePixels int64                     `yaml:"maxThumbnailSourcePixels"` // Defaults to 40 million pixels.
 	} `yaml:"media"`
 
 	System struct {
