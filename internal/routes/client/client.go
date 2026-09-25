@@ -115,6 +115,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
 	rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
 	rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
+	rtr.MethodFunc(http.MethodPost, "/v3/refresh", c.Refresh)
 	rtr.MethodFunc(http.MethodPost, "/v3/logout", middleware.RequireUserAuth(c.Logout))
 	rtr.MethodFunc(http.MethodPost, "/v3/logout/all", middleware.RequireUserAuth(c.LogoutAll))
 

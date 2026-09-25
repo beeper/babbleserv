@@ -28,15 +28,19 @@ func (w *UIASessionCleanupIterator) handleCleanupLoop(workerLock lock.Lock) {
 	defer ticker.Stop()
 	for {
 		workerLock.Refresh()
-		sessions, err := w.db.Accounts.CleanupExpiredUIASessions(w.ctx, uiaCleanupBatchSize)
-		if err != nil {
-			w.log.Err(err).Msg("Failed to clean expired UIA sessions")
-			return
+		sessions, sessionsErr := w.db.Accounts.CleanupExpiredUIASessions(w.ctx, uiaCleanupBatchSize)
+		if sessionsErr != nil {
+			w.log.Err(sessionsErr).Msg("Failed to clean expired UIA sessions")
+		}
+		tokens, tokensErr := w.db.Accounts.CleanupExpiredAccessTokens(w.ctx, uiaCleanupBatchSize)
+		if tokensErr != nil {
+			w.log.Err(tokensErr).Msg("Failed to clean expired access tokens")
 		}
 		if w.ctx.Err() != nil {
 			return
 		}
-		if sessions == uiaCleanupBatchSize {
+		if sessionsErr == nil && tokensErr == nil &&
+			(sessions == uiaCleanupBatchSize || tokens == uiaCleanupBatchSize) {
 			continue
 		}
 		select {

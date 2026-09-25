@@ -2,7 +2,9 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
@@ -17,6 +19,7 @@ import (
 type contextKey string
 
 const requestUserKey contextKey = "user"
+const requestUserAuthErrorKey contextKey = "user_auth_error"
 const requestServerKey contextKey = "server"
 
 // User auth (CS API)
@@ -30,13 +33,27 @@ func NewUserAuthMiddleware(
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			authHeader := r.Header.Get("Authorization")
+			token := ""
+			credentialsProvided := authHeader != ""
+			if authHeader != "" {
+				parts := strings.Fields(authHeader)
+				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+					token = parts[1]
+				}
+			} else if queryToken := r.URL.Query().Get("access_token"); queryToken != "" {
+				token = queryToken
+				credentialsProvided = true
+			}
 
-			if len(authHeader) > 7 {
-				token := authHeader[7:]
+			if token != "" {
 				userDevice, err := getUserDeviceForAuthToken(ctx, token)
 				if err == nil {
 					ctx = context.WithValue(ctx, requestUserKey, &userDevice)
+				} else {
+					ctx = context.WithValue(ctx, requestUserAuthErrorKey, err)
 				}
+			} else if credentialsProvided {
+				ctx = context.WithValue(ctx, requestUserAuthErrorKey, mautrix.MUnknownToken)
 			}
 
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -56,7 +73,17 @@ func RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := GetRequestUserDevice(r)
 		if u == nil {
-			if r.Header.Get("Authorization") != "" {
+			if err, _ := r.Context().Value(requestUserAuthErrorKey).(error); errors.Is(err, types.ErrTokenExpired) {
+				util.ResponseJSON(w, r, http.StatusUnauthorized, map[string]any{
+					"errcode":     mautrix.MUnknownToken.ErrCode,
+					"error":       "Access token has expired",
+					"soft_logout": true,
+				})
+			} else if err, _ := r.Context().Value(requestUserAuthErrorKey).(error); err != nil {
+				if !errors.Is(err, types.ErrUserNotFound) && !errors.Is(err, mautrix.MUnknownToken) {
+					util.ResponseErrorUnknownJSON(w, r, err)
+					return
+				}
 				util.ResponseErrorJSON(w, r, mautrix.MUnknownToken)
 			} else {
 				util.ResponseErrorJSON(w, r, mautrix.MMissingToken)

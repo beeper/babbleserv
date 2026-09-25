@@ -317,3 +317,34 @@ func (c *ClientRoutes) logout(w http.ResponseWriter, r *http.Request, all bool) 
 	}
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
+
+func (c *ClientRoutes) Refresh(w http.ResponseWriter, r *http.Request) {
+	body, _, parseErr := parseUIARequestBody(r, false)
+	if parseErr != nil {
+		if parseErr.ErrCode == mautrix.MTooLarge.ErrCode {
+			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, parseErr)
+			return
+		}
+		util.ResponseErrorJSON(w, r, *parseErr)
+		return
+	}
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+		return
+	} else if req.RefreshToken == "" {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing refresh token")
+		return
+	}
+	resp, err := c.db.Accounts.RefreshAccessToken(r.Context(), req.RefreshToken)
+	if errors.Is(err, types.ErrUserNotFound) {
+		util.ResponseErrorJSON(w, r, mautrix.MUnknownToken)
+		return
+	} else if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	util.ResponseJSON(w, r, http.StatusOK, resp)
+}

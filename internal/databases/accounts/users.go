@@ -10,6 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/databases/accounts/tokens"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -30,7 +31,7 @@ func (a *AccountsDatabase) GetLocalUser(ctx context.Context, userID id.UserID) (
 }
 
 func (a *AccountsDatabase) GetUserDeviceForAuthToken(ctx context.Context, token string) (types.UserDevice, error) {
-	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (types.UserDevice, error) {
+	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.UserDevice, error) {
 		authToken, err := a.tokens.TxnGetAuthTokenTup(txn, token)
 		var device types.UserDevice
 		if err != nil {
@@ -40,6 +41,9 @@ func (a *AccountsDatabase) GetUserDeviceForAuthToken(ctx context.Context, token 
 		} else if authToken.Expires.UnixMicro() != 0 && authToken.Expires.Before(time.Now().UTC()) {
 			return device, types.ErrTokenExpired
 		} else {
+			if err := a.tokens.TxnMarkAuthTokenUsed(txn, token, authToken); err != nil {
+				return device, err
+			}
 			device.UserID = authToken.UserID
 			device.DeviceID = authToken.DeviceID
 			return device, nil
@@ -148,6 +152,7 @@ type authResp struct {
 	DeviceID     id.DeviceID `json:"device_id"`
 	AccessToken  string      `json:"access_token"`
 	RefreshToken string      `json:"refresh_token,omitempty"`
+	ExpiresInMS  int64       `json:"expires_in_ms,omitempty"`
 }
 
 func (a *AccountsDatabase) LoginWithPassword(
@@ -188,6 +193,10 @@ func (a *AccountsDatabase) LoginWithPassword(
 			withRefreshToken,
 			a.config.Accounts.RefreshAccessTokenExpire,
 		)
+
+		if expiry := a.config.Accounts.RefreshAccessTokenExpire; withRefreshToken && expiry > 0 {
+			resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
+		}
 
 		if _, err = a.devices.TxnGetOrCreateDevice(txn, userID, deviceID, initialDeviceDisplayName); err != nil {
 			return resp, err
@@ -248,6 +257,10 @@ func (a *AccountsDatabase) RegisterWithPassword(
 			a.config.Accounts.RefreshAccessTokenExpire,
 		)
 
+		if expiry := a.config.Accounts.RefreshAccessTokenExpire; withRefreshToken && expiry > 0 {
+			resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
+		}
+
 		if _, err = a.devices.TxnGetOrCreateDevice(txn, userID, deviceID, initialDeviceDisplayName); err != nil {
 			return nil, err
 		}
@@ -304,4 +317,34 @@ func (a *AccountsDatabase) runDeviceRemoval(
 		a.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{userID}})
 	}
 	return err
+}
+
+type refreshResp struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresInMS  *int64 `json:"expires_in_ms,omitempty"`
+}
+
+func (a *AccountsDatabase) RefreshAccessToken(ctx context.Context, refreshToken string) (refreshResp, error) {
+	refreshed, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (*tokens.RefreshResult, error) {
+		return a.tokens.TxnRefreshAccessToken(txn, refreshToken, a.config.Accounts.RefreshAccessTokenExpire)
+	})
+	if err != nil {
+		return refreshResp{}, err
+	} else if refreshed == nil {
+		return refreshResp{}, types.ErrUserNotFound
+	}
+	resp := refreshResp{AccessToken: refreshed.AccessToken, RefreshToken: refreshed.RefreshToken}
+	if refreshed.ExpiresAt.UnixMicro() != 0 {
+		remaining := max(time.Until(refreshed.ExpiresAt).Milliseconds(), 0)
+		resp.ExpiresInMS = &remaining
+	}
+	return resp, nil
+}
+
+func (a *AccountsDatabase) CleanupExpiredAccessTokens(ctx context.Context, limit int) (int, error) {
+	// Retain expired tokens for a day so clients can receive the soft-logout hint.
+	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (int, error) {
+		return a.tokens.TxnCleanupExpiredAuthTokens(txn, time.Now().Add(-24*time.Hour), limit)
+	})
 }
