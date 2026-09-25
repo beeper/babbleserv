@@ -3,6 +3,7 @@ package accounts
 import (
 	"bytes"
 	"context"
+	"errors"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -282,7 +283,7 @@ func (a *AccountsDatabase) RegisterWithPassword(
 	return resp, nil
 }
 
-func (a *AccountsDatabase) runDeviceRemoval(
+func (a *AccountsDatabase) runAccountUpdate(
 	ctx context.Context,
 	userID id.UserID,
 	password *string,
@@ -347,4 +348,41 @@ func (a *AccountsDatabase) CleanupExpiredAccessTokens(ctx context.Context, limit
 	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (int, error) {
 		return a.tokens.TxnCleanupExpiredAuthTokens(txn, time.Now().Add(-24*time.Hour), limit)
 	})
+}
+
+func (a *AccountsDatabase) ChangePassword(
+	ctx context.Context,
+	userDevice types.UserDevice,
+	oldPassword string,
+	newPasswordHash []byte,
+	logoutDevices bool,
+	uiaSession, method, path string,
+) error {
+	err := a.runAccountUpdate(ctx, userDevice.UserID, &oldPassword, func(txn fdb.Transaction) (bool, error) {
+		if err := a.txnConsumeUIASession(txn, uiaSession, userDevice, method, path); err != nil {
+			return false, err
+		}
+		a.users.TxnSetLocalUserPasswordHash(txn, userDevice.UserID.Localpart(), newPasswordHash)
+		if !logoutDevices {
+			return false, nil
+		}
+		devices, err := txn.GetRange(a.devices.RangeForUserDevices(userDevice.UserID), fdb.RangeOptions{
+			Mode: fdb.StreamingModeWantAll, Limit: types.MaxVersionstampUserVersion + 2,
+		}).GetSliceWithError()
+		if err != nil {
+			return false, err
+		}
+		deviceIDs := make([]id.DeviceID, 0, len(devices))
+		for _, kv := range devices {
+			deviceID := types.MustNewDeviceFromBytes(kv.Value).ID
+			if deviceID != userDevice.DeviceID {
+				deviceIDs = append(deviceIDs, deviceID)
+			}
+		}
+		return a.txnDeleteUserDevices(txn, userDevice.UserID, deviceIDs)
+	})
+	if errors.Is(err, types.ErrUIASessionExpired) {
+		a.cleanupExpiredUIASession(ctx, uiaSession)
+	}
+	return err
 }

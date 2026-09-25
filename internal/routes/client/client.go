@@ -120,6 +120,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodPost, "/v3/logout/all", middleware.RequireUserAuth(c.LogoutAll))
 
 	rtr.MethodFunc(http.MethodGet, "/v3/account/whoami", middleware.RequireUserAuth(c.GetWhoami))
+	rtr.MethodFunc(http.MethodPost, "/v3/account/password", middleware.RequireUserAuth(c.ChangePassword))
 
 	// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))

@@ -179,7 +179,7 @@ func (a *AccountsDatabase) DeleteUserDevicesWithPassword(
 	deviceIDs []id.DeviceID,
 	uiaSession, method, path string,
 ) error {
-	err := a.runDeviceRemoval(ctx, userDevice.UserID, &password, func(txn fdb.Transaction) (bool, error) {
+	err := a.runAccountUpdate(ctx, userDevice.UserID, &password, func(txn fdb.Transaction) (bool, error) {
 		if err := a.txnConsumeUIASession(txn, uiaSession, userDevice, method, path); err != nil {
 			return false, err
 		}
@@ -192,7 +192,7 @@ func (a *AccountsDatabase) DeleteUserDevicesWithPassword(
 }
 
 func (a *AccountsDatabase) Logout(ctx context.Context, userDevice types.UserDevice, all bool) error {
-	return a.runDeviceRemoval(ctx, userDevice.UserID, nil, func(txn fdb.Transaction) (bool, error) {
+	return a.runAccountUpdate(ctx, userDevice.UserID, nil, func(txn fdb.Transaction) (bool, error) {
 		deviceIDs := []id.DeviceID{userDevice.DeviceID}
 		if all {
 			devices, err := txn.GetRange(a.devices.RangeForUserDevices(userDevice.UserID), fdb.RangeOptions{

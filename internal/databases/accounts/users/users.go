@@ -137,6 +137,10 @@ func (u *UsersDirectory) TxnGetLocalUserPasswordHash(txn fdb.ReadTransaction, us
 	return txn.Get(key).Get()
 }
 
+func (u *UsersDirectory) TxnSetLocalUserPasswordHash(txn fdb.Transaction, username string, hash []byte) {
+	txn.Set(u.userPasswordHashes.Pack(tuple.Tuple{username}), hash)
+}
+
 func (u *UsersDirectory) keyForUser(userID id.UserID) fdb.Key {
 	if userID.Homeserver() == u.serverName {
 		return u.localUsers.Pack(tuple.Tuple{userID.String()})

@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
@@ -140,6 +142,47 @@ type passwordAuthData struct {
 	Password   string                 `json:"password"`
 }
 
+type reqChangePassword struct {
+	NewPassword   string `json:"new_password"`
+	LogoutDevices *bool  `json:"logout_devices,omitempty"`
+}
+
+type storedChangePasswordRequest struct {
+	NewPasswordHash []byte `json:"new_password_hash"`
+	LogoutDevices   bool   `json:"logout_devices"`
+}
+
+func prepareStoredUIAParams(path string, params json.RawMessage) (json.RawMessage, error) {
+	if path != "/_matrix/client/v3/account/password" {
+		return params, nil
+	}
+	var req reqChangePassword
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(storedChangePasswordRequest{
+		NewPasswordHash: hash,
+		LogoutDevices:   req.LogoutDevices == nil || *req.LogoutDevices,
+	})
+}
+
+func storedUIAParamsMatch(path string, submitted, stored json.RawMessage) bool {
+	if path != "/_matrix/client/v3/account/password" {
+		return bytes.Equal(submitted, stored)
+	}
+	var req reqChangePassword
+	var saved storedChangePasswordRequest
+	if json.Unmarshal(submitted, &req) != nil || json.Unmarshal(stored, &saved) != nil {
+		return false
+	}
+	return (req.LogoutDevices == nil || *req.LogoutDevices) == saved.LogoutDevices &&
+		bcrypt.CompareHashAndPassword(saved.NewPasswordHash, []byte(req.NewPassword)) == nil
+}
+
 type passwordUIAResponse struct {
 	Flows   []mautrix.UIAFlow `json:"flows"`
 	Params  map[string]any    `json:"params"`
@@ -207,8 +250,13 @@ func (c *ClientRoutes) createPasswordUIASession(
 	params json.RawMessage,
 	errCode, message string,
 ) {
+	storedParams, err := prepareStoredUIAParams(r.URL.Path, params)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
 	session, err := c.db.Accounts.CreateUIASession(
-		r.Context(), userDevice, r.Method, r.URL.Path, params,
+		r.Context(), userDevice, r.Method, r.URL.Path, storedParams,
 	)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
@@ -248,7 +296,7 @@ func (c *ClientRoutes) parsePasswordUIA(
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return nil, nil, false
 		}
-		if string(params) != "{}" && !bytes.Equal(params, stored) {
+		if string(params) != "{}" && !storedUIAParamsMatch(r.URL.Path, params, stored) {
 			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Request parameters changed during UIA")
 			return nil, nil, false
 		}
@@ -347,4 +395,66 @@ func (c *ClientRoutes) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	util.ResponseJSON(w, r, http.StatusOK, resp)
+}
+
+func (c *ClientRoutes) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	params, rawAuth, respErr := parseUIARequestBody(r, false)
+	if respErr != nil {
+		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
+			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
+			return
+		}
+		util.ResponseErrorJSON(w, r, *respErr)
+		return
+	}
+	var req reqChangePassword
+	if err := json.Unmarshal(params, &req); err != nil {
+		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+		return
+	}
+	var sessionAuth passwordAuthData
+	if len(rawAuth) > 0 {
+		if err := json.Unmarshal(rawAuth, &sessionAuth); err != nil {
+			util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+			return
+		}
+	}
+	if req.NewPassword == "" && (string(params) != "{}" || sessionAuth.Session == "") {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing or empty new_password")
+		return
+	}
+	if len(req.NewPassword) > 72 {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Password exceeds 72 bytes")
+		return
+	}
+	userDevice := *middleware.GetRequestUserDevice(r)
+	auth, prepared, ok := c.parsePasswordUIA(w, r, params, rawAuth, userDevice)
+	if !ok {
+		return
+	}
+	if auth.Session == "" {
+		var err error
+		prepared, err = prepareStoredUIAParams(r.URL.Path, params)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
+	}
+	var stored storedChangePasswordRequest
+	if err := json.Unmarshal(prepared, &stored); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	err := c.db.Accounts.ChangePassword(
+		r.Context(), userDevice, auth.Password, stored.NewPasswordHash, stored.LogoutDevices,
+		auth.Session, r.Method, r.URL.Path,
+	)
+	if c.respondPasswordError(w, r, userDevice, params, auth.Session, err) {
+		return
+	}
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
