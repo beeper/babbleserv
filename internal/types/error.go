@@ -11,6 +11,10 @@ var (
 	ErrUserNotFound       = errors.New("user not found")
 	ErrUserDeviceNotFound = errors.New("user device not found")
 
+	ErrUIASessionNotFound = errors.New("UIA session not found")
+	ErrUIASessionExpired  = errors.New("UIA session expired")
+	ErrUIASessionMismatch = errors.New("UIA session mismatch")
+
 	ErrTokenExpired      = errors.New("token is expired")
 	ErrUserAlreadyExists = errors.New("username already exists")
 	ErrInvalidPassword   = errors.New("invalid password")

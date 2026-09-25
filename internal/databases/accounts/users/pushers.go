@@ -85,3 +85,25 @@ func (u *UsersDirectory) TxnDeletePusherForUser(txn fdb.Transaction, userID id.U
 	txn.Clear(u.keyForUserPusherDevice(userID, appID, pushKey))
 	txn.Clear(u.keyForPusherIdentityUser(appID, pushKey, userID))
 }
+
+func (u *UsersDirectory) TxnDeletePushersForDevices(txn fdb.Transaction, userID id.UserID, deviceIDs map[id.DeviceID]struct{}) error {
+	if len(deviceIDs) == 0 {
+		return nil
+	}
+	iter := txn.GetRange(u.userPusherDevices.Sub(userID.String()), fdb.RangeOptions{Mode: fdb.StreamingModeIterator}).Iterator()
+	for iter.Advance() {
+		kv, err := iter.Get()
+		if err != nil {
+			return err
+		}
+		if _, ok := deviceIDs[id.DeviceID(kv.Value)]; !ok {
+			continue
+		}
+		tup, err := u.userPusherDevices.Unpack(kv.Key)
+		if err != nil {
+			return err
+		}
+		u.TxnDeletePusherForUser(txn, userID, pushgateway.PusherAppID(tup[1].(string)), tup[2].(string))
+	}
+	return nil
+}

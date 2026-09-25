@@ -87,7 +87,7 @@ func (c *ClientRoutes) GetAccountData(w http.ResponseWriter, r *http.Request) {
 
 // Chi matches RawPath when present; otherwise net/http has already decoded
 // Path. Decode exactly once, including literal percent escapes in identifiers.
-func roomTagURLParam(r *http.Request, name string) string {
+func decodedURLParam(r *http.Request, name string) string {
 	value := chi.URLParam(r, name)
 	if r.URL.RawPath != "" {
 		value, _ = url.PathUnescape(value)
@@ -98,11 +98,11 @@ func roomTagURLParam(r *http.Request, name string) string {
 // https://spec.matrix.org/v1.19/client-server-api/#room-tagging
 func (c *ClientRoutes) GetRoomTags(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	if userID.String() != roomTagURLParam(r, "userID") {
+	if userID.String() != decodedURLParam(r, "userID") {
 		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
 		return
 	}
-	ad, err := c.db.Accounts.GetAccountData(r.Context(), userID, id.RoomID(roomTagURLParam(r, "roomID")), event.AccountDataRoomTags)
+	ad, err := c.db.Accounts.GetAccountData(r.Context(), userID, id.RoomID(decodedURLParam(r, "roomID")), event.AccountDataRoomTags)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -130,11 +130,11 @@ func (c *ClientRoutes) DeleteRoomTag(w http.ResponseWriter, r *http.Request) {
 
 func (c *ClientRoutes) updateRoomTag(w http.ResponseWriter, r *http.Request, remove bool) {
 	userID := middleware.GetRequestUserID(r)
-	if userID.String() != roomTagURLParam(r, "userID") {
+	if userID.String() != decodedURLParam(r, "userID") {
 		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
 		return
 	}
-	tag := roomTagURLParam(r, "tag")
+	tag := decodedURLParam(r, "tag")
 	if len(tag) == 0 || len(tag) > 255 {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Tag name must contain 1 to 255 bytes")
 		return
@@ -173,7 +173,7 @@ func (c *ClientRoutes) updateRoomTag(w http.ResponseWriter, r *http.Request, rem
 			return
 		}
 	}
-	if err := c.db.Accounts.UpdateRoomTag(r.Context(), userID, id.RoomID(roomTagURLParam(r, "roomID")), tag, encoded, remove); err != nil {
+	if err := c.db.Accounts.UpdateRoomTag(r.Context(), userID, id.RoomID(decodedURLParam(r, "roomID")), tag, encoded, remove); err != nil {
 		if errors.Is(err, accounts.ErrRoomTagsTooLarge) {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, &mautrix.MTooLarge)
 		} else {

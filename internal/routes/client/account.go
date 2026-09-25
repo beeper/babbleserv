@@ -1,8 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"maunium.net/go/mautrix"
@@ -128,4 +131,189 @@ func (c *ClientRoutes) Register(w http.ResponseWriter, r *http.Request) {
 	} else {
 		util.ResponseJSON(w, r, http.StatusOK, resp)
 	}
+}
+
+type passwordAuthData struct {
+	Type       mautrix.AuthType       `json:"type"`
+	Session    string                 `json:"session,omitempty"`
+	Identifier mautrix.UserIdentifier `json:"identifier"`
+	Password   string                 `json:"password"`
+}
+
+type passwordUIAResponse struct {
+	Flows   []mautrix.UIAFlow `json:"flows"`
+	Params  map[string]any    `json:"params"`
+	Session string            `json:"session"`
+	ErrCode string            `json:"errcode,omitempty"`
+	Error   string            `json:"error,omitempty"`
+}
+
+func respondPasswordUIA(w http.ResponseWriter, r *http.Request, session, errCode, message string) {
+	util.ResponseJSON(w, r, http.StatusUnauthorized, passwordUIAResponse{
+		Flows:   []mautrix.UIAFlow{{Stages: []mautrix.AuthType{mautrix.AuthTypePassword}}},
+		Params:  map[string]any{},
+		Session: session,
+		ErrCode: errCode,
+		Error:   message,
+	})
+}
+
+func parseUIARequestBody(r *http.Request, allowEmpty bool) (json.RawMessage, json.RawMessage, *mautrix.RespError) {
+	var encoded json.RawMessage
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if err != nil {
+		return nil, nil, &mautrix.MNotJSON
+	}
+	if len(bodyBytes) > 64<<10 {
+		return nil, nil, &mautrix.MTooLarge
+	}
+	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
+	if err := decoder.Decode(&encoded); err != nil {
+		if allowEmpty && errors.Is(err, io.EOF) {
+			encoded = json.RawMessage("{}")
+		} else {
+			return nil, nil, &mautrix.MNotJSON
+		}
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, nil, &mautrix.MNotJSON
+	}
+	var body map[string]any
+	objectDecoder := json.NewDecoder(bytes.NewReader(encoded))
+	objectDecoder.UseNumber()
+	if err := objectDecoder.Decode(&body); err != nil || body == nil {
+		return nil, nil, &mautrix.MBadJSON
+	}
+	var auth json.RawMessage
+	if value, ok := body["auth"]; ok {
+		auth, _ = json.Marshal(value)
+	}
+	delete(body, "auth")
+	params, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	if len(params) > 64<<10 {
+		return nil, nil, &mautrix.MTooLarge
+	}
+	return params, auth, nil
+}
+
+func (c *ClientRoutes) createPasswordUIASession(
+	w http.ResponseWriter,
+	r *http.Request,
+	userDevice types.UserDevice,
+	params json.RawMessage,
+	errCode, message string,
+) {
+	session, err := c.db.Accounts.CreateUIASession(
+		r.Context(), userDevice, r.Method, r.URL.Path, params,
+	)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	respondPasswordUIA(w, r, session, errCode, message)
+}
+
+func (c *ClientRoutes) parsePasswordUIA(
+	w http.ResponseWriter,
+	r *http.Request,
+	params, raw json.RawMessage,
+	userDevice types.UserDevice,
+) (*passwordAuthData, json.RawMessage, bool) {
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+		c.createPasswordUIASession(w, r, userDevice, params, "", "")
+		return nil, nil, false
+	}
+	var auth passwordAuthData
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		c.createPasswordUIASession(
+			w, r, userDevice, params, mautrix.MForbidden.ErrCode, "Invalid authentication data",
+		)
+		return nil, nil, false
+	}
+	if auth.Session != "" {
+		stored, err := c.db.Accounts.GetUIASessionRequest(
+			r.Context(), auth.Session, userDevice, r.Method, r.URL.Path,
+		)
+		if errors.Is(err, types.ErrUIASessionMismatch) {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "UIA session does not belong to this request")
+			return nil, nil, false
+		} else if errors.Is(err, types.ErrUIASessionNotFound) || errors.Is(err, types.ErrUIASessionExpired) {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Unknown or expired UIA session")
+			return nil, nil, false
+		} else if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return nil, nil, false
+		}
+		if string(params) != "{}" && !bytes.Equal(params, stored) {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Request parameters changed during UIA")
+			return nil, nil, false
+		}
+		params = stored
+	}
+	if auth.Type != mautrix.AuthTypePassword || auth.Identifier.Type != mautrix.IdentifierTypeUser || auth.Password == "" {
+		if auth.Session == "" {
+			c.createPasswordUIASession(
+				w, r, userDevice, params, mautrix.MForbidden.ErrCode, "Invalid password authentication",
+			)
+		} else {
+			respondPasswordUIA(w, r, auth.Session, mautrix.MForbidden.ErrCode, "Invalid password authentication")
+		}
+		return nil, nil, false
+	}
+
+	authUser := auth.Identifier.User
+	if parsed := id.UserID(authUser); parsed.Homeserver() == "" {
+		authUser = "@" + authUser + ":" + userDevice.UserID.Homeserver()
+	}
+	if id.UserID(authUser) != userDevice.UserID {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "Authentication user does not match access token owner")
+		return nil, nil, false
+	}
+	return &auth, params, true
+}
+
+func (c *ClientRoutes) respondPasswordError(
+	w http.ResponseWriter,
+	r *http.Request,
+	userDevice types.UserDevice,
+	params json.RawMessage,
+	session string,
+	err error,
+) bool {
+	if errors.Is(err, types.ErrInvalidPassword) || errors.Is(err, types.ErrUserNotFound) {
+		if session == "" {
+			c.createPasswordUIASession(
+				w, r, userDevice, params, mautrix.MForbidden.ErrCode, "Invalid password",
+			)
+		} else {
+			respondPasswordUIA(w, r, session, mautrix.MForbidden.ErrCode, "Invalid password")
+		}
+		return true
+	} else if errors.Is(err, types.ErrUIASessionNotFound) || errors.Is(err, types.ErrUIASessionExpired) ||
+		errors.Is(err, types.ErrUIASessionMismatch) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "UIA session is no longer valid")
+		return true
+	}
+	return false
+}
+
+func (c *ClientRoutes) Logout(w http.ResponseWriter, r *http.Request) {
+	c.logout(w, r, false)
+}
+
+func (c *ClientRoutes) LogoutAll(w http.ResponseWriter, r *http.Request) {
+	c.logout(w, r, true)
+}
+
+func (c *ClientRoutes) logout(w http.ResponseWriter, r *http.Request, all bool) {
+	err := c.db.Accounts.Logout(r.Context(), *middleware.GetRequestUserDevice(r), all)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }

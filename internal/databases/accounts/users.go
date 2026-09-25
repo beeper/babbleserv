@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"bytes"
 	"context"
 	"time"
 
@@ -43,6 +44,102 @@ func (a *AccountsDatabase) GetUserDeviceForAuthToken(ctx context.Context, token 
 			device.DeviceID = authToken.DeviceID
 			return device, nil
 		}
+	})
+}
+
+const uiaSessionLifetime = 5 * time.Minute
+
+func (a *AccountsDatabase) CreateUIASession(
+	ctx context.Context,
+	userDevice types.UserDevice,
+	method, path string,
+	request []byte,
+) (string, error) {
+	session := util.GenerateRandomString(32)
+	expiresAt := time.Now().UTC().Add(uiaSessionLifetime)
+	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+		a.tokens.TxnCreateUIASession(
+			txn, session, userDevice.UserID, userDevice.DeviceID, method, path, request, expiresAt,
+		)
+		return nil, nil
+	})
+	return session, err
+}
+
+func (a *AccountsDatabase) GetUIASessionRequest(
+	ctx context.Context,
+	session string,
+	userDevice types.UserDevice,
+	method, path string,
+) ([]byte, error) {
+	type result struct {
+		request []byte
+		expired bool
+	}
+	res, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (result, error) {
+		uia, err := a.tokens.TxnGetUIASession(txn, session)
+		if err != nil {
+			return result{}, err
+		} else if uia == nil {
+			return result{}, types.ErrUIASessionNotFound
+		} else if uia.ExpiresAt.Before(time.Now().UTC()) {
+			if err := a.tokens.TxnDeleteUIASession(txn, session); err != nil {
+				return result{}, err
+			}
+			return result{expired: true}, nil
+		} else if uia.UserID != userDevice.UserID || uia.DeviceID != userDevice.DeviceID ||
+			uia.Method != method || uia.Path != path {
+			return result{}, types.ErrUIASessionMismatch
+		}
+		return result{request: uia.Request}, nil
+	})
+	if err != nil {
+		return nil, err
+	} else if res.expired {
+		return nil, types.ErrUIASessionExpired
+	}
+	return res.request, nil
+}
+
+func (a *AccountsDatabase) txnConsumeUIASession(
+	txn fdb.Transaction,
+	session string,
+	userDevice types.UserDevice,
+	method, path string,
+) error {
+	if session == "" {
+		return nil
+	}
+	uia, err := a.tokens.TxnGetUIASession(txn, session)
+	if err != nil {
+		return err
+	} else if uia == nil {
+		return types.ErrUIASessionNotFound
+	} else if uia.ExpiresAt.Before(time.Now().UTC()) {
+		return types.ErrUIASessionExpired
+	} else if uia.UserID != userDevice.UserID || uia.DeviceID != userDevice.DeviceID ||
+		uia.Method != method || uia.Path != path {
+		return types.ErrUIASessionMismatch
+	}
+	return a.tokens.TxnDeleteUIASession(txn, session)
+}
+
+func (a *AccountsDatabase) cleanupExpiredUIASession(ctx context.Context, session string) {
+	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+		uia, err := a.tokens.TxnGetUIASession(txn, session)
+		if err != nil || uia == nil || !uia.ExpiresAt.Before(time.Now().UTC()) {
+			return nil, err
+		}
+		return nil, a.tokens.TxnDeleteUIASession(txn, session)
+	})
+	if err != nil {
+		a.log.Warn().Err(err).Str("session", session).Msg("Failed to delete expired UIA session")
+	}
+}
+
+func (a *AccountsDatabase) CleanupExpiredUIASessions(ctx context.Context, limit int) (int, error) {
+	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (int, error) {
+		return a.tokens.TxnCleanupExpiredUIASessions(txn, time.Now().UTC(), limit)
 	})
 }
 
@@ -170,4 +267,41 @@ func (a *AccountsDatabase) RegisterWithPassword(
 		Msg("Registered new user")
 
 	return resp, nil
+}
+
+func (a *AccountsDatabase) runDeviceRemoval(
+	ctx context.Context,
+	userID id.UserID,
+	password *string,
+	callback func(fdb.Transaction) (bool, error),
+) error {
+	var expectedHash []byte
+	if password != nil {
+		var err error
+		expectedHash, err = util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) ([]byte, error) {
+			return a.users.TxnGetLocalUserPasswordHash(txn, userID.Localpart())
+		})
+		if err != nil {
+			return err
+		}
+		if expectedHash == nil || bcrypt.CompareHashAndPassword(expectedHash, []byte(*password)) != nil {
+			return types.ErrInvalidPassword
+		}
+	}
+	changed, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
+		if password != nil {
+			currentHash, err := a.users.TxnGetLocalUserPasswordHash(txn, userID.Localpart())
+			if err != nil {
+				return false, err
+			}
+			if !bytes.Equal(currentHash, expectedHash) {
+				return false, types.ErrInvalidPassword
+			}
+		}
+		return callback(txn)
+	})
+	if err == nil && changed {
+		a.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{userID}})
+	}
+	return err
 }
