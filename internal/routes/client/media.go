@@ -26,6 +26,11 @@ func (c *ClientRoutes) GetMediaConfig(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediadownloadservernamemediaidfilename
 func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
+	allowRemote, err := mediaAllowsRemote(r)
+	if err != nil {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+		return
+	}
 	wait, err := c.pendingWait(r)
 	if err != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
@@ -34,7 +39,13 @@ func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 	serverName := decodedURLParam(r, "serverName")
 	mediaID := decodedURLParam(r, "mediaID")
 
-	if media, err := c.waitForMedia(r, serverName, mediaID, wait); err != nil {
+	media, err := c.getOrFetchMedia(r, serverName, mediaID, allowRemote)
+	if err == nil && media != nil && media.UploadedAt.IsZero() {
+		media, err = c.waitForMedia(r, serverName, mediaID, wait)
+	}
+	if c.respondRemoteMediaError(w, r, err) {
+		return
+	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if media == nil {
@@ -47,6 +58,11 @@ func (c *ClientRoutes) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv1mediathumbnailservernamemediaid
 func (c *ClientRoutes) DownloadThumbnail(w http.ResponseWriter, r *http.Request) {
+	allowRemote, err := mediaAllowsRemote(r)
+	if err != nil {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+		return
+	}
 	wait, err := c.pendingWait(r)
 	if err != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
@@ -58,11 +74,32 @@ func (c *ClientRoutes) DownloadThumbnail(w http.ResponseWriter, r *http.Request)
 	}
 	serverName := decodedURLParam(r, "serverName")
 	mediaID := decodedURLParam(r, "mediaID")
+	if !validMediaReference(serverName, mediaID) {
+		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	}
+	animated := r.URL.Query().Get("animated")
 	key := thumbnailMediaID(mediaID, width, height, method)
+	if serverName != c.config.ServerName && animated == "true" {
+		key += "-animated"
+	}
 	thumbnail, err := c.db.Media.GetMedia(r.Context(), serverName, key)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
+	}
+	if thumbnail == nil && serverName != c.config.ServerName {
+		if !allowRemote {
+			util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+			return
+		}
+		thumbnail, err = c.fetchAndCacheRemoteThumbnail(r, serverName, mediaID, key, width, height, method, animated)
+		if c.respondRemoteMediaError(w, r, err) {
+			return
+		} else if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
 	}
 	if thumbnail == nil {
 		original, err := c.waitForMedia(r, serverName, mediaID, wait)

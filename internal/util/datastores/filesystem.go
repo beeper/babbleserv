@@ -124,3 +124,14 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	}
 	return r.reader.Read(p)
 }
+
+func (s *FilesystemStore) DeleteObject(_ context.Context, key string) error {
+	path, err := s.objectPath(key)
+	if err != nil {
+		return err
+	}
+	if err = os.Remove(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}

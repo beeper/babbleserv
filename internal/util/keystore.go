@@ -86,6 +86,10 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 		return err
 	}
 
+	if len(serverKeys.verifyKeys) == 0 {
+		return errors.New("server has no verification keys")
+	}
+
 	errs := make([]error, 0)
 
 	// Accept signatures under the full host:port key and just host

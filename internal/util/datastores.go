@@ -125,3 +125,11 @@ func (d *Datastores) PutObjectForMedia(ctx context.Context, m *types.Media, inpu
 	}
 	return store.PutObject(ctx, m.StorePath, input, info)
 }
+
+func (d *Datastores) DeleteObjectForMedia(ctx context.Context, m *types.Media) error {
+	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
+	return store.DeleteObject(ctx, m.StorePath)
+}

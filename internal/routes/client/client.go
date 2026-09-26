@@ -21,14 +21,15 @@ import (
 type ClientRoutes struct {
 	backgroundWg sync.WaitGroup
 
-	log        zerolog.Logger
-	db         *databases.Databases
-	config     config.BabbleConfig
-	fclient    fclient.FederationClient
-	fedClient  *federation.Client
-	keyStore   *util.KeyStore
-	datastores *util.Datastores
-	notifiers  *notifier.Notifiers
+	log         zerolog.Logger
+	db          *databases.Databases
+	config      config.BabbleConfig
+	fclient     fclient.FederationClient
+	fedClient   *federation.Client
+	mediaClient *federation.Client
+	keyStore    *util.KeyStore
+	datastores  *util.Datastores
+	notifiers   *notifier.Notifiers
 }
 
 func NewClientRoutes(
@@ -45,15 +46,21 @@ func NewClientRoutes(
 		Str("routes", "client").
 		Logger()
 
+	mediaClient := federation.NewClient(fedClient.ServerName, fedClient.Key, federation.NewInMemoryCache())
+	mediaClient.UserAgent = fedClient.UserAgent
+	mediaClient.HTTP.Timeout = 0 // The media acquisition context covers network and storage work.
+	mediaClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.MaxResponseHeaderBytes = 64 * 1024
+
 	return &ClientRoutes{
-		log:        log,
-		db:         db,
-		config:     cfg,
-		fclient:    fclient,
-		fedClient:  fedClient,
-		keyStore:   keyStore,
-		datastores: datastores,
-		notifiers:  notifiers,
+		log:         log,
+		db:          db,
+		config:      cfg,
+		fclient:     fclient,
+		fedClient:   fedClient,
+		mediaClient: mediaClient,
+		keyStore:    keyStore,
+		datastores:  datastores,
+		notifiers:   notifiers,
 	}
 }
 

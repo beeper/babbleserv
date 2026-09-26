@@ -29,6 +29,7 @@ type Datastore interface {
 	GetObject(context.Context, string) (io.Reader, error)
 	GetObjectInfo(context.Context, string) (ObjectInfo, error)
 	PutObject(context.Context, string, io.Reader, ObjectInfo) error
+	DeleteObject(context.Context, string) error
 }
 
 type baseDatastore struct {

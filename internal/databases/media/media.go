@@ -113,6 +113,31 @@ func (m *MediaDatabase) CreateMedia(ctx context.Context, media *types.Media) err
 	return err
 }
 
+func (m *MediaDatabase) PublishRemoteMedia(ctx context.Context, candidate *types.Media) (*types.Media, error) {
+	return util.DoWriteTransaction(ctx, m.db, func(txn fdb.Transaction) (*types.Media, error) {
+		key := m.keyForMedia(candidate.ServerName, candidate.MediaID)
+		existingBytes, err := txn.Get(key).Get()
+		if err != nil {
+			return nil, err
+		} else if existingBytes != nil {
+			existing, err := types.NewMediaFromBytes(existingBytes, candidate.ServerName, candidate.MediaID)
+			if err != nil {
+				return nil, err
+			}
+			if existing.UploadedAt.IsZero() {
+				return nil, ErrMediaAlreadyExists
+			}
+			return existing, nil
+		}
+
+		txn.Set(key, candidate.ToMsgpack())
+		version := tuple.IncompleteVersionstamp(0)
+		kv := m.keyValueForMediaVersion(candidate.ServerName, candidate.MediaID, version)
+		txn.SetVersionstampedKey(kv.Key, kv.Value)
+		return candidate, nil
+	})
+}
+
 func (m *MediaDatabase) SetMedia(ctx context.Context, media *types.Media) error {
 	_, err := util.DoWriteTransaction(ctx, m.db, func(txn fdb.Transaction) (*struct{}, error) {
 		txn.Set(m.keyForMedia(media.ServerName, media.MediaID), media.ToMsgpack())
