@@ -92,8 +92,7 @@ func (r *RoomsDatabase) SendLocalEvents(
 			}
 		}
 		if options.PublishRoom {
-			room.Public = true
-			txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
+			r.txnSetRoomPublished(txn, room, true)
 		}
 
 		if options.LockTxnRefresh != nil {
@@ -844,12 +843,15 @@ func (r *RoomsDatabase) txnResolveRoomState(
 		Int("resolved", len(resolvedStateMap)).
 		Msg("Applying resolved room state")
 
+	previousMemberCount := room.MemberCount
+	var roomChanged bool
 	for _, tup := range toClear {
 		log.Trace().Any("state", tup).Msg("Delete state event references")
-		r.txnDeleteStateEvent(txn, eventsProvider.MustGet(tup.EventID))
+		if r.txnDeleteStateEvent(txn, room, eventsProvider.MustGet(tup.EventID)) {
+			roomChanged = true
+		}
 	}
 
-	var roomChanged bool
 	latestVersion := evs[len(evs)-1].IncompleteVersion
 
 	for _, tup := range toSet {
@@ -866,7 +868,7 @@ func (r *RoomsDatabase) txnResolveRoomState(
 	}
 
 	if roomChanged {
-		txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
+		r.txnStoreRoom(txn, room, previousMemberCount)
 	}
 
 	// Re-pack the last resolved tup and save
@@ -909,6 +911,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 	depthKey := r.KeyForRoomDepth(room.ID)
 	depth := types.BytesToRoomDepth(txn.Get(depthKey).MustGet())
 
+	previousMemberCount := room.MemberCount
 	var eventsStored bool
 	var roomChanged bool
 
@@ -1028,7 +1031,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 	}
 
 	if roomChanged {
-		txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
+		r.txnStoreRoom(txn, room, previousMemberCount)
 	}
 
 	if eventsStored {
@@ -1066,15 +1069,16 @@ func (r *RoomsDatabase) txnStoreStateEvent(
 		[]byte(ev.ID),
 	)
 
+	var membershipChanged bool
 	if ev.Type == event.StateMember {
 		// Process user and server membership changes
-		r.txnStoreMembershipEvent(ctx, txn, ev, version, changedUsers, changedServers)
+		membershipChanged = r.txnStoreMembershipEvent(ctx, txn, room, ev, version, changedUsers, changedServers)
 	} else {
 		// Current (non member) room/type/state_key -> event_id
 		txn.Set(r.events.KeyForRoomCurrentStateTup(room.ID, ev.Type, *ev.StateKey), []byte(ev.ID))
 	}
 
-	return r.updateRoomForStateEvent(room, ev)
+	return r.updateRoomForStateEvent(room, ev) || membershipChanged
 }
 
 // Member event handling involves a bunch more steps, we need to keep track of which users, and
@@ -1082,11 +1086,12 @@ func (r *RoomsDatabase) txnStoreStateEvent(
 func (r *RoomsDatabase) txnStoreMembershipEvent(
 	ctx context.Context,
 	txn fdb.Transaction,
+	room *types.Room,
 	ev *types.Event,
 	version tuple.Versionstamp,
 	changedUsers map[id.UserID]struct{},
 	changedServers map[string]struct{},
-) {
+) bool {
 	memberID := id.UserID(*ev.StateKey)
 	membershipTup := ev.MembershipTup()
 
@@ -1098,8 +1103,18 @@ func (r *RoomsDatabase) txnStoreMembershipEvent(
 	changedUsers[memberID] = struct{}{}
 	membershipTupBytes := types.MembershipTupToBytes(membershipTup)
 
+	currentMemberKey := r.events.KeyForCurrentRoomMember(ev.RoomID, memberID)
+	previous := txn.Get(currentMemberKey).MustGet()
+	wasJoined := previous != nil && types.BytesToMembershipTup(previous).Membership == event.MembershipJoin
+	isJoined := ev.Membership() == event.MembershipJoin
+	if !wasJoined && isJoined {
+		room.MemberCount++
+	} else if wasJoined && !isJoined {
+		room.MemberCount--
+	}
+
 	// Current room/member -> MembershipTup
-	txn.Set(r.events.KeyForCurrentRoomMember(ev.RoomID, memberID), membershipTupBytes)
+	txn.Set(currentMemberKey, membershipTupBytes)
 
 	// Current user/room_id -> MembershipTup
 	r.users.TxnStoreMembership(txn, memberID, ev.RoomID, membershipTup)
@@ -1145,11 +1160,12 @@ func (r *RoomsDatabase) txnStoreMembershipEvent(
 			r.servers.TxnStoreServerMembership(txn, ev.RoomID, serverName, leaveMtup, version)
 		}
 	}
+	return wasJoined != isJoined
 }
 
 // Removes references to a state event such that it never appears to have existed as part of the
 // room state. Removes both room state versions and all user/server memberships and changes.
-func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, ev *types.Event) {
+func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, room *types.Room, ev *types.Event) bool {
 	// First get the version *at which the event was written* - if the event is within this batch
 	// then we must use the IncompleteVersion field.
 	version := ev.IncompleteVersion
@@ -1165,7 +1181,12 @@ func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, ev *types.Event
 		// Clear out user/server memberships and room member state
 		memberID := id.UserID(*ev.StateKey)
 		_, serverName, _ := memberID.Parse()
-		txn.Clear(r.events.KeyForCurrentRoomMember(ev.RoomID, memberID))
+		currentMemberKey := r.events.KeyForCurrentRoomMember(ev.RoomID, memberID)
+		previous := txn.Get(currentMemberKey).MustGet()
+		if previous != nil && types.BytesToMembershipTup(previous).Membership == event.MembershipJoin {
+			room.MemberCount--
+		}
+		txn.Clear(currentMemberKey)
 		txn.Clear(r.events.KeyForCurrentRoomServer(ev.RoomID, serverName))
 		r.users.TxnDeleteUserMembership(txn, memberID, ev.RoomID, version)
 		r.servers.TxnDeleteServerMembership(txn, ev.RoomID, serverName, version)
@@ -1173,4 +1194,8 @@ func (r *RoomsDatabase) txnDeleteStateEvent(txn fdb.Transaction, ev *types.Event
 		// Clear our room/type/state version
 		txn.Clear(r.events.KeyForRoomCurrentStateTup(ev.RoomID, ev.Type, *ev.StateKey))
 	}
+	// Clearing a state tuple also removes its materialized summary value.
+	cleared := *ev
+	cleared.Content = nil
+	return r.updateRoomForStateEvent(room, &cleared) || ev.Type == event.StateMember
 }

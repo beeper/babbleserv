@@ -60,6 +60,10 @@ type RoomsDatabase struct {
 	// value: empty
 	idAliases subspace.Subspace
 
+	// Published rooms ordered by descending joined-member count, then room ID.
+	// key: (-MemberCount, RoomID); value: empty
+	publishedRooms subspace.Subspace
+
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
 	roomLocks *exsync.Map[id.RoomID, *sync.Mutex]
@@ -107,8 +111,9 @@ func NewRoomsDatabase(
 		idToDepth:   roomsDir.Sub("idd"),
 		idToVersion: roomsDir.Sub("iev"),
 
-		aliasToID: roomsDir.Sub("aid"),
-		idAliases: roomsDir.Sub("ida"),
+		aliasToID:      roomsDir.Sub("aid"),
+		idAliases:      roomsDir.Sub("ida"),
+		publishedRooms: roomsDir.Sub("pub"),
 
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
 	}
@@ -194,4 +199,16 @@ func (r *RoomsDatabase) RangeForIDAliases(roomID id.RoomID) fdb.Range {
 func (r *RoomsDatabase) IDAliasKeyToRoomAlias(key fdb.Key) id.RoomAlias {
 	tup, _ := r.idAliases.Unpack(key)
 	return id.RoomAlias(tup[1].(string))
+}
+
+func (r *RoomsDatabase) keyForPublishedRoom(memberCount int, roomID id.RoomID) fdb.Key {
+	return r.publishedRooms.Pack(tuple.Tuple{-int64(memberCount), roomID.String()})
+}
+
+func (r *RoomsDatabase) txnStoreRoom(txn fdb.Transaction, room *types.Room, previousMemberCount int) {
+	if room.Public && room.MemberCount != previousMemberCount {
+		txn.Clear(r.keyForPublishedRoom(previousMemberCount, room.ID))
+		txn.Set(r.keyForPublishedRoom(room.MemberCount, room.ID), nil)
+	}
+	txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
 }

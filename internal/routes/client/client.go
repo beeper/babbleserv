@@ -111,6 +111,12 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
 	rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
 
+	// Published room directory
+	rtr.MethodFunc(http.MethodGet, "/v3/directory/list/room/{roomID}", c.GetRoomDirectoryVisibility)
+	rtr.MethodFunc(http.MethodPut, "/v3/directory/list/room/{roomID}", middleware.RequireUserAuth(c.PutRoomDirectoryVisibility))
+	rtr.MethodFunc(http.MethodGet, "/v3/publicRooms", c.GetPublicRooms)
+	rtr.MethodFunc(http.MethodPost, "/v3/publicRooms", middleware.RequireUserAuth(c.PostPublicRooms))
+
 	// Receipts routes
 	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", middleware.RequireUserAuth(c.SendRoomReadReceipt))
 	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/read_markers", middleware.RequireUserAuth(c.SendRoomReadMarkers))

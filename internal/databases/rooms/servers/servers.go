@@ -87,13 +87,7 @@ func (s *ServersDirectory) keyToMembershipChangeVersion(key fdb.Key) tuple.Versi
 }
 
 func (s *ServersDirectory) keyForMembershipChange(serverName string, version tuple.Versionstamp) fdb.Key {
-	key, err := s.membershipChanges.PackWithVersionstamp(tuple.Tuple{
-		serverName, version,
-	})
-	if err != nil {
-		panic(err)
-	}
-	return key
+	return types.MustPackVersionKey(s.membershipChanges, tuple.Tuple{serverName, version})
 }
 
 func (s *ServersDirectory) rangeForMembershipChanges(

@@ -20,7 +20,10 @@ type Room struct {
 
 	CanonicalAlias string `json:"canonical_alias" msgpack:"cas"`
 
-	MemberCount int `json:"members" msgpack:"mem"`
+	MemberCount       int    `json:"members" msgpack:"mem"`
+	JoinRule          string `json:"join_rule" msgpack:"jrl"`
+	HistoryVisibility string `json:"history_visibility" msgpack:"hvs"`
+	GuestAccess       string `json:"guest_access" msgpack:"gac"`
 
 	Public    bool `json:"is_public" msgpack:"pub"`
 	Federated bool `json:"is_federated" msgpack:"fed"`
