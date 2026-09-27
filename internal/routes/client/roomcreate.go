@@ -2,8 +2,13 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -36,21 +41,62 @@ var presets = map[string][]struct {
 	"public_chat": {
 		{event.StateJoinRules, map[string]any{"join_rule": event.JoinRulePublic}},
 		{event.StateHistoryVisibility, map[string]any{"history_visibility": event.HistoryVisibilityShared}},
-		// Not needed - default is forbidden
-		// {event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessForbidden}},
+		{event.StateGuestAccess, map[string]any{"guest_access": event.GuestAccessForbidden}},
 	},
 }
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3createroom
 func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
-	req, respErr := util.ParseRequestJSON[mautrix.ReqCreateRoom](r)
-	if respErr != nil {
-		util.ResponseErrorJSON(w, r, *respErr)
+	var req *struct {
+		mautrix.ReqCreateRoom
+		PowerLevelOverride map[string]json.RawMessage `json:"power_level_content_override"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+		return
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+		return
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req == nil {
+		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
 		return
 	}
 
 	userID := middleware.GetRequestUserID(r)
 	roomID := c.db.Rooms.GenerateRoomID(r.Context())
+	visibility := req.Visibility
+	if visibility == "" {
+		visibility = "private"
+	}
+	if visibility != "private" && visibility != "public" {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Visibility must be public or private")
+		return
+	}
+	if req.Preset == "" {
+		if visibility == "public" {
+			req.Preset = "public_chat"
+		} else {
+			req.Preset = "private_chat"
+		}
+	}
+	for _, invitedUserID := range req.Invite {
+		if _, _, err := invitedUserID.ParseAndValidateRelaxed(); err != nil {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid invite user ID")
+			return
+		}
+	}
+	if len(req.Invite3PID) > 0 {
+		// Third-party invites require an identity-server token exchange and an
+		// m.room.third_party_invite event. Do not silently create a room while
+		// dropping the requested invites.
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "invite_3pid is not supported")
+		return
+	}
 
 	evs := make([]*types.PartialEvent, 0, len(req.InitialState)+5)
 	sKey := "" // blank state key to point at
@@ -60,16 +106,21 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	for key, value := range req.CreationContent {
 		createContent[key] = value
 	}
-	createContent["creator"] = userID
-	if req.RoomVersion == "" {
-		createContent["room_version"] = c.config.Rooms.DefaultVersion
+	roomVersion := string(req.RoomVersion)
+	if roomVersion == "" {
+		roomVersion = c.config.Rooms.DefaultVersion
+	}
+	numericVersion, versionErr := strconv.Atoi(roomVersion)
+	if versionErr != nil || numericVersion < 3 || numericVersion > 11 ||
+		!gomatrixserverlib.KnownRoomVersion(gomatrixserverlib.RoomVersion(roomVersion)) {
+		util.ResponseErrorJSON(w, r, mautrix.MUnsupportedRoomVersion)
+		return
+	}
+	createContent["room_version"] = roomVersion
+	if numericVersion < 11 {
+		createContent["creator"] = userID
 	} else {
-		if req.RoomVersion == "1" || req.RoomVersion == "2" ||
-			!gomatrixserverlib.KnownRoomVersion(gomatrixserverlib.RoomVersion(req.RoomVersion)) {
-			util.ResponseErrorJSON(w, r, mautrix.MUnsupportedRoomVersion)
-			return
-		}
-		createContent["room_version"] = req.RoomVersion
+		delete(createContent, "creator")
 	}
 	createEv := types.NewPartialEvent(roomID, event.StateCreate, &sKey, userID, createContent)
 	evs = append(evs, createEv)
@@ -91,24 +142,58 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			userPowerLevels[uid] = 100
 		}
 	}
-	powerEv := types.NewPartialEvent(roomID, event.StatePowerLevels, &sKey, userID, map[string]any{
-		"users": userPowerLevels,
+	powerContent := map[string]any{
+		"ban":            50,
+		"events_default": 0,
+		"invite":         0,
+		"kick":           50,
+		"redact":         50,
+		"state_default":  50,
+		"users":          userPowerLevels,
+		"users_default":  0,
 		"events": map[event.Type]int{
 			event.StateHistoryVisibility: 100,
 			event.StatePowerLevels:       100,
 			event.StateTombstone:         100,
 			event.StateServerACL:         100,
 		},
-	})
+	}
+	if req.PowerLevelOverride != nil {
+		encoded, err := json.Marshal(req.PowerLevelOverride)
+		var parsed event.PowerLevelsEventContent
+		if err != nil || json.Unmarshal(encoded, &parsed) != nil {
+			util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+			return
+		}
+		for key, value := range req.PowerLevelOverride {
+			powerContent[key] = value
+		}
+	}
+	powerEv := types.NewPartialEvent(roomID, event.StatePowerLevels, &sKey, userID, powerContent)
 	evs = append(evs, powerEv)
 
 	// 4: An m.room.canonical_alias event if room_alias_name is given.
-	// TODO: aliases
+	var roomAlias id.RoomAlias
+	if req.RoomAliasName != "" {
+		if strings.ContainsRune(req.RoomAliasName, ':') || strings.ContainsRune(req.RoomAliasName, '\x00') {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid room alias localpart")
+			return
+		}
+		roomAlias = id.NewRoomAlias(req.RoomAliasName, c.config.ServerName)
+		if len(roomAlias) > 255 {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Room alias is too long")
+			return
+		}
+		evs = append(evs, types.NewPartialEvent(roomID, event.StateCanonicalAlias, &sKey, userID, map[string]any{
+			"alias": roomAlias.String(),
+		}))
+	}
 
 	// 5: Events set by the preset. Currently these are the m.room.join_rules, m.room.history_visibility, and m.room.guest_access state events.
 	preset, found := presets[req.Preset]
 	if req.Preset != "" && !found {
 		hlog.FromRequest(r).Warn().Msgf("Invalid create room preset: %s", req.Preset)
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid room preset")
 		return
 	}
 	for _, ev := range preset {
@@ -117,6 +202,10 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 
 	// 6: Events listed in initial_state, in the order that they are listed.
 	for _, ev := range req.InitialState {
+		if ev == nil {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Initial state events must be objects")
+			return
+		}
 		if ev.ID != "" || ev.RoomID != "" || ev.Sender != "" {
 			util.ResponseErrorMessageJSON(
 				w, r, mautrix.MInvalidParam,
@@ -124,7 +213,21 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			)
 			return
 		}
-		evs = append(evs, types.NewPartialEvent(roomID, ev.Type, ev.StateKey, userID, ev.Content.Raw))
+		if ev.Type.Type == "" {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Initial state event type is required")
+			return
+		}
+		stateKey := ev.StateKey
+		if stateKey == nil {
+			stateKey = &sKey
+		}
+		contentJSON := ev.Content.VeryRaw
+		var content map[string]any
+		if len(contentJSON) == 0 || json.Unmarshal(contentJSON, &content) != nil || content == nil {
+			util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+			return
+		}
+		evs = append(evs, types.NewPartialEvent(roomID, ev.Type, stateKey, userID, content))
 	}
 
 	// 7: Events implied by name and topic (m.room.name and m.room.topic state events).
@@ -163,13 +266,29 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := c.db.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{})
+	_, err := c.db.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{
+		PublishRoom:      visibility == "public",
+		RoomAlias:        roomAlias,
+		RoomAliasOwner:   userID,
+		RequireAllEvents: true,
+	})
 	if err != nil {
+		if errors.Is(err, types.ErrRoomAliasTaken) {
+			util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+				"errcode": mautrix.MRoomInUse.ErrCode, "error": "Room alias taken",
+			})
+			return
+		} else if errors.Is(err, rooms.ErrRequiredEventRejected) {
+			util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+				"errcode": "M_INVALID_ROOM_STATE", "error": "Initial room state is not allowed",
+			})
+			return
+		}
 		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error sending local events: %w", err))
 		return
 	}
 
-	// Now send any external invites in a background goroutine so we don't block the create call
+	// Remote invites are sent after the room is committed.
 	backgroundCtx := zerolog.Ctx(r.Context()).With().
 		Str("background_task", "SendRemoteInvitesAfterRoomCreate").
 		Logger().

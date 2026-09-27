@@ -24,9 +24,16 @@ import (
 	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
+var ErrRequiredEventRejected = errors.New("required event rejected")
+
 type SendLocalEventsOptions struct {
 	// Ensure (+refresh) a lock is held at commit time
 	LockTxnRefresh lock.LockTxnRefreshFunc
+
+	PublishRoom      bool
+	RoomAlias        id.RoomAlias
+	RoomAliasOwner   id.UserID
+	RequireAllEvents bool
 }
 
 // Send local events to a room, populating prev/auth events as well as authorizing
@@ -63,6 +70,10 @@ func (r *RoomsDatabase) SendLocalEvents(
 			return nil, err
 		}
 
+		if options.RequireAllEvents && len(rejectedEvs) > 0 {
+			return nil, fmt.Errorf("%w: %w", ErrRequiredEventRejected, rejectedEvs[0].Error)
+		}
+
 		// Get local users in the room and evaluate notifications for each event
 		eventNotifications := txnEvaluateNotificationsForEvents(
 			txn, eventsProvider, allowedEvs, userPushRules, userRoomContext,
@@ -73,6 +84,16 @@ func (r *RoomsDatabase) SendLocalEvents(
 
 		if !r.txnStoreEvents(ctx, txn, room, allowedEvs, changedUsers, changedServers, eventNotifications) {
 			log.Warn().Msg("No events stored in send transaction")
+		}
+
+		if options.RoomAlias != "" {
+			if err = r.txnSetRoomAlias(txn, options.RoomAlias, room.ID, options.RoomAliasOwner); err != nil {
+				return nil, err
+			}
+		}
+		if options.PublishRoom {
+			room.Public = true
+			txn.Set(r.KeyForRoom(room.ID), room.ToMsgpack())
 		}
 
 		if options.LockTxnRefresh != nil {

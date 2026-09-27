@@ -54,16 +54,19 @@ func (r *RoomsDatabase) GetRoomAlias(ctx context.Context, alias id.RoomAlias) (i
 
 func (r *RoomsDatabase) SetRoomAlias(ctx context.Context, alias id.RoomAlias, roomID id.RoomID, ownerID id.UserID) error {
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (*struct{}, error) {
-		key := r.KeyForRoomAlias(alias)
-		b := txn.Get(key).MustGet()
-		if b != nil {
-			return nil, types.ErrRoomAliasTaken
-		}
-		txn.Set(r.KeyForIdAlias(roomID, alias), []byte{})
-		txn.Set(key, tuple.Tuple{roomID.String(), ownerID.String()}.Pack())
-		return nil, nil
+		return nil, r.txnSetRoomAlias(txn, alias, roomID, ownerID)
 	})
 	return err
+}
+
+func (r *RoomsDatabase) txnSetRoomAlias(txn fdb.Transaction, alias id.RoomAlias, roomID id.RoomID, ownerID id.UserID) error {
+	key := r.KeyForRoomAlias(alias)
+	if txn.Get(key).MustGet() != nil {
+		return types.ErrRoomAliasTaken
+	}
+	txn.Set(r.KeyForIdAlias(roomID, alias), nil)
+	txn.Set(key, tuple.Tuple{roomID.String(), ownerID.String()}.Pack())
+	return nil
 }
 
 func (r *RoomsDatabase) DeleteRoomAlias(ctx context.Context, alias id.RoomAlias, ownerID id.UserID) error {
