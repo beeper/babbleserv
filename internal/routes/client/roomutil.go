@@ -114,7 +114,7 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 		ev.Signatures[otherHomeserver][k] = v.(string)
 	}
 
-	verifyErr, err := util.VerifyEvent(backgroundCtx, ev, otherHomeserver, c.keyStore)
+	verifyErr, err := util.VerifyEvent(backgroundCtx, ev, c.keyStore)
 	if err != nil {
 		return nil, nil, err
 	} else if verifyErr != nil {

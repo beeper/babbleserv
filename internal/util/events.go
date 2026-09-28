@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
@@ -150,9 +151,23 @@ func GetEventContentHash(ev *types.Event) (string, error) {
 func VerifyEvent(
 	ctx context.Context,
 	ev *types.Event,
-	sendingServerName string,
 	keyStore *KeyStore,
 ) (error, error) {
+	return verifyEvent(ctx, ev, "", keyStore)
+}
+
+// An invite request is checked before the invited server adds its signature.
+func VerifyEventFromServer(ctx context.Context, ev *types.Event, serverName string, keyStore *KeyStore) (error, error) {
+	return verifyEvent(ctx, ev, serverName, keyStore)
+}
+
+func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keyStore *KeyStore) (error, error) {
+	if _, err := spec.NewRoomID(ev.RoomID.String()); err != nil {
+		return err, nil
+	}
+	if ev.Type.Type == spec.MRoomMember && ev.StateKey == nil {
+		return errors.New("membership event has no state key"), nil
+	}
 	b, err := getEventRedactedJSON(ev)
 	if err != nil {
 		return nil, err
@@ -164,10 +179,31 @@ func VerifyEvent(
 	} else if ev.ID == "" {
 		ev.ID = refHash
 	} else if refHash != ev.ID {
-		return errors.New("event ID is not reference hash"), err
+		return errors.New("event ID is not reference hash"), nil
 	}
 
-	verifyErr := keyStore.VerifyJSONFromServer(ctx, sendingServerName, b)
+	var verifyErr error
+	if serverName == "" {
+		verifyErr = gomatrixserverlib.VerifyEventSignatures(ctx, ev.PDU(), keyStore,
+			func(_ spec.RoomID, senderID spec.SenderID) (*spec.UserID, error) {
+				return spec.NewUserID(string(senderID), true)
+			})
+	} else {
+		roomVersion, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
+		if err != nil {
+			return nil, err
+		}
+		results, err := keyStore.VerifyJSONs(ctx, []gomatrixserverlib.VerifyJSONRequest{{
+			ServerName:           spec.ServerName(serverName),
+			AtTS:                 ev.PDU().OriginServerTS(),
+			Message:              b,
+			ValidityCheckingFunc: roomVersion.SignatureValidityCheck,
+		}})
+		if err != nil {
+			return nil, err
+		}
+		verifyErr = results[0].Error
+	}
 	if verifyErr != nil {
 		return verifyErr, nil
 	}

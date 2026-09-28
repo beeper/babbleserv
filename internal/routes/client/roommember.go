@@ -220,7 +220,7 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 			}
 			// Verify the event is signed by the senders server (which may not be the one we are
 			// joining the room via).
-			verifyErr, err := util.VerifyEvent(backgroundCtx, remoteEv, remoteEv.Sender.Homeserver(), c.keyStore)
+			verifyErr, err := util.VerifyEvent(backgroundCtx, remoteEv, c.keyStore)
 			if err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return

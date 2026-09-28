@@ -38,7 +38,7 @@ func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
 	req.Event.ID = util.EventIDFromRequestURLParam(r, "eventID")
 
 	// Verify the event ID and signature
-	verifyErr, err := util.VerifyEvent(r.Context(), req.Event, middleware.GetRequestServer(r), f.keyStore)
+	verifyErr, err := util.VerifyEventFromServer(r.Context(), req.Event, middleware.GetRequestServer(r), f.keyStore)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

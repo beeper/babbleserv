@@ -317,7 +317,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		}
 		ev.RoomVersion = roomVersions[ev.RoomID]
 
-		verifyErr, err := util.VerifyEvent(r.Context(), ev, origin, f.keyStore)
+		verifyErr, err := util.VerifyEvent(r.Context(), ev, f.keyStore)
 		if err != nil {
 			return nil, err
 		} else if errors.Is(verifyErr, types.ErrEventRedacted) {
@@ -499,7 +499,7 @@ func (f *FederationRoutes) getMissingEventsForSendBatch(
 		}
 		ev.RoomVersion = roomVersion
 
-		if verifyErr, err := util.VerifyEvent(ctx, &ev, origin, f.keyStore); err != nil {
+		if verifyErr, err := util.VerifyEvent(ctx, &ev, f.keyStore); err != nil {
 			return nil, err
 		} else if verifyErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(verifyErr).Msg("Missing event failed verification, ignoring")
