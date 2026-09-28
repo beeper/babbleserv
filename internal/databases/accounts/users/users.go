@@ -97,6 +97,11 @@ type UsersDirectory struct {
 
 	// Lowercase one-to-three-rune substring -> user ID; value: empty.
 	searchGrams subspace.Subspace
+
+	// user ID -> (source membership event ID, due milliseconds)
+	remoteProfileJobs subspace.Subspace
+	// (due milliseconds, user ID, source membership event ID) -> empty
+	remoteProfileJobsByDue subspace.Subspace
 }
 
 func NewUsersDirectory(
@@ -120,19 +125,21 @@ func NewUsersDirectory(
 		db:         db,
 		serverName: serverName,
 
-		byVersion:             usersDir.Sub("uvr"),
-		localUsers:            usersDir.Sub("unm"),
-		remoteUsers:           usersDir.Sub("rus"),
-		userProfiles:          usersDir.Sub("upr"),
-		profileChanges:        usersDir.Sub("pch"),
-		userPasswordHashes:    usersDir.Sub("uph"),
-		userCrossSigningKeys:  usersDir.Sub("uxs"),
-		userKeySignatures:     usersDir.Sub("uks"),
-		userFilters:           usersDir.Sub("ufl"),
-		userPushers:           usersDir.Sub("upk"),
-		userPusherDevices:     usersDir.Sub("upd"),
-		pusherUsersByIdentity: usersDir.Sub("upi"),
-		searchGrams:           usersDir.Sub("usg"),
+		byVersion:              usersDir.Sub("uvr"),
+		localUsers:             usersDir.Sub("unm"),
+		remoteUsers:            usersDir.Sub("rus"),
+		userProfiles:           usersDir.Sub("upr"),
+		profileChanges:         usersDir.Sub("pch"),
+		userPasswordHashes:     usersDir.Sub("uph"),
+		userCrossSigningKeys:   usersDir.Sub("uxs"),
+		userKeySignatures:      usersDir.Sub("uks"),
+		userFilters:            usersDir.Sub("ufl"),
+		userPushers:            usersDir.Sub("upk"),
+		userPusherDevices:      usersDir.Sub("upd"),
+		pusherUsersByIdentity:  usersDir.Sub("upi"),
+		searchGrams:            usersDir.Sub("usg"),
+		remoteProfileJobs:      usersDir.Sub("urj"),
+		remoteProfileJobsByDue: usersDir.Sub("urd"),
 	}
 }
 

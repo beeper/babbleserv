@@ -1,6 +1,8 @@
 package types
 
 import (
+	"time"
+
 	"maunium.net/go/mautrix/id"
 )
 
@@ -39,4 +41,23 @@ type UserDirectoryCandidate struct {
 type UserDirectoryResponse struct {
 	Limited bool                      `json:"limited"`
 	Results []*UserDirectoryCandidate `json:"results"`
+}
+
+// RemoteUserDirectorySource identifies the current remote membership event
+// which made a user known to this homeserver. SourceEventID acts as a stable
+// generation for pending profile refresh jobs. Profile is set when the source
+// membership is in a public or world-readable room, whose member event profile
+// is used directly instead of a federation profile lookup.
+type RemoteUserDirectorySource struct {
+	UserID        id.UserID
+	SourceEventID id.EventID
+	Joined        bool
+	Profile       *UserProfile
+}
+
+type RemoteUserDirectoryProfileJob struct {
+	UserID        id.UserID
+	SourceEventID id.EventID
+	DueAt         time.Time
+	Attempts      int
 }
