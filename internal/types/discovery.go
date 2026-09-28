@@ -29,3 +29,14 @@ type PublicRoomsFilter struct {
 	RoomTypes         map[string]struct{}
 	FilterRoomTypes   bool
 }
+
+type UserDirectoryCandidate struct {
+	UserID      id.UserID `json:"user_id"`
+	DisplayName string    `json:"display_name,omitempty"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
+}
+
+type UserDirectoryResponse struct {
+	Limited bool                      `json:"limited"`
+	Results []*UserDirectoryCandidate `json:"results"`
+}

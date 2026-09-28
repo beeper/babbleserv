@@ -19,9 +19,11 @@ var (
 	ErrUserAlreadyExists = errors.New("username already exists")
 	ErrInvalidPassword   = errors.New("invalid password")
 
-	ErrRoomNotFound             = errors.New("room not found")
-	ErrRoomAliasNotFound        = errors.New("room alias not found")
-	ErrRoomAliasTaken           = errors.New("room alias taken")
-	ErrRoomPublicationForbidden = errors.New("room publication forbidden")
-	ErrInvalidPaginationToken   = errors.New("invalid pagination token")
+	ErrRoomNotFound              = errors.New("room not found")
+	ErrRoomAliasNotFound         = errors.New("room alias not found")
+	ErrRoomAliasTaken            = errors.New("room alias taken")
+	ErrRoomPublicationForbidden  = errors.New("room publication forbidden")
+	ErrProfileDisplayNameTooLong = errors.New("profile display name exceeds search index limit")
+
+	ErrInvalidPaginationToken = errors.New("invalid pagination token")
 )

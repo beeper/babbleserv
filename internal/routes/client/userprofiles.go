@@ -2,12 +2,14 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
 
 	"github.com/beeper/babbleserv/internal/middleware"
+	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
@@ -68,10 +70,19 @@ func (c *ClientRoutes) PutProfile(w http.ResponseWriter, r *http.Request) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing value")
 		return
 	}
+	if key == "displayname" || key == "avatar_url" {
+		if _, ok := value.(string); !ok {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Profile value must be a string")
+			return
+		}
+	}
 
 	if err := c.db.Accounts.UpdateUserProfile(
 		r.Context(), userID, key, value,
-	); err != nil {
+	); errors.Is(err, types.ErrProfileDisplayNameTooLong) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+		return
+	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}

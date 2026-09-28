@@ -129,3 +129,30 @@ func (u *UsersDirectory) TxnLookupUserMembershipChanges(
 
 	return changes
 }
+
+// TxnLookupUserMembershipRows returns at most limit current-membership rows,
+// including terminal memberships, and reports whether the range had more rows.
+// It is used by privacy-sensitive user-directory filtering, where silently
+// skipping leave rows would make the transaction's scan bound ineffective.
+func (u *UsersDirectory) TxnLookupUserMembershipRows(
+	txn fdb.ReadTransaction,
+	userID id.UserID,
+	limit int,
+) ([]types.MembershipTup, bool) {
+	if limit <= 0 {
+		return []types.MembershipTup{}, true
+	}
+	kvs := txn.GetRange(u.rangeForMemberships(userID), fdb.RangeOptions{
+		Limit: limit + 1,
+		Mode:  fdb.StreamingModeExact,
+	}).GetSliceOrPanic()
+	more := len(kvs) > limit
+	if more {
+		kvs = kvs[:limit]
+	}
+	memberships := make([]types.MembershipTup, 0, len(kvs))
+	for _, kv := range kvs {
+		memberships = append(memberships, types.BytesToMembershipTup(kv.Value))
+	}
+	return memberships, more
+}

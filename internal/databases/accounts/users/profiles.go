@@ -25,8 +25,23 @@ func (u *UsersDirectory) TxnGetUserProfile(txn fdb.ReadTransaction, userID id.Us
 	return types.NewUserProfileFromBytes(b)
 }
 
-func (u *UsersDirectory) TxnStoreUserProfile(txn fdb.Transaction, userID id.UserID, profile *types.UserProfile) {
+func (u *UsersDirectory) TxnStoreUserProfile(txn fdb.Transaction, userID id.UserID, profile *types.UserProfile) error {
+	if err := validateSearchDisplayName(profile.DisplayName); err != nil {
+		return err
+	}
+	previous, err := u.TxnGetUserProfile(txn, userID)
+	if err != nil {
+		return err
+	}
+	previousName := ""
+	if previous != nil {
+		previousName = previous.DisplayName
+	}
+	if previousName != profile.DisplayName {
+		u.txnUpdateSearchIndex(txn, userID, previousName, profile.DisplayName)
+	}
 	txn.Set(u.keyForProfile(userID), profile.ToMsgpack())
+	return nil
 }
 
 func (u *UsersDirectory) keyForProfileChange(version tuple.Versionstamp) fdb.Key {

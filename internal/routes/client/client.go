@@ -140,6 +140,7 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
 	rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
+	rtr.MethodFunc(http.MethodPost, "/v3/user_directory/search", middleware.RequireUserAuth(c.SearchUserDirectory))
 
 	rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
 	rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))

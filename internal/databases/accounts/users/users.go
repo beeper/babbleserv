@@ -94,6 +94,9 @@ type UsersDirectory struct {
 	// key: (appID, pushKey, id.UserID)
 	// value: empty; finds owners of exactly one pusher identity
 	pusherUsersByIdentity subspace.Subspace
+
+	// Lowercase one-to-three-rune substring -> user ID; value: empty.
+	searchGrams subspace.Subspace
 }
 
 func NewUsersDirectory(
@@ -129,6 +132,7 @@ func NewUsersDirectory(
 		userPushers:           usersDir.Sub("upk"),
 		userPusherDevices:     usersDir.Sub("upd"),
 		pusherUsersByIdentity: usersDir.Sub("upi"),
+		searchGrams:           usersDir.Sub("usg"),
 	}
 }
 
@@ -189,6 +193,10 @@ func (u *UsersDirectory) TxnCreateLocalUser(txn fdb.Transaction, user *types.Use
 
 	if err := u.txnCreateUser(txn, user); err != nil {
 		return err
+	}
+
+	for gram := range searchGrams(userID.String()) {
+		txn.Set(u.searchGrams.Pack(tuple.Tuple{gram, userID.String()}), nil)
 	}
 
 	if hashedPassword != nil {
