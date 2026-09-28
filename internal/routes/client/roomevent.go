@@ -41,6 +41,15 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	device := middleware.GetRequestUserDevice(r)
+	if ev.Sender == device.UserID {
+		ev.ClientTransactionID, err = c.db.Rooms.GetEventTransactionID(r.Context(), eventID, *device)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
+	}
+
 	util.ResponseJSON(w, r, http.StatusOK, util.EventForClientAPI(ev))
 }
 

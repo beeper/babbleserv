@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ var ErrRequiredEventRejected = errors.New("required event rejected")
 type SendLocalEventsOptions struct {
 	// Ensure (+refresh) a lock is held at commit time
 	LockTxnRefresh lock.LockTxnRefreshFunc
+
+	TransactionDevice   *types.UserDevice
+	TransactionEndpoint string
+	TransactionID       string
 
 	PublishRoom      bool
 	RoomAlias        id.RoomAlias
@@ -58,6 +63,15 @@ func (r *RoomsDatabase) SendLocalEvents(
 	ctx = log.WithContext(ctx)
 
 	if res, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*SendEventsResult, error) {
+		if options.TransactionDevice != nil && options.TransactionID != "" {
+			if existing := r.txnGetEventForTransaction(txn, *options.TransactionDevice, roomID, options.TransactionEndpoint, options.TransactionID); existing != nil {
+				if options.LockTxnRefresh != nil {
+					options.LockTxnRefresh(txn)
+				}
+				return &SendEventsResult{Allowed: []*types.Event{existing}, transactionDuplicate: true}, nil
+			}
+		}
+
 		room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
 		if err != nil {
 			return nil, err
@@ -93,6 +107,10 @@ func (r *RoomsDatabase) SendLocalEvents(
 		}
 		if options.PublishRoom {
 			r.txnSetRoomPublished(txn, room, true)
+		}
+
+		if options.TransactionDevice != nil && options.TransactionID != "" && len(allowedEvs) > 0 {
+			r.txnStoreEventTransaction(txn, *options.TransactionDevice, roomID, options.TransactionEndpoint, options.TransactionID, allowedEvs[0].ID)
 		}
 
 		if options.LockTxnRefresh != nil {
@@ -215,9 +233,11 @@ func (r *RoomsDatabase) txnPrepareLocalEvents(
 			}
 		}
 
-		partialEv.Timestamp = originTimestamp.UnixMilli()
+		partial := *partialEv
+		partial.Timestamp = originTimestamp.UnixMilli()
+		partial.Unsigned = maps.Clone(partialEv.Unsigned)
 		ev := &types.Event{
-			PartialEvent: *partialEv,
+			PartialEvent: partial,
 			Local:        true,
 			Depth:        depth,
 			RoomVersion:  room.Version,

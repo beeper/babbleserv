@@ -64,6 +64,11 @@ type RoomsDatabase struct {
 	// key: (-MemberCount, RoomID); value: empty
 	publishedRooms subspace.Subspace
 
+	// (UserID, DeviceID, RoomID, Endpoint, TransactionID) -> EventID
+	eventTransactions subspace.Subspace
+	// (EventID, UserID, DeviceID) -> TransactionID
+	eventTransactionIDs subspace.Subspace
+
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
 	roomLocks *exsync.Map[id.RoomID, *sync.Mutex]
@@ -114,6 +119,9 @@ func NewRoomsDatabase(
 		aliasToID:      roomsDir.Sub("aid"),
 		idAliases:      roomsDir.Sub("ida"),
 		publishedRooms: roomsDir.Sub("pub"),
+
+		eventTransactions:   roomsDir.Sub("etx"),
+		eventTransactionIDs: roomsDir.Sub("eti"),
 
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
 	}

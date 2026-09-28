@@ -26,9 +26,10 @@ const (
 )
 
 type SyncOptions struct {
-	Mode   SyncMode
-	Filter *mautrix.Filter
-	UserID id.UserID
+	Mode     SyncMode
+	Filter   *mautrix.Filter
+	UserID   id.UserID
+	DeviceID id.DeviceID
 
 	// Enables MSC4222: state_after
 	EnableLegacyStateAfter bool

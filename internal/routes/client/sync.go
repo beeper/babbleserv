@@ -86,9 +86,10 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 	}
 
 	options := types.SyncOptions{
-		Filter: filter,
-		Mode:   mode,
-		UserID: userID,
+		Filter:   filter,
+		Mode:     mode,
+		UserID:   userID,
+		DeviceID: deviceID,
 	}
 
 	// TODO: cache these, don't need 100% accuracy (only to wake up sync)

@@ -23,8 +23,9 @@ import (
 )
 
 type SendEventsResult struct {
-	versionFut fdb.FutureKey
-	change     notifier.Change
+	transactionDuplicate bool
+	versionFut           fdb.FutureKey
+	change               notifier.Change
 
 	Allowed  []*types.Event
 	Rejected []RejectedEvent
@@ -89,6 +90,9 @@ func getUserIDList(evs []*types.PartialEvent) []id.UserID {
 }
 
 func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerolog.Logger) (*SendEventsResult, error) {
+	if res.transactionDuplicate {
+		return res, nil
+	}
 	r.notifier.SendChange(res.change)
 
 	rlog := log.Info().

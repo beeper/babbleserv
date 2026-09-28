@@ -281,6 +281,8 @@ func (r *RoomsDatabase) syncRoomEvents(
 	_, err = util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*struct{}, error) {
 		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
 		idToVersion := make(map[id.EventID]tuple.Versionstamp, 10)
+		transactionIDs := make(map[id.EventID]fdb.FutureByteSlice)
+		device := types.UserDevice{UserID: options.UserID, DeviceID: options.DeviceID}
 
 		// First pass: start fetching all the timeline events
 		for _, room := range roomResults {
@@ -289,6 +291,9 @@ func (r *RoomsDatabase) syncRoomEvents(
 				eventsProvider.WillGet(tup.EventID)
 				idToVersion[tup.EventID] = tup.Version
 				roomEvIDs[tup.EventID] = struct{}{}
+				if !options.IsServerToServer && options.DeviceID != "" && tup.Sender == options.UserID {
+					transactionIDs[tup.EventID] = txn.Get(r.keyForEventTransactionID(tup.EventID, device))
+				}
 			}
 
 			// Now get any state events not in timeline, update the state event IDs to only those
@@ -308,6 +313,9 @@ func (r *RoomsDatabase) syncRoomEvents(
 			timeline := make([]*types.Event, len(result.eventTups))
 			for i, tup := range result.eventTups {
 				timeline[i] = eventsProvider.MustGet(tup.EventID)
+				if future, ok := transactionIDs[tup.EventID]; ok {
+					timeline[i].ClientTransactionID = string(future.MustGet())
+				}
 				timeline[i].SetUnsigned("hs.order", types.MustVersionstampToString(idToVersion[tup.EventID]))
 			}
 			state := make([]*types.Event, len(result.eventStateTups))
