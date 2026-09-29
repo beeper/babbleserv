@@ -19,11 +19,8 @@ const (
 	presenceTimeoutIteratorBatchSize    = 10
 )
 
-// The PresenceTimeoutIterator handles timing out presence status (online -> unavailable), we do
-// this by storing (timeoutms, userid) whenever we set presence status to online. We periodically
-// fetch all values where timeoutms < now and for each:
-// - if lastActive > timeout, clear and key and set a new (now+timeoutms, userid) key
-// - if lastActive < timeout, clear and update presence state, if online, to unavailable
+// PresenceTimeoutIterator processes due timeout rows in bounded batches,
+// atomically expiring idle users or rescheduling users who are still active.
 type PresenceTimeoutIterator struct {
 	iteratorWorker
 }
@@ -75,72 +72,23 @@ func (p *PresenceTimeoutIterator) handlePresenceTimeouts(lock lock.Lock) {
 
 	now := time.Now().UTC()
 
-	// Get all users with timeouts up to now
-	userIDs, err := p.db.Transient.GetPresenceTimeouts(p.ctx, now)
+	timeouts, err := p.db.Transient.GetPresenceTimeouts(p.ctx, now, presenceTimeoutIteratorBatchSize)
 	if err != nil {
 		p.log.Err(err).Msg("Failed to get presence timeouts")
 		return
 	}
 
-	if len(userIDs) == 0 {
+	if len(timeouts) == 0 {
 		p.log.Trace().Msg("No presence timeouts to process")
 		return
 	}
 
-	p.log.Info().
-		Int("users", len(userIDs)).
-		Msg("Processing presence timeouts")
-
-	for _, userID := range userIDs {
-		// Refresh lock periodically
+	p.log.Info().Int("timeouts", len(timeouts)).Msg("Processing presence timeouts")
+	for _, timeout := range timeouts {
 		lock.Refresh()
-
-		presence, err := p.db.Transient.GetUserPresence(p.ctx, userID)
-		if err != nil {
-			p.log.Err(err).
-				Str("user_id", userID.String()).
-				Msg("Failed to get user presence")
-			continue
+		if err := p.db.Transient.HandlePresenceTimeout(p.ctx, timeout, now); err != nil {
+			p.log.Err(err).Stringer("user_id", timeout.UserID).
+				Msg("Failed to handle presence timeout")
 		}
-
-		// If no presence, skip (shouldn't happen but be safe)
-		if presence == nil {
-			p.log.Warn().
-				Str("user_id", userID.String()).
-				Msg("User has timeout but no presence")
-			continue
-		}
-
-		if presence.LastActive.After(now.Add(-p.config.Transient.PresenceTimeout)) {
-			// TODO: set these in a batch
-			timeout := now.Add(p.config.Transient.PresenceTimeout)
-			if err := p.db.Transient.SetPresenceTimeout(p.ctx, timeout, userID); err != nil {
-				p.log.Err(err).
-					Str("user_id", userID.String()).
-					Msg("Failed to reschedule presence timeout")
-
-			} else {
-				p.log.Debug().
-					Stringer("user_id", userID).
-					Time("last_active", presence.LastActive).
-					Msg("User still active, rescheduled timeout")
-			}
-		} else if presence.Presence == "online" {
-			p.log.Info().
-				Stringer("user_id", userID).
-				Time("last_active", presence.LastActive).
-				Msg("User presence timed out, setting to unavailable")
-
-			if err := p.db.Transient.UpdateUserPresenceState(p.ctx, userID, "unavailable"); err != nil {
-				p.log.Err(err).
-					Stringer("user_id", userID).
-					Msg("Failed to update presence to unavailable")
-			}
-		}
-	}
-
-	// Clear all processed timeouts
-	if err := p.db.Transient.ClearPresenceTimeouts(p.ctx, now); err != nil {
-		p.log.Err(err).Msg("Failed to clear presence timeouts")
 	}
 }

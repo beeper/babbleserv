@@ -8,6 +8,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -31,6 +32,11 @@ type PresenceDirectory struct {
 	// key: (timeoutMS, id.UseriD)
 	// value: []byte{}
 	presenceTimeouts subspace.Subspace
+}
+
+type Timeout struct {
+	At     time.Time
+	UserID id.UserID
 }
 
 func NewPresenceDirectory(logger zerolog.Logger, db fdb.Database, parentDir directory.Directory) *PresenceDirectory {
@@ -186,6 +192,36 @@ func (p *PresenceDirectory) TxnStorePresenceTimeout(txn fdb.Transaction, timeout
 	txn.Set(p.keyForPresenceTimeout(timeout, userID), []byte{})
 }
 
+func (p *PresenceDirectory) TxnHandlePresenceTimeout(
+	txn fdb.Transaction,
+	timeout Timeout,
+	now time.Time,
+	presenceTimeout time.Duration,
+) bool {
+	timeoutKey := p.keyForPresenceTimeout(timeout.At, timeout.UserID)
+	if txn.Get(timeoutKey).MustGet() == nil {
+		return false
+	}
+
+	current := p.TxnGetPresence(txn, timeout.UserID)
+	txn.Clear(timeoutKey)
+	if current == nil || current.Presence != event.PresenceOnline {
+		return false
+	}
+	lastActive := p.TxnGetLastActive(txn, timeout.UserID)
+	if lastActive == nil {
+		return false
+	}
+	if lastActive.After(now.Add(-presenceTimeout)) {
+		p.TxnStorePresenceTimeout(txn, lastActive.Add(presenceTimeout), timeout.UserID)
+		return false
+	}
+	return p.TxnStorePresence(
+		txn, timeout.UserID, &types.Presence{Presence: event.PresenceUnavailable},
+		time.Time{}, false, *lastActive,
+	)
+}
+
 func (p *PresenceDirectory) rangeForPresenceTimeouts(toTimeout time.Time) fdb.KeyRange {
 	return fdb.KeyRange{
 		Begin: fdb.Key(append(p.presenceTimeouts.Bytes(), byte(0x00))),
@@ -193,23 +229,25 @@ func (p *PresenceDirectory) rangeForPresenceTimeouts(toTimeout time.Time) fdb.Ke
 	}
 }
 
-func (p *PresenceDirectory) TxnClearPresenceTimeouts(txn fdb.Transaction, toTimeout time.Time) {
-	txn.ClearRange(p.rangeForPresenceTimeouts(toTimeout))
-}
-
-// Paginates presence timeout checkers, returning a list of userIDs to check. Expected that these
-// will be cleared via TxnClearPresenceTimeouts once handled.
-func (p *PresenceDirectory) TxnGetPresenceTimeouts(txn fdb.ReadTransaction, toTimeout time.Time) []id.UserID {
+// Each timeout is cleared only in the transaction that handles it.
+func (p *PresenceDirectory) TxnGetPresenceTimeouts(
+	txn fdb.ReadTransaction,
+	toTimeout time.Time,
+	limit int,
+) []Timeout {
 	kvs := txn.GetRange(p.rangeForPresenceTimeouts(toTimeout), fdb.RangeOptions{
-		Mode: fdb.StreamingModeWantAll,
+		Limit: limit, Mode: fdb.StreamingModeExact,
 	}).GetSliceOrPanic()
 
-	// Collect unique UserIDs to check
-	userIDs := make([]id.UserID, len(kvs))
+	timeouts := make([]Timeout, len(kvs))
 	for i, kv := range kvs {
-		tup, _ := p.presenceTimeouts.Unpack(kv.Key)
-		userIDs[i] = id.UserID(tup[1].(string))
+		tup, err := p.presenceTimeouts.Unpack(kv.Key)
+		if err != nil {
+			panic(err)
+		}
+		timeouts[i] = Timeout{
+			At: time.UnixMilli(tup[0].(int64)).UTC(), UserID: id.UserID(tup[1].(string)),
+		}
 	}
-
-	return userIDs
+	return timeouts
 }
