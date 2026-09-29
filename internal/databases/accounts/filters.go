@@ -2,10 +2,10 @@ package accounts
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -15,7 +15,7 @@ import (
 func (a *AccountsDatabase) CreateFilter(
 	ctx context.Context,
 	userID id.UserID,
-	filter mautrix.Filter,
+	filter json.RawMessage,
 ) ([]byte, error) {
 	versionFut, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (fdb.FutureKey, error) {
 		v := tuple.IncompleteVersionstamp(0)
@@ -38,9 +38,16 @@ func (a *AccountsDatabase) GetFilter(
 	ctx context.Context,
 	userID id.UserID,
 	filterID []byte,
-) (*mautrix.Filter, error) {
-	version := types.MustBytesToVersionstamp(filterID)
-	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*mautrix.Filter, error) {
+) (json.RawMessage, error) {
+	// Only decode one complete versionstamp; malformed tuple input can panic.
+	if len(filterID) != 13 || filterID[0] != 0x33 {
+		return nil, nil
+	}
+	version, err := types.BytesToVersionstamp(filterID)
+	if err != nil || types.IsIncompleteVersionstamp(version) {
+		return nil, nil
+	}
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (json.RawMessage, error) {
 		return a.users.TxnGetUserFilter(txn, userID, version)
 	})
 }

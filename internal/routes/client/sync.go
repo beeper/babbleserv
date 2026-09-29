@@ -77,8 +77,15 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Filter does not exist")
 				return
 			}
-			filter, err = c.db.Accounts.GetFilter(r.Context(), userID, b)
+			rawFilter, err := c.db.Accounts.GetFilter(r.Context(), userID, b)
 			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			} else if rawFilter == nil {
+				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Filter does not exist")
+				return
+			}
+			if err = json.Unmarshal(rawFilter, &filter); err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return
 			}

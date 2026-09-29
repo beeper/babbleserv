@@ -6,7 +6,6 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -24,44 +23,24 @@ func (u *UsersDirectory) keyForUserFilter(username string, version tuple.Version
 	return u.userFilters.Pack(tuple.Tuple{username, version})
 }
 
-func (u *UsersDirectory) TxnGetUserFilter(txn fdb.ReadTransaction, userID id.UserID, version tuple.Versionstamp) (*mautrix.Filter, error) {
+func (u *UsersDirectory) TxnGetUserFilter(txn fdb.ReadTransaction, userID id.UserID, version tuple.Versionstamp) (json.RawMessage, error) {
 	if userID.Homeserver() != u.serverName {
 		return nil, fmt.Errorf("userid is not local: %s", userID)
 	}
 
 	key := u.keyForUserFilter(userID.Localpart(), version)
-	b, err := txn.Get(key).Get()
-	if err != nil {
-		return nil, err
-	} else if b == nil {
-		return nil, nil
-	}
-
-	var filter mautrix.Filter
-	if err := json.Unmarshal(b, &filter); err != nil {
-		return nil, err
-	}
-
-	return &filter, nil
+	return txn.Get(key).Get()
 }
 
-func (u *UsersDirectory) TxnStoreUserFilter(txn fdb.Transaction, userID id.UserID, filter mautrix.Filter, version tuple.Versionstamp) error {
+func (u *UsersDirectory) TxnStoreUserFilter(txn fdb.Transaction, userID id.UserID, filter json.RawMessage, version tuple.Versionstamp) error {
 	if userID.Homeserver() != u.serverName {
 		return fmt.Errorf("userid is not local: %s", userID)
 	}
 
-	b, err := json.Marshal(filter)
-	if err != nil {
-		return err
-	}
-
-	var key fdb.Key
 	if types.IsIncompleteVersionstamp(version) {
-		key = u.keyForNewUserFilter(userID.Localpart(), version)
+		txn.SetVersionstampedKey(u.keyForNewUserFilter(userID.Localpart(), version), filter)
 	} else {
-		key = u.keyForUserFilter(userID.Localpart(), version)
+		txn.Set(u.keyForUserFilter(userID.Localpart(), version), filter)
 	}
-
-	txn.SetVersionstampedKey(key, b)
 	return nil
 }
