@@ -177,6 +177,20 @@ func makeLock(
 	releaseLock := func() {
 		// Note: use of db.Transact not util.DoWriteTransaction
 		_, err := db.Transact(func(txn fdb.Transaction) (any, error) {
+			lockBytes := txn.Get(keyForLock(prefix, name)).MustGet()
+			if lockBytes == nil {
+				return nil, nil
+			}
+			tup, err := tuple.Unpack(lockBytes)
+			if err != nil {
+				return nil, err
+			}
+			vstamp := tup[0].(tuple.Versionstamp)
+			if !bytes.Equal(vstamp.TransactionVersion[:], token) {
+				// This worker lost its lease and another worker acquired the lock.
+				// Never let a stale deferred release clear the successor's lease.
+				return nil, nil
+			}
 			txn.Clear(keyForLock(prefix, name))
 			txn.Clear(keyForLockExpires(prefix, name))
 			txn.Clear(keyForLockHostname(prefix, name))
