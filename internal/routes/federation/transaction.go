@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
 	"sync"
@@ -168,13 +169,29 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 				// TODO
 
 			case types.EDUTypePresence:
+				origin := middleware.GetRequestServer(r)
 				for _, edu := range edus {
 					var content types.PresenceEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Err(err).Msg("Failed to unmarshal m.presence content")
-						return
+						log.Warn().Err(err).Msg("Ignoring invalid m.presence content")
+						continue
 					}
 					for _, presenceItem := range content.Push {
+						if presenceItem.UserID.Homeserver() != origin {
+							log.Warn().Str("origin", origin).Stringer("user_id", presenceItem.UserID).
+								Msg("Ignoring unauthorized m.presence EDU item")
+							continue
+						}
+						if localpart, _, err := presenceItem.UserID.ParseAndValidateRelaxed(); err != nil || localpart == "" ||
+							presenceItem.LastActiveAgo < 0 ||
+							presenceItem.LastActiveAgo > int64(math.MaxInt64/time.Millisecond) ||
+							(presenceItem.Presence != event.PresenceOnline &&
+								presenceItem.Presence != event.PresenceOffline &&
+								presenceItem.Presence != event.PresenceUnavailable) {
+							log.Warn().Stringer("user_id", presenceItem.UserID).
+								Msg("Ignoring invalid m.presence EDU item")
+							continue
+						}
 						// Calculate last active time from last_active_ago
 						lastActive := time.Now()
 						if presenceItem.LastActiveAgo > 0 {
