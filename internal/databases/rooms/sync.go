@@ -198,9 +198,7 @@ func (r *RoomsDatabase) syncRoomEvents(
 			case event.MembershipJoin:
 				// This means we joined at this point, after the since token, so fetch events from,
 				// and including, the membership join and flag the room as initial.
-				from := membershipChange.Version
-				from.UserVersion-- // ensure we include the membership event itself
-				roomConfig.from = from
+				roomConfig.from = types.VersionstampBefore(membershipChange.Version) // include the membership event itself
 				roomConfig.to = latestVersion
 				if !options.IsServerToServer {
 					roomConfig.isInitial = true

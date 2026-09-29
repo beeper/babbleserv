@@ -45,8 +45,11 @@ func TxnGetTimeForVersion(txn fdb.ReadTransaction, version tuple.Versionstamp) *
 }
 
 func TxnGetLatestWriteVersion(txn fdb.ReadTransaction) tuple.Versionstamp {
+	// vtt is ordered by the FoundationDB commit version. The wall-clock ttv
+	// index is suitable for timestamp lookup, but clocks and commit order can
+	// disagree when transactions overlap or hosts are skewed.
 	kvs := txn.GetRange(
-		tuple.Tuple{timeToVersionPrefix},
+		tuple.Tuple{versionToTimePrefix},
 		fdb.RangeOptions{
 			Reverse: true,
 			Limit:   1,
@@ -55,7 +58,11 @@ func TxnGetLatestWriteVersion(txn fdb.ReadTransaction) tuple.Versionstamp {
 	if len(kvs) == 0 {
 		return types.ZeroVersionstamp
 	}
-	return types.MustBytesToVersionstamp(kvs[0].Value)
+	keyTuple, err := tuple.Unpack(kvs[0].Key)
+	if err != nil {
+		panic(err)
+	}
+	return keyTuple[1].(tuple.Versionstamp)
 }
 
 func TxnGetLatestWriteVersionBefore(txn fdb.ReadTransaction, before time.Time) tuple.Versionstamp {

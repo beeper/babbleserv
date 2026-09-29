@@ -34,6 +34,26 @@ func TestVersionstamp(t *testing.T) {
 	assert.Equal(t, incompleteVersion, versionFromBytes)
 }
 
+func TestVersionstampBeforeAfter(t *testing.T) {
+	batchStart := tuple.Versionstamp{
+		TransactionVersion: [10]uint8{0, 0, 0, 0, 0x08, 0x09, 0x39, 0x55, 0x01, 0x00},
+		UserVersion:        0,
+	}
+	before := types.VersionstampBefore(batchStart)
+	assert.Equal(t, tuple.Versionstamp{
+		TransactionVersion: [10]uint8{0, 0, 0, 0, 0x08, 0x09, 0x39, 0x55, 0x00, 0xff},
+		UserVersion:        0xffff,
+	}, before)
+	after, ok := types.VersionstampAfter(before)
+	require.True(t, ok)
+	assert.Equal(t, batchStart, after)
+
+	mid := tuple.Versionstamp{TransactionVersion: batchStart.TransactionVersion, UserVersion: 7}
+	assert.Equal(t, uint16(6), types.VersionstampBefore(mid).UserVersion)
+
+	assert.Equal(t, types.ZeroVersionstamp, types.VersionstampBefore(types.ZeroVersionstamp))
+}
+
 func TestVersionMap(t *testing.T) {
 	incompleteVersionstamp := tuple.IncompleteVersionstamp(1)
 	otherVersionstamp := tuple.Versionstamp{
