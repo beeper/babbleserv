@@ -104,6 +104,8 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.GetRoomStateEvent))
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state", middleware.RequireUserAuth(c.GetRoomState))
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/members", middleware.RequireUserAuth(c.GetRoomMembers))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/joined_members", middleware.RequireUserAuth(c.GetJoinedMembers))
+	rtr.MethodFunc(http.MethodGet, "/r0/rooms/{roomID}/joined_members", middleware.RequireUserAuth(c.GetJoinedMembers))
 
 	// Room aliases
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/aliases", middleware.RequireUserAuth(c.GetAliasesForRoom))
