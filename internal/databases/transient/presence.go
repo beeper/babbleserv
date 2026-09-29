@@ -62,22 +62,32 @@ func (t *TransientDatabase) updateUserPresenceOrState(
 	presence *types.Presence,
 	checkMessage bool,
 ) error {
+	activityAt := presence.LastActive.UTC()
+	if presence.LastActive.IsZero() {
+		activityAt = time.Now().UTC()
+	}
 	var timeout time.Time
 	if presence.Presence == event.PresenceOnline && userID.Homeserver() == t.config.ServerName {
 		// Start tracking timeout for local users (who are online)
-		timeout = time.Now().UTC().Add(t.config.Transient.PresenceTimeout)
+		timeout = activityAt.Add(t.config.Transient.PresenceTimeout)
 	}
+	changed := false
 	_, err := util.DoWriteTransactionWithVersion(ctx, t.db, func(txn fdb.Transaction) (types.Nil, error) {
-		if changed := t.presence.TxnStorePresence(txn, userID, presence, timeout, checkMessage); changed {
-			t.notifier.SendChange(notifier.Change{
-				UserIDs: []id.UserID{userID},
-			})
-			zerolog.Ctx(ctx).Debug().Msg("Updated user presence")
-		} else {
-			zerolog.Ctx(ctx).Debug().Msg("Received duplicate presence, updated last active")
-		}
+		// An ambiguous commit may retry as a duplicate.
+		changed = t.presence.TxnStorePresence(
+			txn, userID, presence, timeout, checkMessage, activityAt,
+		) || changed
 		return nil, nil
 	})
+	if err != nil {
+		return err
+	}
+	if changed {
+		t.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{userID}})
+		zerolog.Ctx(ctx).Debug().Msg("Updated user presence")
+	} else {
+		zerolog.Ctx(ctx).Debug().Msg("Received duplicate presence, updated last active")
+	}
 	return err
 }
 

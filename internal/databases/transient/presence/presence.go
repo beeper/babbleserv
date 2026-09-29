@@ -105,27 +105,29 @@ func (p *PresenceDirectory) TxnStorePresence(
 	presence *types.Presence,
 	timeout time.Time,
 	checkMessage bool,
+	activityAt time.Time,
 ) bool {
 	// Lookup any current presence
 	currentPresence := p.TxnGetPresence(txn, userID)
-
-	// Get current last active time
-	now := time.Now().UTC()
+	storedPresence := *presence
+	if !checkMessage && currentPresence != nil {
+		storedPresence.Message = currentPresence.Message
+	}
+	storedPresence.LastActive = activityAt
 
 	// Check if presence has changed
 	hasChanged := currentPresence == nil || currentPresence.Presence != presence.Presence
-	if checkMessage && currentPresence != nil && currentPresence.Message != presence.Message {
+	if checkMessage && currentPresence != nil && currentPresence.Message != storedPresence.Message {
 		hasChanged = true
 	}
 
 	if hasChanged {
-		presence.LastActive = now
 		txn.SetVersionstampedKey(
 			p.keyForPresenceChange(tuple.IncompleteVersionstamp(0)),
-			tuple.Tuple{userID.String(), presence.ToBytes()}.Pack(),
+			tuple.Tuple{userID.String(), storedPresence.ToBytes()}.Pack(),
 		)
 
-		txn.Set(p.keyForUserPresence(userID), presence.ToBytes())
+		txn.Set(p.keyForUserPresence(userID), storedPresence.ToBytes())
 
 		if !timeout.Equal(time.Time{}) {
 			p.TxnStorePresenceTimeout(txn, timeout, userID)
@@ -133,7 +135,7 @@ func (p *PresenceDirectory) TxnStorePresence(
 	}
 
 	// Always bump userToLastActive
-	txn.Set(p.keyForUserLastActive(userID), tuple.Tuple{now.UnixMilli()}.Pack())
+	txn.Set(p.keyForUserLastActive(userID), tuple.Tuple{activityAt.UnixMilli()}.Pack())
 	return hasChanged
 }
 

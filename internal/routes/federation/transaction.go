@@ -211,9 +211,6 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 								Msg("Failed to store remote presence")
 							return
 						}
-						f.notifiers.Transient.SendChange(notifier.Change{
-							UserIDs: []id.UserID{presenceItem.UserID},
-						})
 						log.Debug().
 							Str("user_id", presenceItem.UserID.String()).
 							Str("presence", string(presenceItem.Presence)).
