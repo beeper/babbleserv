@@ -13,6 +13,8 @@ TestKeysQueryWithDeviceIDAsObjectFails
 TestNotPresentUserCannotBanOthers
 TestPresence
 TestPresenceSyncDifferentRooms
+TestPushRuleCacheHealth
+TestPushSync
 TestRoomAlias
 TestRoomCreate
 TestRoomReceipts
@@ -21,6 +23,7 @@ TestServerCapabilities
 TestSync
 TestSyncFilter
 TestSyncOmitsStateChangeOnFilteredEvents
+TestThreadedReceipts
 TestToDeviceMessages
 TestUploadKey
 TestUploadKeyIdempotency

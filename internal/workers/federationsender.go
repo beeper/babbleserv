@@ -88,57 +88,59 @@ func (fs *FederationSender) handleServersLoop(ctx context.Context, initialServer
 	fs.wg.Add(1)
 	defer fs.wg.Done()
 
-	newServersCh := make(chan any, 1000)
+	newServersCh := make(chan notifier.Change, 1000)
 	fs.notifiers.SubscribeWithChannel(newServersCh, notifier.Subscription{AllServers: true})
 	defer fs.notifiers.Unsubscribe(newServersCh)
 
-	// Kick off a goroutine to push our initial servers into the queue
-	go func() {
-		for _, name := range initialServerNames {
-			newServersCh <- name
-		}
-	}()
+	// Push our initial servers into the queue
+	newServersCh <- notifier.Change{
+		Servers: initialServerNames,
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case server := <-newServersCh:
-			serverName := server.(string)
-
-			log := fs.log.With().
-				Str("server", serverName).
-				Logger()
-			srvCtx := log.WithContext(ctx)
-
-			if serverName == fs.config.ServerName {
-				log.Warn().Str("server", serverName).Msg("Ignoring change from ourselves")
-				continue
-			}
-
-			// First check our in memory map of active senders, avoid the FDB lock
-			// entirely if we're already running this sender.
-			fs.lock.RLock()
-			ch, found := fs.serverSenders[serverName]
-			select {
-			// Wakeup the sender if needed
-			case ch <- struct{}{}:
-			default:
-			}
-			fs.lock.RUnlock()
-
-			if found {
-				log.Debug().
-					Str("server", serverName).
-					Msg("We are already running this server sender")
-			} else {
-				fs.wg.Add(1)
-				go func() {
-					fs.maybeRunServerSender(srvCtx, serverName)
-					fs.wg.Done()
-				}()
+		case change := <-newServersCh:
+			for _, serverName := range change.Servers {
+				fs.handleServerChange(ctx, serverName)
 			}
 		}
+	}
+}
+
+func (fs *FederationSender) handleServerChange(ctx context.Context, serverName string) {
+	log := fs.log.With().
+		Str("server", serverName).
+		Logger()
+	srvCtx := log.WithContext(ctx)
+
+	if serverName == fs.config.ServerName {
+		log.Warn().Str("server", serverName).Msg("Ignoring change from ourselves")
+		return
+	}
+
+	// First check our in memory map of active senders, avoid the FDB lock
+	// entirely if we're already running this sender.
+	fs.lock.RLock()
+	ch, found := fs.serverSenders[serverName]
+	select {
+	// Wakeup the sender if needed
+	case ch <- struct{}{}:
+	default:
+	}
+	fs.lock.RUnlock()
+
+	if found {
+		log.Debug().
+			Str("server", serverName).
+			Msg("We are already running this server sender")
+	} else {
+		fs.wg.Add(1)
+		go func() {
+			fs.maybeRunServerSender(srvCtx, serverName)
+			fs.wg.Done()
+		}()
 	}
 }
 

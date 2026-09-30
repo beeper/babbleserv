@@ -154,6 +154,8 @@ func (r *RoomsDatabase) syncRoomEvents(
 				if types.VersionIsAtOrBefore(roomVersion, fromVersion) {
 					zerolog.Ctx(ctx).Trace().Any("membership_tup", membershipTup).Msg("Skip room with no changes")
 					continue
+				} else {
+					zerolog.Ctx(ctx).Trace().Any("membership_tup", membershipTup).Any("room_version", roomVersion).Any("from_version", fromVersion).Any("latest_version", latestVersion).Msg("Including room with changes")
 				}
 			}
 
@@ -314,7 +316,7 @@ func (r *RoomsDatabase) syncRoomEvents(
 				state[i].SetUnsigned("hs.order", types.MustVersionstampToString(idToVersion[tup.EventID]))
 			}
 
-			rooms[membershipTup] = &types.SyncRoom{
+			syncRoom := &types.SyncRoom{
 				TimelineEvents: types.Timeline{
 					EventList: types.EventList{Events: timeline},
 					Limited:   result.limited,
@@ -322,6 +324,33 @@ func (r *RoomsDatabase) syncRoomEvents(
 				StateEvents: types.EventList{Events: state},
 				Receipts:    result.receipts,
 			}
+
+			// Add notification counts for joined rooms, pinned to latestVersion to avoid
+			// over-counting if parallel events come in during sync
+			if membershipTup.Membership == event.MembershipJoin && !options.IsServerToServer {
+				if options.UseRoomThreadedNotifications() {
+					// Thread-aware: separate main room and per-thread counts
+					mainNotif, mainHighlight, threadCounts := r.users.TxnSumNotificationsByThread(
+						txn, options.UserID, membershipTup.RoomID, latestVersion,
+					)
+					syncRoom.UnreadNotifications = &types.UnreadNotificationCounts{
+						NotificationCount: mainNotif,
+						HighlightCount:    mainHighlight,
+					}
+					if len(threadCounts) > 0 {
+						syncRoom.UnreadThreadNotifications = threadCounts
+					}
+				} else {
+					// Legacy: sum all notifications together regardless of thread
+					notifCount, highlightCount := r.users.TxnSumNotifications(txn, options.UserID, membershipTup.RoomID, latestVersion)
+					syncRoom.UnreadNotifications = &types.UnreadNotificationCounts{
+						NotificationCount: notifCount,
+						HighlightCount:    highlightCount,
+					}
+				}
+			}
+
+			rooms[membershipTup] = syncRoom
 		}
 
 		return nil, nil

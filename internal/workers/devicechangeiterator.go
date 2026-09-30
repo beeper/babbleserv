@@ -181,21 +181,15 @@ func (d *DeviceChangeIterator) processRemoteDeviceChange(lock lock.Lock, change 
 	tds := make([]*types.ToDevice, 0, len(localUserIDs))
 
 	for userID := range localUserIDs {
-		userDevices, err := d.db.Accounts.GetUserDevices(d.ctx, userID)
-		if err != nil {
-			return err
-		}
-		for _, d := range userDevices {
-			tds = append(tds, &types.ToDevice{
-				UserID:   userID,
-				DeviceID: d.ID,
-				Sender:   change.UserID,
-				Type:     types.BabbleservLocalDeviceChange,
-			})
-		}
+		tds = append(tds, &types.ToDevice{
+			UserID:   userID,
+			DeviceID: id.DeviceID("*"),
+			Sender:   change.UserID,
+			Type:     types.BabbleservLocalDeviceChange,
+		})
 	}
 
-	_, err = d.db.Transient.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
+	_, err = d.db.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
 		// Ensure we hold the lock when comitting the events
 		LockTxnRefresh: lock.TxnRefresh,
 	})
@@ -249,18 +243,12 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 		// If user is local - we just need to populate device_lists in sync, so send dummy to-device
 		// events to be expanded later, no content needed as clients will query it.
 		if userID.Homeserver() == d.config.ServerName {
-			userDevices, err := d.db.Accounts.GetUserDevices(d.ctx, userID)
-			if err != nil {
-				return err
-			}
-			for _, d := range userDevices {
-				tds = append(tds, &types.ToDevice{
-					Type:     types.BabbleservLocalDeviceChange,
-					UserID:   userID,
-					DeviceID: d.ID,
-					Sender:   change.UserID,
-				})
-			}
+			tds = append(tds, &types.ToDevice{
+				Type:     types.BabbleservLocalDeviceChange,
+				UserID:   userID,
+				DeviceID: id.DeviceID("*"),
+				Sender:   change.UserID,
+			})
 			continue
 		}
 	}
@@ -332,7 +320,7 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 		}
 	}
 
-	_, err = d.db.Transient.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
+	_, err = d.db.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
 		// Ensure we hold the lock when comitting the events
 		LockTxnRefresh: lock.TxnRefresh,
 	})

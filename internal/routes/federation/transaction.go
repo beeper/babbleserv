@@ -237,7 +237,7 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 					}
 				}
 
-				_, err := f.db.Transient.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{})
+				_, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{})
 				if err != nil {
 					panic(err)
 				}
@@ -377,7 +377,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 				return
 			}
 			options := rooms.SendFederatedEventsOptions{}
-			results, err := f.db.Rooms.SendFederatedEvents(r.Context(), roomID, evs, options)
+			results, err := f.db.SendFederatedEvents(r.Context(), roomID, evs, options)
 			if err != nil {
 				// This is *BAD*, an unexpected error handling results for a room, we can't bail the
 				// request here as we'll poison other parallel room sends. So we just log and none

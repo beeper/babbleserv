@@ -178,23 +178,17 @@ func (p *PresenceChangeIterator) processRemotePresenceChange(lock lock.Lock, cha
 	tds := make([]*types.ToDevice, 0, len(localUserIDs))
 
 	for userID := range localUserIDs {
-		userDevices, err := p.db.Accounts.GetUserDevices(p.ctx, userID)
-		if err != nil {
-			return err
-		}
-		for _, d := range userDevices {
-			tds = append(tds, &types.ToDevice{
-				UserID:   userID,
-				DeviceID: d.ID,
-				Type:     types.BabbleservLocalPresenceChange,
-				Sender:   change.UserID,
-				Content:  makePresenceLocalContent(change),
-			})
-		}
+		tds = append(tds, &types.ToDevice{
+			UserID:   userID,
+			DeviceID: id.DeviceID("*"),
+			Type:     types.BabbleservLocalPresenceChange,
+			Sender:   change.UserID,
+			Content:  makePresenceLocalContent(change),
+		})
 	}
 
 	if len(tds) > 0 {
-		_, err = p.db.Transient.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
+		_, err = p.db.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
 			// Ensure we hold the lock when comitting the events
 			LockTxnRefresh: lock.TxnRefresh,
 		})
@@ -250,20 +244,13 @@ func (p *PresenceChangeIterator) processLocalPresenceChange(lock lock.Lock, chan
 		// If user is local - we just need to populate presence in sync, so send to-device
 		// events to be expanded later.
 		if userID.Homeserver() == p.config.ServerName {
-			userDevices, err := p.db.Accounts.GetUserDevices(p.ctx, userID)
-			if err != nil {
-				return err
-			}
-
-			for _, d := range userDevices {
-				tds = append(tds, &types.ToDevice{
-					Type:     types.BabbleservLocalPresenceChange,
-					UserID:   userID,
-					DeviceID: d.ID,
-					Sender:   change.UserID,
-					Content:  makePresenceLocalContent(change),
-				})
-			}
+			tds = append(tds, &types.ToDevice{
+				Type:     types.BabbleservLocalPresenceChange,
+				UserID:   userID,
+				DeviceID: id.DeviceID("*"),
+				Sender:   change.UserID,
+				Content:  makePresenceLocalContent(change),
+			})
 		}
 	}
 
@@ -280,7 +267,7 @@ func (p *PresenceChangeIterator) processLocalPresenceChange(lock lock.Lock, chan
 	}
 
 	if len(tds) > 0 {
-		_, err = p.db.Transient.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
+		_, err = p.db.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
 			// Ensure we hold the lock when comitting the events
 			LockTxnRefresh: lock.TxnRefresh,
 		})

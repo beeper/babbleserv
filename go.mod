@@ -1,6 +1,6 @@
 module github.com/beeper/babbleserv
 
-go 1.24.3
+go 1.27.0
 
 require (
 	github.com/apple/foundationdb/bindings/go v0.0.0-20230127234245-2d0427521d8f
@@ -33,6 +33,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/goccy/go-json v0.10.3 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect

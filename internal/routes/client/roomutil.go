@@ -28,7 +28,7 @@ func (c *ClientRoutes) sendLocalEventHandleResults(
 	partialEv *types.PartialEvent,
 	responseGen func(ev *types.Event) any,
 ) {
-	res, err := c.db.Rooms.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, rooms.SendLocalEventsOptions{})
+	res, err := c.db.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, rooms.SendLocalEventsOptions{})
 	if errors.Is(err, types.ErrRoomNotFound) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, err.Error())
 	} else if err != nil {
@@ -113,7 +113,7 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 	// Now that we've prepared, other HS signed and we verified the event we  can send it. We send
 	// it as if it's a federated event which triggers all the authorization checks, accounting for
 	// any state changes in the room during the signing process above.
-	results, err := c.db.Rooms.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, rooms.SendFederatedEventsOptions{})
+	results, err := c.db.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, rooms.SendFederatedEventsOptions{})
 	if err != nil {
 		return nil, nil, err
 	}

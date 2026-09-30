@@ -165,7 +165,7 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 	}
 
 	if len(allTds) > 0 {
-		_, err := e.db.Transient.SendToDeviceEvents(e.ctx, allTds, transient.SendToDeviceOptions{
+		_, err := e.db.SendToDeviceEvents(e.ctx, allTds, transient.SendToDeviceOptions{
 			// Ensure we hold the lock when comitting the events
 			LockTxnRefresh: lock.TxnRefresh,
 		})
@@ -206,38 +206,26 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForJoinEvent(ev *types.Event
 		if memberID.Homeserver() != e.config.ServerName {
 			continue
 		}
-		devices, err := e.db.Accounts.GetUserDevices(e.ctx, memberID)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range devices {
-			tds = append(tds, &types.ToDevice{
-				Type:     types.BabbleservLocalDeviceChange,
-				UserID:   memberID,
-				DeviceID: d.ID,
-				Sender:   ev.Sender,
-			})
-		}
+		tds = append(tds, &types.ToDevice{
+			Type:     types.BabbleservLocalDeviceChange,
+			UserID:   memberID,
+			DeviceID: id.DeviceID("*"),
+			Sender:   ev.Sender,
+		})
 	}
 
 	// If the joining user is local, also notify them about changes to all other members
 	if ev.Sender.Homeserver() == e.config.ServerName {
-		devices, err := e.db.Accounts.GetUserDevices(e.ctx, ev.Sender)
-		if err != nil {
-			return nil, err
-		}
 		for memberID := range roomMembers {
 			if memberID == ev.Sender {
 				continue
 			}
-			for _, d := range devices {
-				tds = append(tds, &types.ToDevice{
-					Type:     types.BabbleservLocalDeviceChange,
-					UserID:   ev.Sender,
-					DeviceID: d.ID,
-					Sender:   memberID,
-				})
-			}
+			tds = append(tds, &types.ToDevice{
+				Type:     types.BabbleservLocalDeviceChange,
+				UserID:   ev.Sender,
+				DeviceID: id.DeviceID("*"),
+				Sender:   memberID,
+			})
 		}
 	}
 
@@ -344,14 +332,6 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Even
 		return mtup.Membership == event.MembershipJoin
 	})
 
-	var leaverDevices []*types.Device
-	if ev.Sender.Homeserver() == e.config.ServerName {
-		leaverDevices, err = e.db.Accounts.GetUserDevices(e.ctx, ev.Sender)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	roomMembers, err := e.db.Rooms.GetCurrentRoomMemberships(e.ctx, ev.RoomID)
 	if err != nil {
 		return nil, err
@@ -385,28 +365,20 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Even
 		// them both.
 		if !match {
 			if ev.Sender.Homeserver() == e.config.ServerName {
-				for _, d := range leaverDevices {
-					tds = append(tds, &types.ToDevice{
-						Type:     types.BabbleservLocalDeviceLeft,
-						Sender:   memberID,
-						UserID:   ev.Sender,
-						DeviceID: d.ID,
-					})
-				}
+				tds = append(tds, &types.ToDevice{
+					Type:     types.BabbleservLocalDeviceLeft,
+					Sender:   memberID,
+					UserID:   ev.Sender,
+					DeviceID: id.DeviceID("*"),
+				})
 			}
 			if memberID.Homeserver() == e.config.ServerName {
-				devices, err := e.db.Accounts.GetUserDevices(e.ctx, memberID)
-				if err != nil {
-					return nil, err
-				}
-				for _, d := range devices {
-					tds = append(tds, &types.ToDevice{
-						Type:     types.BabbleservLocalDeviceLeft,
-						Sender:   ev.Sender,
-						UserID:   memberID,
-						DeviceID: d.ID,
-					})
-				}
+				tds = append(tds, &types.ToDevice{
+					Type:     types.BabbleservLocalDeviceLeft,
+					Sender:   ev.Sender,
+					UserID:   memberID,
+					DeviceID: id.DeviceID("*"),
+				})
 			}
 		}
 	}
