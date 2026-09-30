@@ -77,8 +77,15 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Filter does not exist")
 				return
 			}
-			filter, err = c.db.Accounts.GetFilter(r.Context(), userID, b)
+			rawFilter, err := c.db.Accounts.GetFilter(r.Context(), userID, b)
 			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			} else if rawFilter == nil {
+				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Filter does not exist")
+				return
+			}
+			if err = json.Unmarshal(rawFilter, &filter); err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
 				return
 			}
@@ -86,9 +93,10 @@ func (c *ClientRoutes) doSyncWithMode(w http.ResponseWriter, r *http.Request, mo
 	}
 
 	options := types.SyncOptions{
-		Filter: filter,
-		Mode:   mode,
-		UserID: userID,
+		Filter:   filter,
+		Mode:     mode,
+		UserID:   userID,
+		DeviceID: deviceID,
 	}
 
 	// TODO: cache these, don't need 100% accuracy (only to wake up sync)

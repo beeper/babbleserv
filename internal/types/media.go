@@ -17,11 +17,13 @@ type Media struct {
 
 	Size        int64  `msgpack:"sz,omitempty"`
 	ContentType string `msgpack:"ty,omitempty"`
+	FileName    string `msgpack:"fn,omitempty"`
 
 	Sender id.UserID `msgpack:"snd"`
 
 	CreatedAt  time.Time `msgpack:"ct"`
 	UploadedAt time.Time `msgpack:"ut,omitempty"`
+	ExpiresAt  time.Time `msgpack:"et,omitempty"`
 }
 
 func NewMediaFromBytes(b []byte, serverName, mediaID string) (*Media, error) {

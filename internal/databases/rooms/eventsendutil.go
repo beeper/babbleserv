@@ -23,8 +23,9 @@ import (
 )
 
 type SendEventsResult struct {
-	versionFut fdb.FutureKey
-	change     notifier.Change
+	transactionDuplicate bool
+	versionFut           fdb.FutureKey
+	change               notifier.Change
 
 	Allowed  []*types.Event
 	Rejected []RejectedEvent
@@ -89,6 +90,9 @@ func getUserIDList(evs []*types.PartialEvent) []id.UserID {
 }
 
 func (r *RoomsDatabase) handleSendEventsResults(res *SendEventsResult, log zerolog.Logger) (*SendEventsResult, error) {
+	if res.transactionDuplicate {
+		return res, nil
+	}
 	r.notifier.SendChange(res.change)
 
 	rlog := log.Info().
@@ -261,29 +265,32 @@ func (r *RoomsDatabase) txnPreProcessEventUnsigned(
 }
 
 func (r *RoomsDatabase) updateRoomForStateEvent(room *types.Room, ev *types.Event) bool {
+	if ev.StateKey == nil || *ev.StateKey != "" {
+		return false
+	}
 	var changed bool
-	switch ev.Type {
-	case event.StateRoomName:
+	switch ev.Type.Type {
+	case event.StateRoomName.Type:
 		room.Name = gjson.GetBytes(ev.Content, "name").String()
 		changed = true
-	case event.StateTopic:
+	case event.StateTopic.Type:
 		room.Topic = gjson.GetBytes(ev.Content, "topic").String()
 		changed = true
-	case event.StateRoomAvatar:
+	case event.StateRoomAvatar.Type:
 		room.AvatarURL = gjson.GetBytes(ev.Content, "url").String()
 		changed = true
-	case event.StateMember:
-		if ev.Membership() == event.MembershipJoin {
-			// We're joining new if no prev or prev wasn't join
-			if ev.PrevStateEvent == nil || ev.PrevStateEvent.Membership() != event.MembershipJoin {
-				room.MemberCount++
-			}
-		} else {
-			// We're leaving if prev was join
-			if ev.PrevStateEvent != nil && ev.PrevStateEvent.Membership() == event.MembershipJoin {
-				room.MemberCount--
-			}
-		}
+	case event.StateCanonicalAlias.Type:
+		room.CanonicalAlias = gjson.GetBytes(ev.Content, "alias").String()
+		changed = true
+	case event.StateJoinRules.Type:
+		room.JoinRule = gjson.GetBytes(ev.Content, "join_rule").String()
+		changed = true
+	case event.StateHistoryVisibility.Type:
+		room.HistoryVisibility = gjson.GetBytes(ev.Content, "history_visibility").String()
+		changed = true
+	case event.StateGuestAccess.Type:
+		room.GuestAccess = gjson.GetBytes(ev.Content, "guest_access").String()
+		changed = true
 	}
 
 	return changed

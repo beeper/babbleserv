@@ -31,6 +31,8 @@ func NewWorkers(
 		Logger()
 
 	workers := []Worker{
+		NewUIASessionCleanupIterator(log, cfg, db, notifiers),
+		NewRemoteUserDirectoryIterator(log, cfg, db, notifiers, fclient),
 		// Wakes up relevant federation senders for new events
 		NewEventsIterator(log, cfg, db, notifiers),
 		// Federation sender per remote homeserver

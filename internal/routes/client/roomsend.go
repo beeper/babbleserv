@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -38,9 +39,7 @@ func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request
 func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
 	roomID := id.RoomID(chi.URLParam(r, "roomID"))
 	evType := event.NewEventType(chi.URLParam(r, "eventType"))
-
-	// TODO: transaction IDs and idempotency
-	// Note: asking server to store TXNID indefinitely is stupid (or even beyond like a day)
+	txnID := chi.URLParam(r, "txnID")
 
 	var content map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
@@ -48,9 +47,18 @@ func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if content == nil {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, "Event content must be an object")
+		return
+	}
+
 	userID := middleware.GetRequestUserID(r)
 	ev := types.NewPartialEvent(roomID, evType, nil, userID, content)
-	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
+	c.sendLocalEventHandleResultsWithOptions(w, r, roomID, ev, rooms.SendLocalEventsOptions{
+		TransactionDevice:   middleware.GetRequestUserDevice(r),
+		TransactionEndpoint: "send/" + evType.Type,
+		TransactionID:       txnID,
+	}, func(ev *types.Event) any {
 		return map[string]id.EventID{
 			"event_id": ev.ID,
 		}

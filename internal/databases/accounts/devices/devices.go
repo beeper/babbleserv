@@ -77,6 +77,7 @@ func NewDevicesDirectory(logger zerolog.Logger, db fdb.Database, parentDir direc
 		deviceOneTimeKeysByVersion: devicesDir.Sub("otv"),
 		deviceFallbackKeys:         devicesDir.Sub("fbk"),
 		deviceChanges:              devicesDir.Sub("dch"),
+		deviceSyncConns:            devicesDir.Sub("dsc"),
 	}
 }
 
@@ -93,12 +94,16 @@ func (d *DevicesDirectory) keyForDeviceLastSeen(userID id.UserID, deviceID id.De
 }
 
 func (d *DevicesDirectory) RangeForDeviceSyncConns(userID id.UserID, deviceID id.DeviceID) fdb.ExactRange {
-	return d.deviceSyncConns.Sub(tuple.Tuple{userID.String(), deviceID.String()})
+	return d.deviceSyncConns.Sub(userID.String(), deviceID.String())
 }
 
 func (d *DevicesDirectory) TxnDeleteDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID) {
 	txn.Clear(d.keyForDevice(userID, deviceID))
 	txn.Clear(d.keyForDeviceLastSeen(userID, deviceID))
+	txn.Clear(d.deviceKeys.Pack(tuple.Tuple{userID.String(), deviceID.String()}))
+	txn.ClearRange(d.deviceOneTimeKeys.Sub(userID.String(), deviceID.String()))
+	txn.ClearRange(d.deviceOneTimeKeysByVersion.Sub(userID.String(), deviceID.String()))
+	txn.ClearRange(d.deviceFallbackKeys.Sub(userID.String(), deviceID.String()))
 	txn.ClearRange(d.RangeForDeviceSyncConns(userID, deviceID))
 }
 

@@ -9,6 +9,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/databases/transient/presence"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -62,53 +63,60 @@ func (t *TransientDatabase) updateUserPresenceOrState(
 	presence *types.Presence,
 	checkMessage bool,
 ) error {
+	activityAt := presence.LastActive.UTC()
+	if presence.LastActive.IsZero() {
+		activityAt = time.Now().UTC()
+	}
 	var timeout time.Time
 	if presence.Presence == event.PresenceOnline && userID.Homeserver() == t.config.ServerName {
 		// Start tracking timeout for local users (who are online)
-		timeout = time.Now().UTC().Add(t.config.Transient.PresenceTimeout)
+		timeout = activityAt.Add(t.config.Transient.PresenceTimeout)
 	}
+	changed := false
 	_, err := util.DoWriteTransactionWithVersion(ctx, t.db, func(txn fdb.Transaction) (types.Nil, error) {
-		if changed := t.presence.TxnStorePresence(txn, userID, presence, timeout, checkMessage); changed {
-			t.notifier.SendChange(notifier.Change{
-				UserIDs: []id.UserID{userID},
-			})
-			zerolog.Ctx(ctx).Debug().Msg("Updated user presence")
-		} else {
-			zerolog.Ctx(ctx).Debug().Msg("Received duplicate presence, updated last active")
-		}
+		// An ambiguous commit may retry as a duplicate.
+		changed = t.presence.TxnStorePresence(
+			txn, userID, presence, timeout, checkMessage, activityAt,
+		) || changed
 		return nil, nil
 	})
-	return err
-}
-
-func (t *TransientDatabase) SetPresenceTimeout(
-	ctx context.Context,
-	timeout time.Time,
-	userID id.UserID,
-) error {
-	_, err := util.DoWriteTransaction(ctx, t.db, func(txn fdb.Transaction) (types.Nil, error) {
-		t.presence.TxnStorePresenceTimeout(txn, timeout, userID)
-		return nil, nil
-	})
+	if err != nil {
+		return err
+	}
+	if changed {
+		t.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{userID}})
+		zerolog.Ctx(ctx).Debug().Msg("Updated user presence")
+	} else {
+		zerolog.Ctx(ctx).Debug().Msg("Received duplicate presence, updated last active")
+	}
 	return err
 }
 
 func (t *TransientDatabase) GetPresenceTimeouts(
 	ctx context.Context,
 	toTimeout time.Time,
-) ([]id.UserID, error) {
-	return util.DoReadTransaction(ctx, t.db, func(txn fdb.ReadTransaction) ([]id.UserID, error) {
-		return t.presence.TxnGetPresenceTimeouts(txn, toTimeout), nil
+	limit int,
+) ([]presence.Timeout, error) {
+	return util.DoReadTransaction(ctx, t.db, func(txn fdb.ReadTransaction) ([]presence.Timeout, error) {
+		return t.presence.TxnGetPresenceTimeouts(txn, toTimeout, limit), nil
 	})
 }
 
-func (t *TransientDatabase) ClearPresenceTimeouts(
+func (t *TransientDatabase) HandlePresenceTimeout(
 	ctx context.Context,
-	toTimeout time.Time,
+	timeout presence.Timeout,
+	now time.Time,
 ) error {
-	_, err := util.DoWriteTransaction(ctx, t.db, func(txn fdb.Transaction) (types.Nil, error) {
-		t.presence.TxnClearPresenceTimeouts(txn, toTimeout)
+	changed := false
+	_, err := util.DoWriteTransactionWithVersion(ctx, t.db, func(txn fdb.Transaction) (types.Nil, error) {
+		// An ambiguous commit may retry after the timeout was cleared.
+		changed = t.presence.TxnHandlePresenceTimeout(
+			txn, timeout, now, t.config.Transient.PresenceTimeout,
+		) || changed
 		return nil, nil
 	})
+	if err == nil && changed {
+		t.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{timeout.UserID}})
+	}
 	return err
 }

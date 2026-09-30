@@ -70,10 +70,11 @@ type Event struct {
 	Signatures map[string]map[string]string `msgpack:"sig" json:"signatures"`
 
 	// Internal, in-memory only flags used for the lifetime of a request/background job
-	IsForClientAPI    bool               `msgpack:"-" json:"-"`
-	IsDuplicate       bool               `msgpack:"-" json:"-"`
-	IncompleteVersion tuple.Versionstamp `msgpack:"-" json:"-"`
-	PrevStateEvent    *Event             `msgpack:"-" json:"-"`
+	ClientTransactionID string             `msgpack:"-" json:"-"`
+	IsForClientAPI      bool               `msgpack:"-" json:"-"`
+	IsDuplicate         bool               `msgpack:"-" json:"-"`
+	IncompleteVersion   tuple.Versionstamp `msgpack:"-" json:"-"`
+	PrevStateEvent      *Event             `msgpack:"-" json:"-"`
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
@@ -198,6 +199,11 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 		b := exerrors.Must(json.Marshal(ev.PartialEvent))
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
 		b = exerrors.Must(sjson.SetBytes(b, "event_id", ev.ID))
+		// Only locally looked-up metadata may expose a client transaction ID.
+		b = exerrors.Must(sjson.DeleteBytes(b, "unsigned.transaction_id"))
+		if ev.ClientTransactionID != "" {
+			b = exerrors.Must(sjson.SetBytes(b, "unsigned.transaction_id", ev.ClientTransactionID))
+		}
 		return b, nil
 	}
 

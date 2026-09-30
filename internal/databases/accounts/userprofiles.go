@@ -46,7 +46,9 @@ func (a *AccountsDatabase) UpdateUserProfile(ctx context.Context, userID id.User
 			profile.Custom[key] = value
 		}
 
-		a.users.TxnStoreUserProfile(txn, userID, profile)
+		if err := a.users.TxnStoreUserProfile(txn, userID, profile); err != nil {
+			return nil, err
+		}
 
 		version := tuple.IncompleteVersionstamp(0)
 		a.users.TxnStoreProfileChange(txn, userID, profile, version)

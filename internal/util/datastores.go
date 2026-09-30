@@ -32,6 +32,12 @@ func NewDatastores(config config.BabbleConfig) *Datastores {
 			store := datastores.NewS3Store()
 			store.Configure(config, storeConfig)
 			stores[key] = store
+		case "filesystem":
+			store := datastores.NewFilesystemStore()
+			store.Configure(config, storeConfig)
+			stores[key] = store
+		default:
+			panic(fmt.Errorf("unknown datastore type: %s", sType))
 		}
 	}
 
@@ -82,25 +88,48 @@ func (d *Datastores) PickDatastoreForRequest(r *http.Request) datastores.Datasto
 
 func (d *Datastores) PresignedGetURLForMedia(ctx context.Context, m *types.Media) (string, error) {
 	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return "", fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
 	return store.GetObjectPresignedURL(ctx, m.StorePath, d.presignedURLTimeout)
 }
 
 func (d *Datastores) PresignedPutURLForMedia(ctx context.Context, m *types.Media) (string, error) {
 	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return "", fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
 	return store.PutObjectPresignedURL(ctx, m.StorePath, d.presignedURLTimeout)
 }
 
 func (d *Datastores) GetObjectInfoForMedia(ctx context.Context, m *types.Media) (datastores.ObjectInfo, error) {
 	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return datastores.ObjectInfo{}, fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
 	return store.GetObjectInfo(ctx, m.StorePath)
 }
 
 func (d *Datastores) GetObjectForMedia(ctx context.Context, m *types.Media) (io.Reader, error) {
 	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return nil, fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
 	return store.GetObject(ctx, m.StorePath)
 }
 
-func (d *Datastores) PutObjectForMedia(ctx context.Context, m *types.Media, input io.Reader) error {
+func (d *Datastores) PutObjectForMedia(ctx context.Context, m *types.Media, input io.Reader, info datastores.ObjectInfo) error {
 	store := d.GetDatastore(m.StoreKey)
-	return store.PutObject(ctx, m.StorePath, input, datastores.ObjectInfo{})
+	if store == nil {
+		return fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
+	return store.PutObject(ctx, m.StorePath, input, info)
+}
+
+func (d *Datastores) DeleteObjectForMedia(ctx context.Context, m *types.Media) error {
+	store := d.GetDatastore(m.StoreKey)
+	if store == nil {
+		return fmt.Errorf("media datastore %q is not configured", m.StoreKey)
+	}
+	return store.DeleteObject(ctx, m.StorePath)
 }

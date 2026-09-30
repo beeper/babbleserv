@@ -160,7 +160,7 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	ev.RoomVersion = room.Version
 
 	// Veriy the event is signed by the requesting HS
-	verifyErr, err := util.VerifyEvent(r.Context(), &ev, middleware.GetRequestServer(r), f.keyStore)
+	verifyErr, err := util.VerifyEvent(r.Context(), &ev, f.keyStore)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

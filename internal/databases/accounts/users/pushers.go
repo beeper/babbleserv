@@ -13,6 +13,14 @@ func (u *UsersDirectory) keyForUserPusher(userID id.UserID, appID pushgateway.Pu
 	return u.userPushers.Pack(tuple.Tuple{userID.String(), string(appID), pushKey})
 }
 
+func (u *UsersDirectory) keyForUserPusherDevice(userID id.UserID, appID pushgateway.PusherAppID, pushKey string) fdb.Key {
+	return u.userPusherDevices.Pack(tuple.Tuple{userID.String(), string(appID), pushKey})
+}
+
+func (u *UsersDirectory) keyForPusherIdentityUser(appID pushgateway.PusherAppID, pushKey string, userID id.UserID) fdb.Key {
+	return u.pusherUsersByIdentity.Pack(tuple.Tuple{string(appID), pushKey, userID.String()})
+}
+
 func (u *UsersDirectory) RangeForUserPushers(userID id.UserID) fdb.ExactRange {
 	return u.userPushers.Sub(userID.String())
 }
@@ -35,17 +43,67 @@ func (u *UsersDirectory) TxnGetPushersForUser(txn fdb.ReadTransaction, userID id
 	return pushers, nil
 }
 
-func (u *UsersDirectory) TxnSetPusherForUser(txn fdb.Transaction, userID id.UserID, pusher *pushgateway.Pusher) error {
-	key := u.keyForUserPusher(userID, pusher.AppID, pusher.PushKey)
+func (u *UsersDirectory) TxnSetPusherForUser(
+	txn fdb.Transaction,
+	userID id.UserID,
+	deviceID id.DeviceID,
+	pusher *pushgateway.Pusher,
+	appendPusher bool,
+) error {
 	value, err := json.Marshal(pusher)
 	if err != nil {
 		return err
 	}
-	txn.Set(key, value)
+	if !appendPusher {
+		iter := txn.GetRange(
+			u.pusherUsersByIdentity.Sub(string(pusher.AppID), pusher.PushKey),
+			fdb.RangeOptions{Mode: fdb.StreamingModeWantAll},
+		).Iterator()
+		for iter.Advance() {
+			kv, err := iter.Get()
+			if err != nil {
+				return err
+			}
+			tup, err := u.pusherUsersByIdentity.Unpack(kv.Key)
+			if err != nil {
+				return err
+			}
+			otherUserID := id.UserID(tup[2].(string))
+			if otherUserID != userID {
+				u.TxnDeletePusherForUser(txn, otherUserID, pusher.AppID, pusher.PushKey)
+			}
+		}
+	}
+	txn.Set(u.keyForUserPusher(userID, pusher.AppID, pusher.PushKey), value)
+	txn.Set(u.keyForUserPusherDevice(userID, pusher.AppID, pusher.PushKey), []byte(deviceID))
+	txn.Set(u.keyForPusherIdentityUser(pusher.AppID, pusher.PushKey, userID), nil)
 	return nil
 }
 
 func (u *UsersDirectory) TxnDeletePusherForUser(txn fdb.Transaction, userID id.UserID, appID pushgateway.PusherAppID, pushKey string) {
-	key := u.keyForUserPusher(userID, appID, pushKey)
-	txn.Clear(key)
+	txn.Clear(u.keyForUserPusher(userID, appID, pushKey))
+	txn.Clear(u.keyForUserPusherDevice(userID, appID, pushKey))
+	txn.Clear(u.keyForPusherIdentityUser(appID, pushKey, userID))
+}
+
+func (u *UsersDirectory) TxnDeletePushersForDevices(txn fdb.Transaction, userID id.UserID, deviceIDs map[id.DeviceID]struct{}) error {
+	if len(deviceIDs) == 0 {
+		return nil
+	}
+	iter := txn.GetRange(u.userPusherDevices.Sub(userID.String()), fdb.RangeOptions{Mode: fdb.StreamingModeIterator}).Iterator()
+	for iter.Advance() {
+		kv, err := iter.Get()
+		if err != nil {
+			return err
+		}
+		if _, ok := deviceIDs[id.DeviceID(kv.Value)]; !ok {
+			continue
+		}
+		tup, err := u.userPusherDevices.Unpack(kv.Key)
+		if err != nil {
+			return err
+		}
+		u.TxnDeletePusherForUser(txn, userID, pushgateway.PusherAppID(tup[1].(string)), tup[2].(string))
+	}
+	return nil
 }

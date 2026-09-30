@@ -28,7 +28,18 @@ func (c *ClientRoutes) sendLocalEventHandleResults(
 	partialEv *types.PartialEvent,
 	responseGen func(ev *types.Event) any,
 ) {
-	res, err := c.db.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, rooms.SendLocalEventsOptions{})
+	c.sendLocalEventHandleResultsWithOptions(w, r, roomID, partialEv, rooms.SendLocalEventsOptions{}, responseGen)
+}
+
+func (c *ClientRoutes) sendLocalEventHandleResultsWithOptions(
+	w http.ResponseWriter,
+	r *http.Request,
+	roomID id.RoomID,
+	partialEv *types.PartialEvent,
+	options rooms.SendLocalEventsOptions,
+	responseGen func(ev *types.Event) any,
+) {
+	res, err := c.db.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, options)
 	if errors.Is(err, types.ErrRoomNotFound) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, err.Error())
 	} else if err != nil {
@@ -103,7 +114,7 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 		ev.Signatures[otherHomeserver][k] = v.(string)
 	}
 
-	verifyErr, err := util.VerifyEvent(backgroundCtx, ev, otherHomeserver, c.keyStore)
+	verifyErr, err := util.VerifyEvent(backgroundCtx, ev, c.keyStore)
 	if err != nil {
 		return nil, nil, err
 	} else if verifyErr != nil {

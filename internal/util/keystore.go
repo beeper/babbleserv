@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
@@ -86,6 +87,10 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 		return err
 	}
 
+	if len(serverKeys.verifyKeys) == 0 {
+		return errors.New("server has no verification keys")
+	}
+
 	errs := make([]error, 0)
 
 	// Accept signatures under the full host:port key and just host
@@ -112,4 +117,28 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 	}
 
 	return errors.Join(errs...)
+}
+
+func (k *KeyStore) VerifyJSONs(ctx context.Context, requests []gomatrixserverlib.VerifyJSONRequest) ([]gomatrixserverlib.VerifyJSONResult, error) {
+	results := make([]gomatrixserverlib.VerifyJSONResult, len(requests))
+	for i, request := range requests {
+		serverName := string(request.ServerName)
+		keys, err := k.GetServerKeys(ctx, serverName)
+		if err != nil {
+			results[i].Error = err
+			continue
+		}
+		if request.ValidityCheckingFunc != nil && !request.ValidityCheckingFunc(request.AtTS, spec.AsTimestamp(keys.validUntil)) {
+			results[i].Error = errors.New("server signing key was not valid at the event timestamp")
+			continue
+		}
+		results[i].Error = errors.New("no valid signature from " + serverName)
+		for keyID, key := range keys.verifyKeys {
+			if VerifyJSON(request.Message, serverName, keyID, key) == nil {
+				results[i].Error = nil
+				break
+			}
+		}
+	}
+	return results, nil
 }

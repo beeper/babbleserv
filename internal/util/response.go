@@ -13,7 +13,8 @@ import (
 )
 
 var (
-	MUnknown = mautrix.RespError{
+	MCannotOverwriteMedia = mautrix.RespError{ErrCode: "M_CANNOT_OVERWRITE_MEDIA"}
+	MUnknown              = mautrix.RespError{
 		ErrCode: "M_UNKNOWN",
 	}
 	MNotImplemented = mautrix.RespError{
@@ -39,10 +40,12 @@ type errorMeta struct {
 }
 
 var errorToMeta = map[string]errorMeta{
-	mautrix.MNotJSON.ErrCode:      {400, "Request body is not valid JSON"},
-	mautrix.MBadJSON.ErrCode:      {400, "Request body is JSON but not match schema"},
-	mautrix.MBadState.ErrCode:     {400, ""},
-	mautrix.MInvalidParam.ErrCode: {400, ""},
+	mautrix.MNotJSON.ErrCode:         {400, "Request body is not valid JSON"},
+	mautrix.MBadJSON.ErrCode:         {400, "Request body is JSON but not match schema"},
+	mautrix.MBadState.ErrCode:        {400, ""},
+	mautrix.MInvalidParam.ErrCode:    {400, ""},
+	mautrix.MInvalidUsername.ErrCode: {400, "Invalid username"},
+	mautrix.MUserInUse.ErrCode:       {400, "Username is already taken"},
 
 	mautrix.MUnsupportedRoomVersion.ErrCode: {400, "Room version not supported"},
 	mautrix.MRoomInUse.ErrCode:              {409, "Room alias taken"},
@@ -53,8 +56,10 @@ var errorToMeta = map[string]errorMeta{
 	mautrix.MForbidden.ErrCode:    {403, ""},
 	MUnprocessableContent.ErrCode: {422, ""},
 
-	mautrix.MNotFound.ErrCode: {404, "Nothing found here"},
-	MMethodNotAllowed.ErrCode: {405, "Wrong HTTP method"},
+	mautrix.MNotFound.ErrCode:     {404, "Nothing found here"},
+	MCannotOverwriteMedia.ErrCode: {409, "Media ID already has content"},
+	mautrix.MTooLarge.ErrCode:     {413, "Media upload exceeds configured maximum size"},
+	MMethodNotAllowed.ErrCode:     {405, "Wrong HTTP method"},
 
 	MUnknown.ErrCode:        {500, "An unknown error occurred"},
 	MNotImplemented.ErrCode: {501, "Not implemented"},

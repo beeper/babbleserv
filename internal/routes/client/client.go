@@ -21,14 +21,15 @@ import (
 type ClientRoutes struct {
 	backgroundWg sync.WaitGroup
 
-	log        zerolog.Logger
-	db         *databases.Databases
-	config     config.BabbleConfig
-	fclient    fclient.FederationClient
-	fedClient  *federation.Client
-	keyStore   *util.KeyStore
-	datastores *util.Datastores
-	notifiers  *notifier.Notifiers
+	log         zerolog.Logger
+	db          *databases.Databases
+	config      config.BabbleConfig
+	fclient     fclient.FederationClient
+	fedClient   *federation.Client
+	mediaClient *federation.Client
+	keyStore    *util.KeyStore
+	datastores  *util.Datastores
+	notifiers   *notifier.Notifiers
 }
 
 func NewClientRoutes(
@@ -45,15 +46,21 @@ func NewClientRoutes(
 		Str("routes", "client").
 		Logger()
 
+	mediaClient := federation.NewClient(fedClient.ServerName, fedClient.Key, federation.NewInMemoryCache())
+	mediaClient.UserAgent = fedClient.UserAgent
+	mediaClient.HTTP.Timeout = 0 // The media acquisition context covers network and storage work.
+	mediaClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.MaxResponseHeaderBytes = 64 * 1024
+
 	return &ClientRoutes{
-		log:        log,
-		db:         db,
-		config:     cfg,
-		fclient:    fclient,
-		fedClient:  fedClient,
-		keyStore:   keyStore,
-		datastores: datastores,
-		notifiers:  notifiers,
+		log:         log,
+		db:          db,
+		config:      cfg,
+		fclient:     fclient,
+		fedClient:   fedClient,
+		mediaClient: mediaClient,
+		keyStore:    keyStore,
+		datastores:  datastores,
+		notifiers:   notifiers,
 	}
 }
 
@@ -97,12 +104,20 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state/{eventType}/{stateKey}", middleware.RequireUserAuth(c.GetRoomStateEvent))
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/state", middleware.RequireUserAuth(c.GetRoomState))
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/members", middleware.RequireUserAuth(c.GetRoomMembers))
+	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/joined_members", middleware.RequireUserAuth(c.GetJoinedMembers))
+	rtr.MethodFunc(http.MethodGet, "/r0/rooms/{roomID}/joined_members", middleware.RequireUserAuth(c.GetJoinedMembers))
 
 	// Room aliases
 	rtr.MethodFunc(http.MethodGet, "/v3/rooms/{roomID}/aliases", middleware.RequireUserAuth(c.GetAliasesForRoom))
 	rtr.MethodFunc(http.MethodGet, "/v3/directory/room/{roomAlias}", c.GetAlias)
 	rtr.MethodFunc(http.MethodPut, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.CreateAlias))
 	rtr.MethodFunc(http.MethodDelete, "/v3/directory/room/{roomAlias}", middleware.RequireUserAuth(c.DeleteAlias))
+
+	// Published room directory
+	rtr.MethodFunc(http.MethodGet, "/v3/directory/list/room/{roomID}", c.GetRoomDirectoryVisibility)
+	rtr.MethodFunc(http.MethodPut, "/v3/directory/list/room/{roomID}", middleware.RequireUserAuth(c.PutRoomDirectoryVisibility))
+	rtr.MethodFunc(http.MethodGet, "/v3/publicRooms", c.GetPublicRooms)
+	rtr.MethodFunc(http.MethodPost, "/v3/publicRooms", middleware.RequireUserAuth(c.PostPublicRooms))
 
 	// Receipts routes
 	rtr.MethodFunc(http.MethodPost, "/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", middleware.RequireUserAuth(c.SendRoomReadReceipt))
@@ -113,21 +128,27 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	rtr.MethodFunc(http.MethodPut, "/v3/presence/{userID}/status", middleware.RequireUserAuth(c.PutPresence))
 
 	rtr.MethodFunc(http.MethodPost, "/v3/register", c.Register)
+	rtr.MethodFunc(http.MethodGet, "/v3/register/available", c.GetRegisterAvailable)
 	rtr.MethodFunc(http.MethodGet, "/v3/login", c.GetLogin)
 	rtr.MethodFunc(http.MethodPost, "/v3/login", c.Login)
+	rtr.MethodFunc(http.MethodPost, "/v3/refresh", c.Refresh)
+	rtr.MethodFunc(http.MethodPost, "/v3/logout", middleware.RequireUserAuth(c.Logout))
+	rtr.MethodFunc(http.MethodPost, "/v3/logout/all", middleware.RequireUserAuth(c.LogoutAll))
 
-	rtr.MethodFunc(http.MethodGet, "/v3/whoami", middleware.RequireUserAuth(c.GetWhoami))
+	rtr.MethodFunc(http.MethodGet, "/v3/account/whoami", middleware.RequireUserAuth(c.GetWhoami))
+	rtr.MethodFunc(http.MethodPost, "/v3/account/password", middleware.RequireUserAuth(c.ChangePassword))
 
 	// Profile routes - note the spec has the GET endpoints un-authenticated but Babbleserv disagrees
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}", middleware.RequireUserAuth(c.GetProfile))
 	rtr.MethodFunc(http.MethodGet, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.GetProfile))
 	rtr.MethodFunc(http.MethodPut, "/v3/profile/{userID}/{key}", middleware.RequireUserAuth(c.PutProfile))
+	rtr.MethodFunc(http.MethodPost, "/v3/user_directory/search", middleware.RequireUserAuth(c.SearchUserDirectory))
 
 	rtr.MethodFunc(http.MethodGet, "/v3/devices", middleware.RequireUserAuth(c.GetDevices))
 	rtr.MethodFunc(http.MethodGet, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.GetDevice))
 	rtr.MethodFunc(http.MethodPut, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.PutDevice))
 	rtr.MethodFunc(http.MethodDelete, "/v3/devices/{deviceID}", middleware.RequireUserAuth(c.DeleteDevice))
-	rtr.MethodFunc(http.MethodDelete, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
+	rtr.MethodFunc(http.MethodPost, "/v3/delete_devices", middleware.RequireUserAuth(c.DeleteDevices))
 
 	rtr.MethodFunc(http.MethodGet, "/v3/keys/changes", middleware.RequireUserAuth(c.GetKeyChanges))
 	rtr.MethodFunc(http.MethodPost, "/v3/keys/query", middleware.RequireUserAuth(c.QueryKeys))
@@ -179,6 +200,10 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 	// Room account data
 	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.SetAccountData))
 	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/account_data/{type}", middleware.RequireUserAuth(c.GetAccountData))
+	// Room tags are stored as room account data (m.tag).
+	rtr.MethodFunc(http.MethodGet, "/v3/user/{userID}/rooms/{roomID}/tags", middleware.RequireUserAuth(c.GetRoomTags))
+	rtr.MethodFunc(http.MethodPut, "/v3/user/{userID}/rooms/{roomID}/tags/{tag}", middleware.RequireUserAuth(c.PutRoomTag))
+	rtr.MethodFunc(http.MethodDelete, "/v3/user/{userID}/rooms/{roomID}/tags/{tag}", middleware.RequireUserAuth(c.DeleteRoomTag))
 
 	rtr.MethodFunc(http.MethodPut, "/v3/sendToDevice/{eventType}/{txnID}", middleware.RequireUserAuth(c.SendToDevice))
 
@@ -193,8 +218,12 @@ func (c *ClientRoutes) AddClientRoutes(rtr chi.Router) {
 
 func (c *ClientRoutes) AddClientMediaRoutes(rtr chi.Router) {
 	if c.config.Media.Enabled {
+		rtr.MethodFunc(http.MethodGet, "/v3/config", middleware.RequireUserAuth(c.GetMediaConfig))
+		rtr.MethodFunc(http.MethodGet, "/v3/thumbnail/{serverName}/{mediaID}", middleware.RequireUserAuth(c.DownloadThumbnail))
 		rtr.MethodFunc(http.MethodPost, "/v1/create", middleware.RequireUserAuth(c.CreateMedia))
-		rtr.MethodFunc(http.MethodPost, "/v1/complete", middleware.RequireUserAuth(c.CompleteMedia))
+		rtr.MethodFunc(http.MethodPost, "/v1/complete/{serverName}/{mediaID}", middleware.RequireUserAuth(c.CompleteMedia))
+		rtr.MethodFunc(http.MethodGet, "/v3/download/{serverName}/{mediaID}", middleware.RequireUserAuth(c.DownloadMedia))
+		rtr.MethodFunc(http.MethodGet, "/v3/download/{serverName}/{mediaID}/{filename}", middleware.RequireUserAuth(c.DownloadMedia))
 		rtr.MethodFunc(http.MethodPost, "/v3/upload", middleware.RequireUserAuth(c.UploadMedia))
 		rtr.MethodFunc(http.MethodPut, "/v3/upload/{serverName}/{mediaID}", middleware.RequireUserAuth(c.UploadMedia))
 	}

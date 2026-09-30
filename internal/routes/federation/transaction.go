@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
 	"sync"
@@ -168,13 +169,29 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 				// TODO
 
 			case types.EDUTypePresence:
+				origin := middleware.GetRequestServer(r)
 				for _, edu := range edus {
 					var content types.PresenceEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Err(err).Msg("Failed to unmarshal m.presence content")
-						return
+						log.Warn().Err(err).Msg("Ignoring invalid m.presence content")
+						continue
 					}
 					for _, presenceItem := range content.Push {
+						if presenceItem.UserID.Homeserver() != origin {
+							log.Warn().Str("origin", origin).Stringer("user_id", presenceItem.UserID).
+								Msg("Ignoring unauthorized m.presence EDU item")
+							continue
+						}
+						if localpart, _, err := presenceItem.UserID.ParseAndValidateRelaxed(); err != nil || localpart == "" ||
+							presenceItem.LastActiveAgo < 0 ||
+							presenceItem.LastActiveAgo > int64(math.MaxInt64/time.Millisecond) ||
+							(presenceItem.Presence != event.PresenceOnline &&
+								presenceItem.Presence != event.PresenceOffline &&
+								presenceItem.Presence != event.PresenceUnavailable) {
+							log.Warn().Stringer("user_id", presenceItem.UserID).
+								Msg("Ignoring invalid m.presence EDU item")
+							continue
+						}
 						// Calculate last active time from last_active_ago
 						lastActive := time.Now()
 						if presenceItem.LastActiveAgo > 0 {
@@ -194,9 +211,6 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 								Msg("Failed to store remote presence")
 							return
 						}
-						f.notifiers.Transient.SendChange(notifier.Change{
-							UserIDs: []id.UserID{presenceItem.UserID},
-						})
 						log.Debug().
 							Str("user_id", presenceItem.UserID.String()).
 							Str("presence", string(presenceItem.Presence)).
@@ -317,7 +331,7 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 		}
 		ev.RoomVersion = roomVersions[ev.RoomID]
 
-		verifyErr, err := util.VerifyEvent(r.Context(), ev, origin, f.keyStore)
+		verifyErr, err := util.VerifyEvent(r.Context(), ev, f.keyStore)
 		if err != nil {
 			return nil, err
 		} else if errors.Is(verifyErr, types.ErrEventRedacted) {
@@ -499,7 +513,7 @@ func (f *FederationRoutes) getMissingEventsForSendBatch(
 		}
 		ev.RoomVersion = roomVersion
 
-		if verifyErr, err := util.VerifyEvent(ctx, &ev, origin, f.keyStore); err != nil {
+		if verifyErr, err := util.VerifyEvent(ctx, &ev, f.keyStore); err != nil {
 			return nil, err
 		} else if verifyErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(verifyErr).Msg("Missing event failed verification, ignoring")

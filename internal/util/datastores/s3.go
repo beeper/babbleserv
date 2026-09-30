@@ -108,3 +108,7 @@ func (s *S3Store) PutObject(ctx context.Context, key string, src io.Reader, info
 	})
 	return err
 }
+
+func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
+	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
+}

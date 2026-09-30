@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/matrix-org/gomatrixserverlib"
+
 	"github.com/beeper/babbleserv/internal/util"
 )
 
@@ -48,6 +50,12 @@ func (f *FederationRoutes) GetKeys(w http.ResponseWriter, r *http.Request) {
 
 	keyID, key := f.config.MustGetActiveSigningKey()
 	resp, err = util.SignJSON(resp, f.config.ServerName, keyID, key)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+
+	resp, err = gomatrixserverlib.CanonicalJSON(resp)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

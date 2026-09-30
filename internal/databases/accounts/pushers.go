@@ -23,10 +23,12 @@ func (a *AccountsDatabase) GetPushersForUser(
 func (a *AccountsDatabase) SetPusherForUser(
 	ctx context.Context,
 	userID id.UserID,
+	deviceID id.DeviceID,
 	pusher *pushgateway.Pusher,
+	appendPusher bool,
 ) error {
 	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
-		return nil, a.users.TxnSetPusherForUser(txn, userID, pusher)
+		return nil, a.users.TxnSetPusherForUser(txn, userID, deviceID, pusher, appendPusher)
 	})
 	return err
 }

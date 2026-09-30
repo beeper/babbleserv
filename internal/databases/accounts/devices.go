@@ -2,6 +2,8 @@ package accounts
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
@@ -131,4 +133,79 @@ func (a *AccountsDatabase) GetUserDeviceTokenPrefixes(
 	} else {
 		return tokens, nil
 	}
+}
+
+func (a *AccountsDatabase) txnDeleteUserDevices(txn fdb.Transaction, userID id.UserID, deviceIDs []id.DeviceID) (bool, error) {
+	if len(deviceIDs) > types.MaxVersionstampUserVersion {
+		return false, fmt.Errorf("too many devices in one deletion: %d", len(deviceIDs))
+	}
+	seen := make(map[id.DeviceID]struct{}, len(deviceIDs))
+	changed := false
+	for index, deviceID := range deviceIDs {
+		if _, ok := seen[deviceID]; ok {
+			continue
+		}
+		seen[deviceID] = struct{}{}
+		device, err := a.devices.TxnGetDevice(txn, userID, deviceID)
+		if err != nil {
+			return false, err
+		}
+		if device == nil {
+			continue
+		}
+		if err := a.tokens.TxnClearUserDeviceTokens(txn, userID, deviceID); err != nil {
+			return false, err
+		}
+		if err := a.tokens.TxnClearDeviceUIASessions(txn, userID, deviceID); err != nil {
+			return false, err
+		}
+		a.devices.TxnDeleteDevice(txn, userID, deviceID)
+		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, tuple.IncompleteVersionstamp(uint16(index)))
+		if err := a.users.TxnIncrementUserDeviceListVersion(txn, userID); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	if err := a.users.TxnDeletePushersForDevices(txn, userID, seen); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func (a *AccountsDatabase) DeleteUserDevicesWithPassword(
+	ctx context.Context,
+	userDevice types.UserDevice,
+	password string,
+	deviceIDs []id.DeviceID,
+	uiaSession, method, path string,
+) error {
+	err := a.runAccountUpdate(ctx, userDevice.UserID, &password, func(txn fdb.Transaction) (bool, error) {
+		if err := a.txnConsumeUIASession(txn, uiaSession, userDevice, method, path); err != nil {
+			return false, err
+		}
+		return a.txnDeleteUserDevices(txn, userDevice.UserID, deviceIDs)
+	})
+	if errors.Is(err, types.ErrUIASessionExpired) {
+		a.cleanupExpiredUIASession(ctx, uiaSession)
+	}
+	return err
+}
+
+func (a *AccountsDatabase) Logout(ctx context.Context, userDevice types.UserDevice, all bool) error {
+	return a.runAccountUpdate(ctx, userDevice.UserID, nil, func(txn fdb.Transaction) (bool, error) {
+		deviceIDs := []id.DeviceID{userDevice.DeviceID}
+		if all {
+			devices, err := txn.GetRange(a.devices.RangeForUserDevices(userDevice.UserID), fdb.RangeOptions{
+				Mode: fdb.StreamingModeWantAll, Limit: types.MaxVersionstampUserVersion + 1,
+			}).GetSliceWithError()
+			if err != nil {
+				return false, err
+			}
+			deviceIDs = make([]id.DeviceID, len(devices))
+			for i, kv := range devices {
+				deviceIDs[i] = types.MustNewDeviceFromBytes(kv.Value).ID
+			}
+		}
+		return a.txnDeleteUserDevices(txn, userDevice.UserID, deviceIDs)
+	})
 }

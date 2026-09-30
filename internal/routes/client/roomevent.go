@@ -7,6 +7,8 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/tidwall/gjson"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
@@ -39,6 +41,15 @@ func (c *ClientRoutes) GetRoomEvent(w http.ResponseWriter, r *http.Request) {
 	} else if !wasInRoom {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "You do not have access to this event")
 		return
+	}
+
+	device := middleware.GetRequestUserDevice(r)
+	if ev.Sender == device.UserID {
+		ev.ClientTransactionID, err = c.db.Rooms.GetEventTransactionID(r.Context(), eventID, *device)
+		if err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EventForClientAPI(ev))
@@ -120,4 +131,40 @@ func (c *ClientRoutes) GetRoomMembers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EventsForClientAPI(memberEvs))
+}
+
+// https://spec.matrix.org/v1.19/client-server-api/#get_matrixclientv3roomsroomidjoined_members
+func (c *ClientRoutes) GetJoinedMembers(w http.ResponseWriter, r *http.Request) {
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	userID := middleware.GetRequestUserID(r)
+	if inRoom, err := c.db.Rooms.IsUserJoinedRoom(r.Context(), userID, roomID); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	} else if !inRoom {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "You are not in this room")
+		return
+	}
+
+	memberEvs, err := c.db.Rooms.GetCurrentRoomMemberEvents(r.Context(), roomID)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	type joinedMember struct {
+		DisplayName string `json:"display_name"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+	joined := make(map[id.UserID]joinedMember)
+	for _, memberEv := range memberEvs {
+		if memberEv.StateKey == nil || memberEv.Membership() != event.MembershipJoin {
+			continue
+		}
+		joined[id.UserID(*memberEv.StateKey)] = joinedMember{
+			DisplayName: gjson.GetBytes(memberEv.Content, "displayname").String(),
+			AvatarURL:   gjson.GetBytes(memberEv.Content, "avatar_url").String(),
+		}
+	}
+	util.ResponseJSON(w, r, http.StatusOK, struct {
+		Joined map[id.UserID]joinedMember `json:"joined"`
+	}{Joined: joined})
 }

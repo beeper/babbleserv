@@ -128,20 +128,27 @@ func GetVersionRange(
 	fromVersion, toVersion tuple.Versionstamp,
 	args ...tuple.TupleElement,
 ) fdb.ExactRange {
+	prefix := sub.Pack(args)
 	var begin, end fdb.KeyConvertible
 	if fromVersion == ZeroVersionstamp {
-		begin = fdb.Key(append(sub.Pack(args), byte(0x00)))
+		begin = fdb.Key(append(append([]byte(nil), prefix...), byte(0x00)))
 	} else {
 		// FDB range starts are inclusive by default, this switches that
-		fromVersion.UserVersion += 1
-		begin = sub.Pack(append(args, fromVersion))
+		if after, ok := VersionstampAfter(fromVersion); ok {
+			begin = sub.Pack(append(args, after))
+		} else {
+			begin = fdb.Key(append(append([]byte(nil), prefix...), byte(0xff)))
+		}
 	}
 	if toVersion == ZeroVersionstamp {
-		end = fdb.Key(append(sub.Pack(args), byte(0xff)))
+		end = fdb.Key(append(append([]byte(nil), prefix...), byte(0xff)))
 	} else {
 		// FDB range ends are exclusive by default, this switches that
-		toVersion.UserVersion += 1
-		end = sub.Pack(append(args, toVersion))
+		if after, ok := VersionstampAfter(toVersion); ok {
+			end = sub.Pack(append(args, after))
+		} else {
+			end = fdb.Key(append(append([]byte(nil), prefix...), byte(0xff)))
+		}
 	}
 	return fdb.KeyRange{Begin: begin, End: end}
 }
@@ -211,4 +218,48 @@ func VersionIsAtOrBefore(version, beforeVersion tuple.Versionstamp) bool {
 
 func VersionIsAfter(version, beforeVersion tuple.Versionstamp) bool {
 	return bytes.Compare(version.Bytes(), beforeVersion.Bytes()) == 1
+}
+
+// VersionstampAfter returns the smallest versionstamp greater than version.
+// Event batches reserve the maximum user version, but carrying into the
+// transaction version keeps historical lookups correct for arbitrary tokens.
+func VersionstampAfter(version tuple.Versionstamp) (tuple.Versionstamp, bool) {
+	if IsIncompleteVersionstamp(version) {
+		return ZeroVersionstamp, false
+	}
+	if version.UserVersion < math.MaxUint16 {
+		version.UserVersion++
+		return version, true
+	}
+	version.UserVersion = 0
+	for i := len(version.TransactionVersion) - 1; i >= 0; i-- {
+		if version.TransactionVersion[i] != math.MaxUint8 {
+			version.TransactionVersion[i]++
+			if version.TransactionVersion == incompleteVersion {
+				return ZeroVersionstamp, false
+			}
+			return version, true
+		}
+		version.TransactionVersion[i] = 0
+	}
+	return ZeroVersionstamp, false
+}
+
+// VersionstampBefore returns the largest versionstamp less than version, borrowing from the
+// transaction version so that VersionstampAfter maps the result back to version. Returns
+// ZeroVersionstamp, an open range start, when version has no predecessor.
+func VersionstampBefore(version tuple.Versionstamp) tuple.Versionstamp {
+	if version.UserVersion > 0 {
+		version.UserVersion--
+		return version
+	}
+	version.UserVersion = math.MaxUint16
+	for i := len(version.TransactionVersion) - 1; i >= 0; i-- {
+		if version.TransactionVersion[i] != 0 {
+			version.TransactionVersion[i]--
+			return version
+		}
+		version.TransactionVersion[i] = math.MaxUint8
+	}
+	return ZeroVersionstamp
 }

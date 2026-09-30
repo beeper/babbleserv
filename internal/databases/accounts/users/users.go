@@ -86,6 +86,22 @@ type UsersDirectory struct {
 	// key: (id.UserID, appID, pushKey)
 	// value: pushgateway.Pusher (JSON)
 	userPushers subspace.Subspace
+
+	// key: (id.UserID, appID, pushKey)
+	// value: id.DeviceID which last set the pusher
+	userPusherDevices subspace.Subspace
+
+	// key: (appID, pushKey, id.UserID)
+	// value: empty; finds owners of exactly one pusher identity
+	pusherUsersByIdentity subspace.Subspace
+
+	// Lowercase one-to-three-rune substring -> user ID; value: empty.
+	searchGrams subspace.Subspace
+
+	// user ID -> (source membership event ID, due milliseconds)
+	remoteProfileJobs subspace.Subspace
+	// (due milliseconds, user ID, source membership event ID) -> empty
+	remoteProfileJobsByDue subspace.Subspace
 }
 
 func NewUsersDirectory(
@@ -109,22 +125,31 @@ func NewUsersDirectory(
 		db:         db,
 		serverName: serverName,
 
-		byVersion:            usersDir.Sub("uvr"),
-		localUsers:           usersDir.Sub("unm"),
-		remoteUsers:          usersDir.Sub("rus"),
-		userProfiles:         usersDir.Sub("upr"),
-		profileChanges:       usersDir.Sub("pch"),
-		userPasswordHashes:   usersDir.Sub("uph"),
-		userCrossSigningKeys: usersDir.Sub("uxs"),
-		userKeySignatures:    usersDir.Sub("uks"),
-		userFilters:          usersDir.Sub("ufl"),
-		userPushers:          usersDir.Sub("upk"),
+		byVersion:              usersDir.Sub("uvr"),
+		localUsers:             usersDir.Sub("unm"),
+		remoteUsers:            usersDir.Sub("rus"),
+		userProfiles:           usersDir.Sub("upr"),
+		profileChanges:         usersDir.Sub("pch"),
+		userPasswordHashes:     usersDir.Sub("uph"),
+		userCrossSigningKeys:   usersDir.Sub("uxs"),
+		userKeySignatures:      usersDir.Sub("uks"),
+		userFilters:            usersDir.Sub("ufl"),
+		userPushers:            usersDir.Sub("upk"),
+		userPusherDevices:      usersDir.Sub("upd"),
+		pusherUsersByIdentity:  usersDir.Sub("upi"),
+		searchGrams:            usersDir.Sub("usg"),
+		remoteProfileJobs:      usersDir.Sub("urj"),
+		remoteProfileJobsByDue: usersDir.Sub("urd"),
 	}
 }
 
 func (u *UsersDirectory) TxnGetLocalUserPasswordHash(txn fdb.ReadTransaction, username string) ([]byte, error) {
 	key := u.userPasswordHashes.Pack(tuple.Tuple{username})
 	return txn.Get(key).Get()
+}
+
+func (u *UsersDirectory) TxnSetLocalUserPasswordHash(txn fdb.Transaction, username string, hash []byte) {
+	txn.Set(u.userPasswordHashes.Pack(tuple.Tuple{username}), hash)
 }
 
 func (u *UsersDirectory) keyForUser(userID id.UserID) fdb.Key {
@@ -175,6 +200,10 @@ func (u *UsersDirectory) TxnCreateLocalUser(txn fdb.Transaction, user *types.Use
 
 	if err := u.txnCreateUser(txn, user); err != nil {
 		return err
+	}
+
+	for gram := range searchGrams(userID.String()) {
+		txn.Set(u.searchGrams.Pack(tuple.Tuple{gram, userID.String()}), nil)
 	}
 
 	if hashedPassword != nil {

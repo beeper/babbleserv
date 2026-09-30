@@ -112,18 +112,32 @@ func StringToVersionMap(s string) (types.VersionMap, error) {
 
 	parts := strings.Split(s, ".")
 
-	if parts[0] == "" {
+	if s == "" {
 		return versions, nil
 	}
 
 	for _, part := range parts {
+		if len(part) < 2 {
+			return nil, fmt.Errorf("invalid version component %q", part)
+		}
 		key, value := part[0], part[1:]
 
 		bytes, err := Base32HexDecode(value)
 		if err != nil {
 			return nil, err
 		}
-		version := types.MustBytesToVersionstamp(bytes)
+		// Only unpack one complete versionstamp tuple (type byte + 12 bytes).
+		// The FDB tuple decoder can panic on malformed values of other types.
+		if len(bytes) != 13 || bytes[0] != 0x33 {
+			return nil, types.ErrInvalidVersion
+		}
+		version, err := types.BytesToVersionstamp(bytes)
+		if err != nil {
+			return nil, err
+		}
+		if types.IsIncompleteVersionstamp(version) {
+			return nil, types.ErrInvalidVersion
+		}
 
 		vKey := types.VersionKey(key)
 		switch vKey {
@@ -157,7 +171,23 @@ func VersionFromRequestQuery(r *http.Request, field, versionKey types.VersionKey
 
 func ParseRequestJSON[T any](r *http.Request) (T, *mautrix.RespError) {
 	var req T
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		var sErr *json.SyntaxError
+		if errors.As(err, &sErr) {
+			return req, &mautrix.MNotJSON
+		}
+		return req, &mautrix.MBadJSON
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return req, &mautrix.MBadJSON
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return req, &mautrix.MNotJSON
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
 		var sErr *json.SyntaxError
 		if errors.As(err, &sErr) {
 			return req, &mautrix.MNotJSON
