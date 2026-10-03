@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,25 +44,16 @@ var presets = map[string][]struct {
 	},
 }
 
+type reqCreateRoom struct {
+	mautrix.ReqCreateRoom
+	PowerLevelOverride map[string]json.RawMessage `json:"power_level_content_override"`
+}
+
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3createroom
 func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
-	var req *struct {
-		mautrix.ReqCreateRoom
-		PowerLevelOverride map[string]json.RawMessage `json:"power_level_content_override"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-	if err := json.Unmarshal(raw, &req); err != nil || req == nil {
-		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+	req, respErr := util.ParseRequestJSON[reqCreateRoom](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 

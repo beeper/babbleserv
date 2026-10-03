@@ -2,8 +2,6 @@ package client
 
 import (
 	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"unicode/utf8"
@@ -36,22 +34,18 @@ func (c *ClientRoutes) GetPushers(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3pushersset
 func (c *ClientRoutes) SetPusher(w http.ResponseWriter, r *http.Request) {
 	const maxPusherBytes = 64 * 1024
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPusherBytes))
-	if err != nil {
-		var sizeErr *http.MaxBytesError
-		if errors.As(err, &sizeErr) {
-			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, &mautrix.MTooLarge)
+	r.Body = http.MaxBytesReader(w, r.Body, maxPusherBytes)
+	body, respErr := util.ParseRequestJSON[json.RawMessage](r)
+	if respErr != nil {
+		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
+			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
 		} else {
-			util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+			util.ResponseErrorJSON(w, r, *respErr)
 		}
 		return
 	}
-	if !json.Valid(body) {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-	var req *reqSetPusher
-	if err := json.Unmarshal(body, &req); err != nil || req == nil {
+	var req reqSetPusher
+	if err := json.Unmarshal(body, &req); err != nil {
 		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
 		return
 	}

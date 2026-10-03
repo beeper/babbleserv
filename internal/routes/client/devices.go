@@ -71,7 +71,7 @@ func (c *ClientRoutes) PutDevice(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.16/client-server-api/#delete_matrixclientv3devicesdeviceid
 func (c *ClientRoutes) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	deviceID := decodedURLParam(r, "deviceID")
-	params, rawAuth, respErr := parseUIARequestBody(r, true)
+	params, rawAuth, respErr := parseUIARequestBody(w, r, true)
 	if respErr != nil {
 		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
@@ -100,7 +100,7 @@ func (c *ClientRoutes) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3delete_devices
 func (c *ClientRoutes) DeleteDevices(w http.ResponseWriter, r *http.Request) {
-	params, rawAuth, respErr := parseUIARequestBody(r, false)
+	params, rawAuth, respErr := parseUIARequestBody(w, r, false)
 	if respErr != nil {
 		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)

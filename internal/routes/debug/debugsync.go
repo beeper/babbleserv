@@ -12,7 +12,7 @@ import (
 )
 
 func (d *DebugRoutes) DebugSyncUser(w http.ResponseWriter, r *http.Request) {
-	userID := id.UserID(chi.URLParam(r, "userID"))
+	userID := util.UserIDFromRequestURLParam(r, "userID")
 	deviceID := id.DeviceID(chi.URLParam(r, "deviceID"))
 
 	versions, err := util.VersionMapFromRequestQuery(r, "since")

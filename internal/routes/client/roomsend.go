@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"maunium.net/go/mautrix"
@@ -17,13 +16,13 @@ import (
 )
 
 func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request) {
-	roomID := id.RoomID(chi.URLParam(r, "roomID"))
-	evType := event.NewEventType(chi.URLParam(r, "eventType"))
-	stateKey := chi.URLParam(r, "stateKey")
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	evType := util.EventTypeFromRequestURLParam(r, "eventType")
+	stateKey := util.StateKeyFromRequestURLParam(r, "stateKey")
 
-	var content map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	content, respErr := util.ParseRequestJSON[map[string]any](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
@@ -37,18 +36,13 @@ func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request
 }
 
 func (c *ClientRoutes) SendRoomEvent(w http.ResponseWriter, r *http.Request) {
-	roomID := id.RoomID(chi.URLParam(r, "roomID"))
-	evType := event.NewEventType(chi.URLParam(r, "eventType"))
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	evType := util.EventTypeFromRequestURLParam(r, "eventType")
 	txnID := chi.URLParam(r, "txnID")
 
-	var content map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-
-	if content == nil {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, "Event content must be an object")
+	content, respErr := util.ParseRequestJSON[map[string]any](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 

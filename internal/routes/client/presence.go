@@ -4,10 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
@@ -16,7 +14,7 @@ import (
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3presenceuseridstatus
 func (c *ClientRoutes) GetPresence(w http.ResponseWriter, r *http.Request) {
-	userID := id.UserID(chi.URLParam(r, "userID"))
+	userID := util.UserIDFromRequestURLParam(r, "userID")
 
 	presence, err := c.db.Transient.GetUserPresence(r.Context(), userID)
 	if err != nil {
@@ -56,7 +54,7 @@ func (c *ClientRoutes) PutPresence(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := middleware.GetRequestUserID(r)
-	userIDParam := id.UserID(chi.URLParam(r, "userID"))
+	userIDParam := util.UserIDFromRequestURLParam(r, "userID")
 	if userIDParam != userID {
 		util.ResponseErrorJSON(w, r, mautrix.MForbidden)
 		return

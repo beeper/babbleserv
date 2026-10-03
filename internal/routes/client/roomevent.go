@@ -6,7 +6,6 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/tidwall/gjson"
 	"maunium.net/go/mautrix/id"
 
@@ -60,8 +59,8 @@ func (c *ClientRoutes) GetRoomStateEvent(w http.ResponseWriter, r *http.Request)
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 	userID := middleware.GetRequestUserID(r)
 
-	evType := chi.URLParam(r, "eventType")
-	stateKey := chi.URLParam(r, "stateKey")
+	evType := util.EventTypeFromRequestURLParam(r, "eventType")
+	stateKey := util.StateKeyFromRequestURLParam(r, "stateKey")
 
 	// Check the user is currently in the room, state is always available irrespective of send time
 	if inRoom, err := c.db.Rooms.IsUserJoinedRoom(r.Context(), userID, roomID); err != nil {
@@ -73,7 +72,7 @@ func (c *ClientRoutes) GetRoomStateEvent(w http.ResponseWriter, r *http.Request)
 	}
 
 	stateEv, err := c.db.Rooms.GetCurrentRoomStateEvent(r.Context(), roomID, types.StateTup{
-		Type:     event.NewEventType(evType),
+		Type:     evType,
 		StateKey: stateKey,
 	})
 	if err != nil {

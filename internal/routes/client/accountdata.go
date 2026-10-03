@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 
@@ -35,9 +34,9 @@ func (c *ClientRoutes) SetAccountData(w http.ResponseWriter, r *http.Request) {
 	adType := event.NewEventType(chi.URLParam(r, "type"))
 
 	// Decode + re-encode the content as JSON to ensure validity
-	var content map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	content, respErr := util.ParseRequestJSON[map[string]any](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 	contentBytes, _ := json.Marshal(content)
@@ -141,23 +140,14 @@ func (c *ClientRoutes) updateRoomTag(w http.ResponseWriter, r *http.Request, rem
 	}
 	var encoded json.RawMessage
 	if !remove {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, accounts.MaxRoomTagsBytes))
-		if err != nil {
-			var sizeErr *http.MaxBytesError
-			if errors.As(err, &sizeErr) {
-				util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, &mautrix.MTooLarge)
+		r.Body = http.MaxBytesReader(w, r.Body, accounts.MaxRoomTagsBytes)
+		content, respErr := util.ParseRequestJSON[map[string]json.RawMessage](r)
+		if respErr != nil {
+			if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
+				util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
 			} else {
-				util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+				util.ResponseErrorJSON(w, r, *respErr)
 			}
-			return
-		}
-		if !json.Valid(body) {
-			util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-			return
-		}
-		var content map[string]json.RawMessage
-		if err := json.Unmarshal(body, &content); err != nil || content == nil {
-			util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
 			return
 		}
 		if raw, ok := content["order"]; ok {
@@ -167,8 +157,8 @@ func (c *ClientRoutes) updateRoomTag(w http.ResponseWriter, r *http.Request, rem
 				return
 			}
 		}
-		encoded, err = json.Marshal(content)
-		if err != nil {
+		var err error
+		if encoded, err = json.Marshal(content); err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
 		}

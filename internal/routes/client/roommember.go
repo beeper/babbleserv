@@ -73,7 +73,7 @@ func (c *ClientRoutes) ForgetRoom(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) SendRoomInvite(w http.ResponseWriter, r *http.Request) {
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
-	req, respErr := util.ParseRequestJSON[reqMemberOther](r)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -144,9 +144,9 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
@@ -276,9 +276,9 @@ func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
@@ -350,9 +350,9 @@ func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidleave
 func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 	userID := middleware.GetRequestUserID(r)
@@ -361,9 +361,9 @@ func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidkick
 func (c *ClientRoutes) SendRoomKick(w http.ResponseWriter, r *http.Request) {
-	var req reqMemberOther
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 	c.sendRoomLeaveOrKick(w, r, req.UserID, req.Reason)
@@ -523,9 +523,9 @@ func (c *ClientRoutes) SendRoomUnban(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) sendBanOrUnban(w http.ResponseWriter, r *http.Request, membership event.Membership) {
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
-	var req reqMemberOther
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 

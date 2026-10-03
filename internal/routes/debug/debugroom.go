@@ -3,7 +3,6 @@ package debug
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -12,7 +11,7 @@ import (
 )
 
 func (d *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
-	roomID := id.RoomID(chi.URLParam(r, "roomID"))
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
 	room, err := d.db.Rooms.GetRoom(r.Context(), roomID)
 	if err != nil {
@@ -54,8 +53,8 @@ func (d *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DebugRoutes) DebugGetRoomStateAt(w http.ResponseWriter, r *http.Request) {
-	roomID := id.RoomID(chi.URLParam(r, "roomID"))
-	eventID := id.EventID(chi.URLParam(r, "eventID"))
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 
 	allStateMap, err := d.db.Rooms.GetRoomStateMapAtEvent(r.Context(), roomID, eventID)
 	if err != nil {
