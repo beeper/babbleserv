@@ -1,6 +1,7 @@
 package util
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -10,12 +11,21 @@ import (
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
+	"github.com/rs/zerolog"
 	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 )
+
+func EventsToIDs(evs []*types.Event) []id.EventID {
+	ids := make([]id.EventID, len(evs))
+	for i, ev := range evs {
+		ids[i] = ev.ID
+	}
+	return ids
+}
 
 func EventForClientAPI(ev *types.Event) *types.Event {
 	ev.IsForClientAPI = true
@@ -52,22 +62,8 @@ func EventsToMauPDUs(evs []*types.Event) []federation.PDU {
 func SortEventList(evs []*types.Event) {
 	slices.SortFunc(evs, func(a, b *types.Event) int {
 		// TODO: this is probably not enough
-		if a.Depth > b.Depth {
-			return 1
-		}
-		if a.Depth == b.Depth && len(a.AuthEventIDs) > len(b.AuthEventIDs) {
-			return 1
-		}
-		return -1
+		return cmp.Or(cmp.Compare(a.Depth, b.Depth), cmp.Compare(len(a.AuthEventIDs), len(b.AuthEventIDs)))
 	})
-}
-
-func EventsToPDUs(evs []*types.Event) []gomatrixserverlib.PDU {
-	pdus := make([]gomatrixserverlib.PDU, len(evs))
-	for i, ev := range evs {
-		pdus[i] = ev.PDU()
-	}
-	return pdus
 }
 
 func EventsToJSONs(evs []*types.Event) []json.RawMessage {
@@ -80,16 +76,6 @@ func EventsToJSONs(evs []*types.Event) []json.RawMessage {
 		jsons[i] = json
 	}
 	return jsons
-}
-
-func MergeEventsMap(evSlices ...[]*types.Event) map[id.EventID]*types.Event {
-	evMap := make(map[id.EventID]*types.Event, len(evSlices)*len(evSlices[0]))
-	for _, evs := range evSlices {
-		for _, ev := range evs {
-			evMap[ev.ID] = ev
-		}
-	}
-	return evMap
 }
 
 func getEventRedactedJSON(ev *types.Event) ([]byte, error) {
@@ -161,8 +147,68 @@ func VerifyEventFromServer(ctx context.Context, ev *types.Event, serverName stri
 	return verifyEvent(ctx, ev, serverName, keyStore)
 }
 
+// Verifies an event from another server, returning the event to keep: the redacted form of one that
+// has been redacted, as Synapse does.
+func VerifyRemoteEvent(ctx context.Context, ev *types.Event, keyStore *KeyStore) (*types.Event, error, error) {
+	// The event must be signed by the senders server, which may not be the one it came from
+	verifyErr, err := VerifyEvent(ctx, ev, keyStore)
+	if err != nil {
+		return nil, nil, err
+	} else if errors.Is(verifyErr, types.ErrEventRedacted) {
+		redactedEv, err := ev.GetRedactedEvent()
+		if err != nil {
+			return nil, nil, err
+		}
+		return redactedEv, nil, nil
+	} else if verifyErr != nil {
+		return nil, verifyErr, nil
+	}
+	return ev, nil, nil
+}
+
+// Parses and verifies events fetched from another server, skipping those that cannot be parsed or
+// fail verification and any already seen. Redacted events are kept, redacted.
+func VerifyRemoteEvents[S ~[]E, E ~[]byte](
+	ctx context.Context,
+	raws S,
+	roomVersion string,
+	keyStore *KeyStore,
+	seenIDs map[id.EventID]struct{},
+) ([]*types.Event, error) {
+	log := zerolog.Ctx(ctx)
+	evs := make([]*types.Event, 0, len(raws))
+	for _, b := range raws {
+		remoteEv := &types.Event{RoomVersion: roomVersion}
+		if err := json.Unmarshal(b, remoteEv); err != nil {
+			log.Warn().Err(err).Msg("Skipping remote event that cannot be parsed")
+			continue
+		}
+		verifiedEv, verifyErr, err := VerifyRemoteEvent(ctx, remoteEv, keyStore)
+		if err != nil {
+			return nil, err
+		} else if verifyErr != nil {
+			log.Err(verifyErr).
+				Stringer("event_id", remoteEv.ID).
+				Stringer("type", remoteEv.Type).
+				Any("ev", remoteEv).
+				Msg("Skipping remote event that failed verification")
+			continue
+		} else if _, found := seenIDs[verifiedEv.ID]; found {
+			log.Warn().
+				Stringer("event_id", verifiedEv.ID).
+				Msg("Skipping duplicate remote event")
+			continue
+		}
+		evs = append(evs, verifiedEv)
+		seenIDs[verifiedEv.ID] = struct{}{}
+	}
+	return evs, nil
+}
+
 func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keyStore *KeyStore) (error, error) {
 	if _, err := spec.NewRoomID(ev.RoomID.String()); err != nil {
+		return err, nil
+	} else if err := CheckEventSize(ev); err != nil {
 		return err, nil
 	}
 	if ev.Type.Type == spec.MRoomMember && ev.StateKey == nil {
@@ -264,6 +310,11 @@ func GetRefHashForRedactedBytes(b []byte, roomVersion gomatrixserverlib.RoomVers
 }
 
 func HashAndSignEvent(ev *types.Event, serverName, keyID string, key ed25519.PrivateKey) error {
+	if err := CheckEventSize(ev); err != nil {
+		return err
+	} else if err := ev.MustGetRoomSpec().CheckCanonicalJSON(ev.PDU().JSON()); err != nil {
+		return &gomatrixserverlib.EventValidationError{Code: 400, Message: err.Error()}
+	}
 	// Calculate the content hash before the ID/reference hash
 	hash, err := GetEventContentHash(ev)
 	if err != nil {
