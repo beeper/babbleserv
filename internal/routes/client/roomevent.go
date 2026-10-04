@@ -71,7 +71,7 @@ func (c *ClientRoutes) GetRoomStateEvent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	stateEv, err := c.db.Rooms.GetCurrentRoomStateEvent(r.Context(), roomID, types.StateTup{
+	stateEv, err := c.db.Rooms.RoomStateEvent(r.Context(), roomID, types.StateTup{
 		Type:     evType,
 		StateKey: stateKey,
 	})
@@ -100,7 +100,7 @@ func (c *ClientRoutes) GetRoomState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stateEvs, err := c.db.Rooms.GetCurrentRoomStateEvents(r.Context(), roomID)
+	stateEvs, err := c.db.Rooms.RoomState(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -123,7 +123,7 @@ func (c *ClientRoutes) GetRoomMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	memberEvs, err := c.db.Rooms.GetCurrentRoomMemberEvents(r.Context(), roomID)
+	memberEvs, err := c.db.Rooms.RoomMemberEvents(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -144,7 +144,7 @@ func (c *ClientRoutes) GetJoinedMembers(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	memberEvs, err := c.db.Rooms.GetCurrentRoomMemberEvents(r.Context(), roomID)
+	memberEvs, err := c.db.Rooms.RoomMemberEvents(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

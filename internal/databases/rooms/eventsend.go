@@ -674,7 +674,7 @@ func (r *RoomsDatabase) txnGetLocalJoinerInvite(txn fdb.ReadTransaction, ev *typ
 	if !r.isLocalUser(userID) {
 		return nil, nil
 	}
-	memberships, err := r.txnMemberships(txn, ev.RoomID, []id.UserID{userID})
+	memberships, err := r.txnGetRoomUserMemberships(txn, ev.RoomID, []id.UserID{userID})
 	if err != nil {
 		return nil, err
 	} else if membership, found := memberships[userID]; !found || membership.Membership != event.MembershipInvite {

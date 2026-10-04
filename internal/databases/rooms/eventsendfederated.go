@@ -202,7 +202,7 @@ func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomI
 		return true, nil
 	case event.MembershipLeave:
 		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
-			memberships, err := r.txnMemberships(txn, roomID, []id.UserID{target})
+			memberships, err := r.txnGetRoomUserMemberships(txn, roomID, []id.UserID{target})
 			if err != nil {
 				return false, err
 			} else if membership, found := memberships[target]; !found || membership.Membership != event.MembershipInvite {
@@ -395,7 +395,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	}
 	eventsProvider.WillGet(extremities...)
 
-	stored, err := s.r.txnStoredEventIDs(txn, util.EventsToIDs(evs))
+	stored, err := s.r.txnGetStoredEventIDs(txn, util.EventsToIDs(evs))
 	if err != nil {
 		return nil, err
 	}
@@ -1012,7 +1012,7 @@ func (s *federatedEventSender) txnStageStatelessEvents(
 			}
 		}
 	}
-	if storedNow, err := s.r.txnStoredEventIDs(txn, util.EventsToIDs(unstored)); err != nil {
+	if storedNow, err := s.r.txnGetStoredEventIDs(txn, util.EventsToIDs(unstored)); err != nil {
 		return err
 	} else if len(storedNow) > 0 {
 		return errEventsStoredConcurrently

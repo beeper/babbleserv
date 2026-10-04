@@ -554,7 +554,7 @@ func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*ty
 	} else if joined := isServerJoined(stored); joined != plan.guard.joined {
 		return nil, fmt.Errorf("%w: this server joined %t, prepared %t", errGuardFailed, joined, plan.guard.joined)
 	}
-	if storedNow, err := s.r.txnStoredEventIDs(txn, plan.guard.unstored); err != nil {
+	if storedNow, err := s.r.txnGetStoredEventIDs(txn, plan.guard.unstored); err != nil {
 		return nil, err
 	} else if len(storedNow) > 0 {
 		return nil, errEventsStoredConcurrently

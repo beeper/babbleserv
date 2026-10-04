@@ -19,13 +19,13 @@ func (d *DebugRoutes) DebugGetRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	servers, err := d.db.Rooms.GetCurrentRoomServers(r.Context(), roomID)
+	servers, err := d.db.Rooms.RoomServers(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
-	stateEvs, err := d.db.Rooms.GetCurrentRoomStateEvents(r.Context(), roomID)
+	stateEvs, err := d.db.Rooms.RoomState(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

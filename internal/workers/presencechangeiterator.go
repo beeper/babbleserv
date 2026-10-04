@@ -163,12 +163,12 @@ func (p *PresenceChangeIterator) processRemotePresenceChange(lock lock.Lock, cha
 	localUserIDs := make(map[id.UserID]struct{}, len(memberships))
 
 	for roomID := range memberships {
-		roomMemberships, err := p.db.Rooms.GetCurrentRoomMemberships(p.ctx, roomID)
+		roomMembers, err := p.db.Rooms.RoomMembers(p.ctx, roomID, event.MembershipJoin)
 		if err != nil {
 			return fmt.Errorf("failed to get room member IDs: %s: %w", roomID, err)
 		}
-		for memberID, membershipTup := range roomMemberships {
-			if membershipTup.Membership == event.MembershipJoin && memberID.Homeserver() == p.config.ServerName {
+		for memberID := range roomMembers {
+			if memberID.Homeserver() == p.config.ServerName {
 				localUserIDs[memberID] = struct{}{}
 			}
 		}
@@ -214,15 +214,11 @@ func (p *PresenceChangeIterator) processLocalPresenceChange(lock lock.Lock, chan
 	localUserIDs[change.Presence.UserID] = struct{}{}
 
 	for roomID := range memberships {
-		roomMemberships, err := p.db.Rooms.GetCurrentRoomMemberships(p.ctx, roomID)
+		roomMembers, err := p.db.Rooms.RoomMembers(p.ctx, roomID, event.MembershipJoin)
 		if err != nil {
 			return fmt.Errorf("failed to get room member IDs: %s: %w", roomID, err)
 		}
-		for memberID, membershipTup := range roomMemberships {
-			if membershipTup.Membership != event.MembershipJoin {
-				// We only care about joined members
-				continue
-			}
+		for memberID := range roomMembers {
 			if memberID.Homeserver() == p.config.ServerName {
 				localUserIDs[memberID] = struct{}{}
 			} else {

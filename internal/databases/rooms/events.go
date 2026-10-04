@@ -2,6 +2,8 @@ package rooms
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	"maunium.net/go/mautrix/id"
 
@@ -31,6 +33,37 @@ func (r *RoomsDatabase) MustDoesEventExist(ctx context.Context, eventID id.Event
 	} else {
 		return ret
 	}
+}
+
+// storedEventIDs returns a map of event IDs already stored
+func (r *RoomsDatabase) storedEventIDs(ctx context.Context, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+	stored := make(map[id.EventID]struct{})
+	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
+		chunkStored, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (map[id.EventID]struct{}, error) {
+			return r.txnGetStoredEventIDs(txn, chunk)
+		})
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(stored, chunkStored)
+	}
+	return stored, nil
+}
+
+func (r *RoomsDatabase) txnGetStoredEventIDs(txn fdb.ReadTransaction, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+	futures := make([]fdb.FutureByteSlice, len(eventIDs))
+	for i, eventID := range eventIDs {
+		futures[i] = txn.Get(r.events.KeyForIDToVersion(eventID))
+	}
+	stored := make(map[id.EventID]struct{}, len(eventIDs))
+	for i, future := range futures {
+		if b, err := future.Get(); err != nil {
+			return nil, err
+		} else if b != nil {
+			stored[eventIDs[i]] = struct{}{}
+		}
+	}
+	return stored, nil
 }
 
 func (r *RoomsDatabase) GetEvent(ctx context.Context, eventID id.EventID) (*types.Event, error) {

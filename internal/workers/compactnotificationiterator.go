@@ -119,7 +119,7 @@ func (n *CompactNotificationIterator) compactNotificationsForRoom(roomID id.Room
 }
 
 func (n *CompactNotificationIterator) compactNotificationsForRoomMembers(roomID id.RoomID) error {
-	memberships, err := n.db.Rooms.GetCurrentRoomLocalJoinedMemberships(n.ctx, roomID)
+	memberships, err := n.db.Rooms.LocalJoinedMembers(n.ctx, roomID)
 	if err != nil {
 		return err
 	}
