@@ -145,7 +145,7 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 		ev, err := e.db.Rooms.GetEvent(e.ctx, tup.EventID)
 		if err != nil {
 			return err
-		} else if ev.IsProfileUpdate() {
+		} else if ev.IsBabbleProfileUpdate() {
 			// Ignore internal profile updates as these don't actually change membership - note this
 			// doesn't cover profile updates over federation.
 			continue

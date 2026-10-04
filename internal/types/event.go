@@ -337,7 +337,7 @@ func (ev *Event) MustGetRoomSpec() gomatrixserverlib.IRoomVersion {
 	return roomSpec
 }
 
-func (ev *Event) IsProfileUpdate() bool {
+func (ev *Event) IsBabbleProfileUpdate() bool {
 	return gjson.GetBytes(ev.Content, `babbleserv\.is_profile_update`).Bool()
 }
 

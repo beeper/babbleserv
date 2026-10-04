@@ -9,31 +9,6 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-func (s *ServersDirectory) TxnGetMembership(
-	txn fdb.ReadTransaction,
-	serverName string,
-	roomID id.RoomID,
-) *types.MembershipTup {
-	if b := txn.Get(s.keyForMembership(serverName, roomID)).MustGet(); b == nil {
-		return nil
-	} else {
-		tup := types.BytesToMembershipTup(b)
-		return &tup
-	}
-}
-
-func (s *ServersDirectory) TxnIsServerJoinedRoom(
-	txn fdb.ReadTransaction,
-	serverName string,
-	roomID id.RoomID,
-) bool {
-	mtup := s.TxnGetMembership(txn, serverName, roomID)
-	if mtup == nil {
-		return false
-	}
-	return mtup.Membership == event.MembershipJoin
-}
-
 func (s *ServersDirectory) TxnLookupServerMemberships(
 	txn fdb.ReadTransaction,
 	serverName string,
@@ -85,31 +60,68 @@ func (s *ServersDirectory) TxnLookupServerMembershipChanges(
 	return changes, nil
 }
 
-func (s *ServersDirectory) TxnStoreServerMembership(
-	txn fdb.Transaction,
-	roomID id.RoomID,
-	serverName string,
-	mtup types.MembershipTup,
-	version tuple.Versionstamp,
-) {
-	mtupBytes := types.MembershipTupToBytes(mtup)
-
-	txn.SetVersionstampedKey(s.keyForMembershipChange(serverName, version), mtupBytes)
-
-	membershipKey := s.keyForMembership(serverName, roomID)
+// TxnStoreServerMembership sets a server's membership of the room on a join, clears it otherwise
+func (s *ServersDirectory) TxnStoreServerMembership(txn fdb.Transaction, roomID id.RoomID, serverName string, mtup types.MembershipTup) {
+	membershipKey := s.KeyForMembership(serverName, roomID)
 	if mtup.Membership == event.MembershipJoin {
-		txn.Set(membershipKey, mtupBytes)
+		txn.Set(membershipKey, types.MembershipTupToBytes(mtup))
 	} else {
 		txn.Clear(membershipKey)
 	}
 }
 
-func (s *ServersDirectory) TxnDeleteServerMembership(
+func (s *ServersDirectory) TxnStoreServerMembershipChange(
 	txn fdb.Transaction,
-	roomID id.RoomID,
 	serverName string,
 	version tuple.Versionstamp,
+	mtup types.MembershipTup,
 ) {
-	txn.Clear(s.keyForMembership(serverName, roomID))
-	txn.Clear(s.keyForMembershipChange(serverName, version))
+	txn.SetVersionstampedKey(s.KeyForMembershipChange(serverName, version), types.MembershipTupToBytes(mtup))
+}
+
+// TxnReadJoinedCounts starts reading each server's joined member count of the room
+func (s *ServersDirectory) TxnReadJoinedCounts(txn fdb.ReadTransaction, roomID id.RoomID, serverNames []string) map[string]fdb.FutureByteSlice {
+	futures := make(map[string]fdb.FutureByteSlice, len(serverNames))
+	for _, serverName := range serverNames {
+		futures[serverName] = txn.Get(s.KeyForJoinedCount(roomID, serverName))
+	}
+	return futures
+}
+
+func JoinedCountOf(b []byte) int {
+	if b == nil {
+		return 0
+	}
+	tup, err := tuple.Unpack(b)
+	if err != nil {
+		panic(err)
+	}
+	return int(tup[0].(int64))
+}
+
+// TxnSetJoinedCount writes a server's joined member count of the room, clearing it at zero
+func (s *ServersDirectory) TxnSetJoinedCount(txn fdb.Transaction, roomID id.RoomID, serverName string, count int) {
+	key := s.KeyForJoinedCount(roomID, serverName)
+	if count > 0 {
+		txn.Set(key, tuple.Tuple{int64(count)}.Pack())
+	} else {
+		txn.Clear(key)
+	}
+}
+
+// TxnLookupRoomServers returns the servers with joined members in the room
+func (s *ServersDirectory) TxnLookupRoomServers(txn fdb.ReadTransaction, roomID id.RoomID) ([]string, error) {
+	kvs, err := txn.GetRange(s.rangeForJoinedCounts(roomID), fdb.RangeOptions{Mode: fdb.StreamingModeWantAll}).GetSliceWithError()
+	if err != nil {
+		return nil, err
+	}
+	serverNames := make([]string, len(kvs))
+	for i, kv := range kvs {
+		tup, err := s.joinedCounts.Unpack(kv.Key)
+		if err != nil {
+			return nil, err
+		}
+		serverNames[i] = tup[1].(string)
+	}
+	return serverNames, nil
 }
