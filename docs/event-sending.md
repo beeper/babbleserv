@@ -96,7 +96,7 @@ Step 5 and step 6 can resolve different sets of contexts. An event's before-stat
 
 Unknown predecessor state is a reason to drop an event, not to resolve only the known subset. When finalizing a state event's auth header in step 5, `ErrAuthEventPending` drops the event because its auth chain reaches an unsettled batch event; `ErrAuthEventNotFinalized` rejects it because an auth event cannot be finalized. Errors from resolving predecessor or extremity contexts generally fail the batch; an unsupported predecessor-resolution algorithm instead drops the affected event.
 
-When this server is outside the room, ordinary federation sends accept only local-user invites and specific leaves responding to an existing invite through the outlier-membership path. Other events are dropped. Client-initiated remote knocks and leaves call `SendFederatedOutlierMembershipEvent` directly after federation succeeds. These paths do not construct or publish full room state.
+When this server is outside the room, ordinary federation sends accept only local-user invites and specific leaves responding to an existing invite through the outlier-membership path. Other events are dropped. Client-initiated remote knocks and leaves call `SendFederatedOutlierMembershipEvent` directly after federation succeeds. If a local user rejects an invite and `make_leave` or `send_leave` fails, the client route instead signs and stores a local outlier leave, so the user can dismiss the invite even when the inviting server is unavailable or has left the room.
 
 ### Remote joins
 
