@@ -1,9 +1,11 @@
 package types_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,7 +41,8 @@ func TestVersionstampBeforeAfter(t *testing.T) {
 		TransactionVersion: [10]uint8{0, 0, 0, 0, 0x08, 0x09, 0x39, 0x55, 0x01, 0x00},
 		UserVersion:        0,
 	}
-	before := types.VersionstampBefore(batchStart)
+	before, ok := types.VersionstampBefore(batchStart)
+	require.True(t, ok)
 	assert.Equal(t, tuple.Versionstamp{
 		TransactionVersion: [10]uint8{0, 0, 0, 0, 0x08, 0x09, 0x39, 0x55, 0x00, 0xff},
 		UserVersion:        0xffff,
@@ -49,9 +52,13 @@ func TestVersionstampBeforeAfter(t *testing.T) {
 	assert.Equal(t, batchStart, after)
 
 	mid := tuple.Versionstamp{TransactionVersion: batchStart.TransactionVersion, UserVersion: 7}
-	assert.Equal(t, uint16(6), types.VersionstampBefore(mid).UserVersion)
+	beforeMid, ok := types.VersionstampBefore(mid)
+	require.True(t, ok)
+	assert.Equal(t, uint16(6), beforeMid.UserVersion)
 
-	assert.Equal(t, types.ZeroVersionstamp, types.VersionstampBefore(types.ZeroVersionstamp))
+	beforeZero, ok := types.VersionstampBefore(types.ZeroVersionstamp)
+	assert.False(t, ok)
+	assert.Equal(t, types.ZeroVersionstamp, beforeZero)
 }
 
 func TestVersionMap(t *testing.T) {
@@ -97,4 +104,52 @@ func TestVersionMap(t *testing.T) {
 	assert.Equal(t, incompleteVersionstamp, partialVersions[types.RoomsVersionKey])
 	assert.Equal(t, otherVersionstamp, partialVersions[types.AccountsVersionKey])
 	assert.Equal(t, incompleteVersionstamp, partialVersions["someOtherKey"])
+}
+
+func TestVersionstampBefore(t *testing.T) {
+	version := func(userVersion uint16, transactionVersion ...byte) tuple.Versionstamp {
+		v := tuple.Versionstamp{UserVersion: userVersion}
+		copy(v.TransactionVersion[len(v.TransactionVersion)-len(transactionVersion):], transactionVersion)
+		return v
+	}
+
+	for _, tc := range []struct {
+		name    string
+		version tuple.Versionstamp
+		before  tuple.Versionstamp
+	}{
+		{"user version", version(5, 0x07, 0x4c), version(4, 0x07, 0x4c)},
+		{"first of a transaction", version(0, 0x07, 0x4c), version(0xffff, 0x07, 0x4b)},
+		{"borrow across bytes", version(0, 0x01, 0x00, 0x00), version(0xffff, 0x00, 0xff, 0xff)},
+		{"first transaction", version(1), version(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, ok := types.VersionstampBefore(tc.version)
+			require.True(t, ok)
+			assert.Equal(t, tc.before, before)
+			assert.True(t, types.VersionIsBefore(before, tc.version))
+
+			after, ok := types.VersionstampAfter(before)
+			require.True(t, ok)
+			assert.Equal(t, tc.version, after)
+
+			sub := subspace.Sub("versions")
+			begin, _ := types.GetVersionRange(sub, before, types.ZeroVersionstamp).FDBRangeKeys()
+			assert.LessOrEqual(t, bytes.Compare(begin.FDBKey(), sub.Pack(tuple.Tuple{tc.version})), 0)
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		version tuple.Versionstamp
+	}{
+		{"zero", types.ZeroVersionstamp},
+		{"incomplete", tuple.IncompleteVersionstamp(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, ok := types.VersionstampBefore(tc.version)
+			assert.False(t, ok)
+			assert.Equal(t, types.ZeroVersionstamp, before)
+		})
+	}
 }

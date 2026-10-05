@@ -31,9 +31,6 @@ type SyncOptions struct {
 	UserID   id.UserID
 	DeviceID id.DeviceID
 
-	// Enables MSC4222: state_after
-	EnableLegacyStateAfter bool
-
 	// Flag indicating whether this sync is for S2S federation
 	IsServerToServer bool
 }
@@ -49,7 +46,7 @@ func (o *SyncOptions) GetTimelineLimit() int {
 }
 
 func (o *SyncOptions) GetReceiptsLimit() int {
-	if o == nil || o.Filter == nil {
+	if o == nil || o.Filter == nil || o.Filter.Room == nil || o.Filter.Room.Ephemeral == nil {
 		return DefaultReceiptsLimit
 	}
 	if o.Filter.Room.Ephemeral.Limit > 0 {
@@ -73,7 +70,7 @@ func (o *SyncOptions) GetRoomFilter() *mautrix.RoomFilter {
 }
 
 func (o *SyncOptions) GetTimelineFilter() *mautrix.FilterPart {
-	if o == nil || o.Filter == nil {
+	if o == nil || o.Filter == nil || o.Filter.Room == nil {
 		return nil
 	}
 	return o.Filter.Room.Timeline
