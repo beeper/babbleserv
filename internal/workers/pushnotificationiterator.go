@@ -143,7 +143,7 @@ func (n *PushNotificationIterator) sendPushNotificationsForEvents(tups []types.E
 
 	for roomID, eventTups := range eventsByRoom {
 		// Get local joined users in room
-		memberships, err := n.db.Rooms.GetCurrentRoomLocalJoinedMemberships(n.ctx, roomID)
+		memberships, err := n.db.Rooms.LocalJoinedMembers(n.ctx, roomID)
 		if err != nil {
 			return err
 		}
@@ -289,7 +289,7 @@ func (n *PushNotificationIterator) getSenderDisplayName(ev *types.Event) string 
 
 func (n *PushNotificationIterator) getRoomName(roomID id.RoomID) string {
 	// Try to get room name from state
-	roomNameEvent, err := n.db.Rooms.GetCurrentRoomStateEvent(n.ctx, roomID, types.StateTup{
+	roomNameEvent, err := n.db.Rooms.RoomStateEvent(n.ctx, roomID, types.StateTup{
 		Type:     event.StateRoomName,
 		StateKey: "",
 	})

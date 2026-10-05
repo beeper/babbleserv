@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/go-chi/chi/v5"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -15,7 +14,7 @@ import (
 )
 
 func (d *DebugRoutes) DebugGetEvent(w http.ResponseWriter, r *http.Request) {
-	eventID := id.EventID(chi.URLParam(r, "eventID"))
+	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 
 	ev, err := d.db.Rooms.GetEvent(r.Context(), eventID)
 	if err != nil {
@@ -72,7 +71,7 @@ func (d *DebugRoutes) DebugMakeEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	roomID := id.RoomID(chi.URLParam(r, "roomID"))
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
 	partialEvs := make([]*types.PartialEvent, 0, count)
 	for i := range count {

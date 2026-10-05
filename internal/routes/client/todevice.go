@@ -6,7 +6,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/event"
 
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -16,7 +15,7 @@ import (
 
 func (c *ClientRoutes) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	txnID := chi.URLParam(r, "txnID")
-	eventType := event.NewEventType(chi.URLParam(r, "eventType"))
+	eventType := util.EventTypeFromRequestURLParam(r, "eventType")
 
 	req, respErr := util.ParseRequestJSON[mautrix.ReqSendToDevice](r)
 	if respErr != nil {

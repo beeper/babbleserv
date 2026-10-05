@@ -5,16 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
+	"slices"
 	"strings"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
@@ -45,30 +44,20 @@ var presets = map[string][]struct {
 	},
 }
 
+type reqCreateRoom struct {
+	mautrix.ReqCreateRoom
+	PowerLevelOverride map[string]json.RawMessage `json:"power_level_content_override"`
+}
+
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3createroom
 func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
-	var req *struct {
-		mautrix.ReqCreateRoom
-		PowerLevelOverride map[string]json.RawMessage `json:"power_level_content_override"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
-		return
-	}
-	if err := json.Unmarshal(raw, &req); err != nil || req == nil {
-		util.ResponseErrorJSON(w, r, mautrix.MBadJSON)
+	req, respErr := util.ParseRequestJSON[reqCreateRoom](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
 	userID := middleware.GetRequestUserID(r)
-	roomID := c.db.Rooms.GenerateRoomID(r.Context())
 	visibility := req.Visibility
 	if visibility == "" {
 		visibility = "private"
@@ -83,6 +72,18 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		} else {
 			req.Preset = "private_chat"
 		}
+	}
+	if maxInitialState := c.config.Rooms.MaxCreateRoomInitialState; len(req.InitialState) > maxInitialState {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf(
+			"initial_state may contain at most %d events", maxInitialState,
+		))
+		return
+	}
+	if maxInvites := c.config.Rooms.MaxCreateRoomInvites; len(req.Invite) > maxInvites {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf(
+			"invite may contain at most %d users", maxInvites,
+		))
+		return
 	}
 	for _, invitedUserID := range req.Invite {
 		if _, _, err := invitedUserID.ParseAndValidateRelaxed(); err != nil {
@@ -110,19 +111,42 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	if roomVersion == "" {
 		roomVersion = c.config.Rooms.DefaultVersion
 	}
-	numericVersion, versionErr := strconv.Atoi(roomVersion)
-	if versionErr != nil || numericVersion < 3 || numericVersion > 11 ||
-		!gomatrixserverlib.KnownRoomVersion(gomatrixserverlib.RoomVersion(roomVersion)) {
+	if !slices.Contains(supportedRoomVersions, roomVersion) {
 		util.ResponseErrorJSON(w, r, mautrix.MUnsupportedRoomVersion)
 		return
 	}
 	createContent["room_version"] = roomVersion
-	if numericVersion < 11 {
+	if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.CreatorInCreateEvent) {
 		createContent["creator"] = userID
 	} else {
 		delete(createContent, "creator")
 	}
-	createEv := types.NewPartialEvent(roomID, event.StateCreate, &sKey, userID, createContent)
+	if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.PrivilegedCreators) && req.Preset == "trusted_private_chat" {
+		additional, valid := createContent["additional_creators"].([]any)
+		if createContent["additional_creators"] == nil {
+			valid = true
+		}
+		if valid {
+			for _, invited := range req.Invite {
+				if !slices.Contains(additional, any(invited.String())) {
+					additional = append(additional, invited.String())
+				}
+			}
+			if len(additional) > 0 {
+				createContent["additional_creators"] = additional
+			}
+		}
+	}
+	createEv := types.NewPartialEvent("", event.StateCreate, &sKey, userID, createContent)
+	roomID, err := c.db.Rooms.GenerateRoomID(r.Context(), createEv)
+	if util.IsInvalidEvent(err) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, err.Error())
+		return
+	} else if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	createEv.RoomID = roomID
 	evs = append(evs, createEv)
 
 	// 2: An m.room.member event for the creator to join the room. This is needed so the remaining events can be sent.
@@ -142,6 +166,16 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			userPowerLevels[uid] = 100
 		}
 	}
+	if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.PrivilegedCreators) {
+		delete(userPowerLevels, userID)
+		if additional, ok := createContent["additional_creators"].([]any); ok {
+			for _, value := range additional {
+				if creator, ok := value.(string); ok {
+					delete(userPowerLevels, id.UserID(creator))
+				}
+			}
+		}
+	}
 	powerContent := map[string]any{
 		"ban":            50,
 		"events_default": 0,
@@ -157,6 +191,9 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			event.StateTombstone:         100,
 			event.StateServerACL:         100,
 		},
+	}
+	if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.PrivilegedCreators) {
+		powerContent["events"].(map[event.Type]int)[event.StateTombstone] = 150
 	}
 	if req.PowerLevelOverride != nil {
 		encoded, err := json.Marshal(req.PowerLevelOverride)
@@ -248,8 +285,8 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 8: Invite events implied by invite and invite_3pid (m.room.member with membership: invite and m.room.third_party_invite).
-	// Note we'll keep external (federated) invites separate and send them after we create the room
-	// as we need the room persisted first.
+	// Local invites are sent with the room, which is created with every one of them or not at all,
+	// external (federated) ones once it exists, as they need the room persisted.
 	externalInvites := make(map[id.UserID]*types.PartialEvent, 0)
 	for _, uid := range req.Invite {
 		uidStr := string(uid)
@@ -266,24 +303,28 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := c.db.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{
+	_, err = c.db.SendLocalEvents(r.Context(), roomID, evs, rooms.SendLocalEventsOptions{
 		PublishRoom:      visibility == "public",
 		RoomAlias:        roomAlias,
 		RoomAliasOwner:   userID,
 		RequireAllEvents: true,
 	})
-	if err != nil {
-		if errors.Is(err, types.ErrRoomAliasTaken) {
-			util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
-				"errcode": mautrix.MRoomInUse.ErrCode, "error": "Room alias taken",
-			})
-			return
-		} else if errors.Is(err, rooms.ErrRequiredEventRejected) {
-			util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
-				"errcode": "M_INVALID_ROOM_STATE", "error": "Initial room state is not allowed",
-			})
-			return
-		}
+	var rejected *rooms.RequiredEventRejectedError
+	if errors.Is(err, types.ErrRoomAliasTaken) {
+		util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+			"errcode": mautrix.MRoomInUse.ErrCode, "error": "Room alias taken",
+		})
+		return
+	} else if errors.As(err, &rejected) && rejected.Event.Type == event.StateMember && rejected.Event.Membership() == event.MembershipInvite {
+		// As Synapse fails the request with the invite's error
+		util.ResponseRejectedEventJSON(w, r, err)
+		return
+	} else if rejected != nil {
+		util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+			"errcode": "M_INVALID_ROOM_STATE", "error": "Initial room state is not allowed",
+		})
+		return
+	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("error sending local events: %w", err))
 		return
 	}

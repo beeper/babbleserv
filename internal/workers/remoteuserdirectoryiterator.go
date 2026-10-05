@@ -7,6 +7,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
@@ -22,6 +23,7 @@ const (
 	remoteUserDirectoryLockTimeout   = 30 * time.Second
 	remoteUserDirectoryPollInterval  = 5 * time.Second
 	remoteUserDirectoryBatchSize     = 10
+	remoteUserDirectoryRoomPage      = 100
 	remoteUserDirectoryLookupTimeout = 10 * time.Second
 	remoteUserDirectoryRetryDelay    = time.Minute
 	remoteUserDirectoryMaxRetries    = 8
@@ -106,7 +108,7 @@ func (w *RemoteUserDirectoryIterator) processEventBatch(workerLock lock.Lock) bo
 	} else if len(eventTups) == 0 {
 		return false
 	}
-	sources, err := w.db.Rooms.DiscoverRemoteDirectoryUsersForEvents(w.ctx, eventTups)
+	sources, joinedRooms, err := w.db.Rooms.DiscoverRemoteDirectoryUsersForEvents(w.ctx, eventTups)
 	if err != nil {
 		w.log.Err(err).Msg("Failed to validate remote directory memberships")
 		return false
@@ -120,6 +122,12 @@ func (w *RemoteUserDirectoryIterator) processEventBatch(workerLock lock.Lock) bo
 			return false
 		}
 	}
+	for _, roomID := range joinedRooms {
+		if err := w.indexRoomMembers(workerLock, roomID); err != nil {
+			w.log.Err(err).Stringer("room_id", roomID).Msg("Failed to index the remote members of a joined room")
+			return false
+		}
+	}
 	position = eventTups[len(eventTups)-1].Version
 	if err = w.db.System.UpdateIteratorPositions(
 		w.ctx, remoteUserDirectoryPositionsKey, position, workerLock.TxnRefresh,
@@ -128,6 +136,32 @@ func (w *RemoteUserDirectoryIterator) processEventBatch(workerLock lock.Lock) bo
 		return false
 	}
 	return true
+}
+
+// indexRoomMembers indexes the remote members of a room this server joined that are not indexed
+// already, from its current state a page of members at a time, as the join's response events are
+// staged without entering the index of all events the iterator walks.
+func (w *RemoteUserDirectoryIterator) indexRoomMembers(workerLock lock.Lock, roomID id.RoomID) error {
+	room, err := w.db.Rooms.GetRoom(w.ctx, roomID)
+	if err != nil || room == nil {
+		return err
+	}
+	for from, more := uint64(0), true; more; {
+		workerLock.Refresh()
+		var sources []types.RemoteUserDirectorySource
+		if sources, from, more, err = w.db.Rooms.RoomRemoteDirectorySources(w.ctx, room, from, remoteUserDirectoryRoomPage); err != nil {
+			return err
+		} else if len(sources) == 0 {
+			continue
+		}
+		now := time.Now().UTC()
+		if err := w.db.Accounts.EnsureUnindexedRemoteDirectoryUsers(
+			w.ctx, sources, now, now.Add(remoteUserDirectoryLookupDelay),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *RemoteUserDirectoryIterator) processProfileJob(workerLock lock.Lock) bool {

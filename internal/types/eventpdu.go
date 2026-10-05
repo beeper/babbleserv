@@ -3,6 +3,7 @@ package types
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"time"
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
@@ -154,9 +155,10 @@ func (pdu EventPDU) JSON() []byte {
 }
 
 func (pdu EventPDU) AuthEventIDs() []string {
-	eventIDs := make([]string, 0, len(pdu.ev.AuthEventIDs))
-	for _, eventID := range pdu.ev.AuthEventIDs {
-		eventIDs = append(eventIDs, eventID.String())
+	authIDs := pdu.ev.AuthDependencyIDs()
+	eventIDs := make([]string, len(authIDs))
+	for i, eventID := range authIDs {
+		eventIDs[i] = eventID.String()
 	}
 	return eventIDs
 }
@@ -164,3 +166,15 @@ func (pdu EventPDU) AuthEventIDs() []string {
 func (pdu EventPDU) ToHeaderedJSON() ([]byte, error) {
 	return nil, nil
 }
+
+func (pdu EventPDU) PrevStateEventIDs() []string {
+	out := make([]string, len(pdu.ev.PrevState))
+	for i, eventID := range pdu.ev.PrevState {
+		out[i] = eventID.String()
+	}
+	return out
+}
+
+// Sticky events are not supported by the versions this server advertises.
+func (pdu EventPDU) IsSticky(now, received time.Time) bool      { return false }
+func (pdu EventPDU) StickyEndTime(received time.Time) time.Time { return time.Time{} }

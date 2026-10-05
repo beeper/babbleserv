@@ -166,12 +166,12 @@ func (d *DeviceChangeIterator) processRemoteDeviceChange(lock lock.Lock, change 
 	localUserIDs := make(map[id.UserID]struct{}, len(memberships))
 
 	for roomID := range memberships {
-		memberships, err := d.db.Rooms.GetCurrentRoomMemberships(d.ctx, roomID)
+		roomMembers, err := d.db.Rooms.RoomMembers(d.ctx, roomID, event.MembershipJoin)
 		if err != nil {
 			return fmt.Errorf("failed to get room member IDs: %s: %w", roomID, err)
 		}
-		for memberID, membershipTup := range memberships {
-			if membershipTup.Membership == event.MembershipJoin && memberID.Homeserver() == d.config.ServerName {
+		for memberID := range roomMembers {
+			if memberID.Homeserver() == d.config.ServerName {
 				localUserIDs[memberID] = struct{}{}
 			}
 		}
@@ -213,15 +213,11 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 	localUserIDs[change.UserID] = struct{}{}
 
 	for roomID := range memberships {
-		roomMemberships, err := d.db.Rooms.GetCurrentRoomMemberships(d.ctx, roomID)
+		roomMembers, err := d.db.Rooms.RoomMembers(d.ctx, roomID, event.MembershipJoin)
 		if err != nil {
 			return fmt.Errorf("failed to get room member IDs: %s: %w", roomID, err)
 		}
-		for memberID, membershipTup := range roomMemberships {
-			if membershipTup.Membership != event.MembershipJoin {
-				// We only care about joined members
-				continue
-			}
+		for memberID := range roomMembers {
 			if memberID.Homeserver() == d.config.ServerName {
 				localUserIDs[memberID] = struct{}{}
 			} else {

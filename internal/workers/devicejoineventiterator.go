@@ -2,10 +2,11 @@ package workers
 
 import (
 	"encoding/json"
+	"slices"
 	"time"
 
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"github.com/samber/lo"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -145,7 +146,7 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 		ev, err := e.db.Rooms.GetEvent(e.ctx, tup.EventID)
 		if err != nil {
 			return err
-		} else if ev.IsProfileUpdate() {
+		} else if ev.IsBabbleProfileUpdate() && ev.Sender.Homeserver() == e.config.ServerName {
 			// Ignore internal profile updates as these don't actually change membership - note this
 			// doesn't cover profile updates over federation.
 			continue
@@ -153,7 +154,7 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 		var tds []*types.ToDevice
 		switch ev.Membership() {
 		case event.MembershipJoin:
-			tds, err = e.deviceChangesForJoinEvent(ev)
+			tds, err = e.deviceChangesForJoin(ev, tup.Version)
 		case event.MembershipLeave:
 			tds, err = e.localDeviceChangesForLeaveEvent(ev)
 		default:
@@ -174,32 +175,47 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 	return nil
 }
 
-func (e *DeviceJoinEventIterator) deviceChangesForJoinEvent(ev *types.Event) ([]*types.ToDevice, error) {
-	tds, err := e.localDeviceChangesForJoinEvent(ev)
+// deviceChangesForJoin returns the device list changes of a join. A local user's remote join that made
+// this server joined also handles the other local members joined with it, whose joins its response
+// may have named: those were staged without state and never reach the iterator.
+func (e *DeviceJoinEventIterator) deviceChangesForJoin(ev *types.Event, version tuple.Versionstamp) ([]*types.ToDevice, error) {
+	isLocal := ev.Sender.Homeserver() == e.config.ServerName
+	if isLocal && !ev.HasStateIn(ev.RoomID) {
+		return nil, nil
+	}
+	roomMembers, err := e.db.Rooms.RoomMembers(e.ctx, ev.RoomID, event.MembershipJoin)
 	if err != nil {
 		return nil, err
 	}
-	// If this is our user we might need to send m.device_list_updates out
-	if ev.Sender.Homeserver() == e.config.ServerName {
-		if rtds, err := e.remoteDeviceChangesForJoinEvent(ev); err != nil {
+	joiners := []id.UserID{ev.Sender}
+	if isLocal && !ev.Local {
+		localMembers, err := e.db.Rooms.LocalMembersJoinedWith(e.ctx, ev, version)
+		if err != nil {
 			return nil, err
-		} else {
+		}
+		for memberID := range localMembers {
+			if memberID != ev.Sender {
+				joiners = append(joiners, memberID)
+			}
+		}
+	}
+
+	var tds []*types.ToDevice
+	for _, joiner := range joiners {
+		tds = append(tds, e.localDeviceChangesForJoin(joiner, roomMembers)...)
+		// If this is our user we might need to send m.device_list_updates out
+		if joiner.Homeserver() == e.config.ServerName {
+			rtds, err := e.remoteDeviceChangesForJoin(ev.RoomID, joiner)
+			if err != nil {
+				return nil, err
+			}
 			tds = append(tds, rtds...)
 		}
 	}
 	return tds, nil
 }
 
-func (e *DeviceJoinEventIterator) localDeviceChangesForJoinEvent(ev *types.Event) ([]*types.ToDevice, error) {
-	roomMembers, err := e.db.Rooms.GetCurrentRoomMemberships(e.ctx, ev.RoomID)
-	if err != nil {
-		return nil, err
-	}
-	// We only care about members currently joined in the room
-	roomMembers = lo.PickBy(roomMembers, func(uid id.UserID, mtup types.MembershipTup) bool {
-		return mtup.Membership == event.MembershipJoin
-	})
-
+func (e *DeviceJoinEventIterator) localDeviceChangesForJoin(joiner id.UserID, roomMembers types.RoomMemberships) []*types.ToDevice {
 	tds := make([]*types.ToDevice, 0, len(roomMembers))
 
 	for memberID := range roomMembers {
@@ -210,21 +226,83 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForJoinEvent(ev *types.Event
 			Type:     types.BabbleservLocalDeviceChange,
 			UserID:   memberID,
 			DeviceID: id.DeviceID("*"),
-			Sender:   ev.Sender,
+			Sender:   joiner,
 		})
 	}
 
-	// If the joining user is local, also notify them about changes to all other members
-	if ev.Sender.Homeserver() == e.config.ServerName {
+	// A local joiner tracks the devices of every other member, as Synapse lists them all in
+	// device_lists.changed for a newly joined room, a remote join's response members included, whose
+	// events the iterator never sees.
+	if joiner.Homeserver() == e.config.ServerName {
 		for memberID := range roomMembers {
-			if memberID == ev.Sender {
+			if memberID == joiner {
 				continue
 			}
 			tds = append(tds, &types.ToDevice{
 				Type:     types.BabbleservLocalDeviceChange,
-				UserID:   ev.Sender,
+				UserID:   joiner,
 				DeviceID: id.DeviceID("*"),
 				Sender:   memberID,
+			})
+		}
+	}
+
+	return tds
+}
+
+// https://github.com/element-hq/synapse/issues/11374, m.device_list_edus are sent per spec:
+// ... when that user joins a room which contains servers which are not already receiving updates for that user’s device list
+func (e *DeviceJoinEventIterator) remoteDeviceChangesForJoin(roomID id.RoomID, joiner id.UserID) ([]*types.ToDevice, error) {
+	roomServers, err := e.db.Rooms.RoomServers(e.ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	userRooms, err := e.db.Rooms.GetUserJoinedMembershipsWithEncryption(e.ctx, joiner)
+	if err != nil {
+		return nil, err
+	}
+	serverRooms := make(map[string]types.Memberships, len(roomServers))
+	for _, server := range roomServers {
+		if server == e.config.ServerName {
+			continue
+		} else if serverRooms[server], err = e.db.Rooms.GetServerMemberships(e.ctx, server); err != nil {
+			return nil, err
+		}
+	}
+	servers := serversNewToUser(roomID, userRooms, serverRooms)
+	if len(servers) == 0 {
+		return nil, nil
+	}
+
+	devices, err := e.db.Accounts.GetUserDevices(e.ctx, joiner)
+	if err != nil {
+		return nil, err
+	}
+	getDeviceKeys := util.MemoizeMap(func(k id.DeviceID) (*mautrix.DeviceKeys, error) {
+		// As above, requestUserID=""
+		return e.db.Accounts.GetDeviceKeys(e.ctx, joiner, k, "")
+	}, 10)
+
+	tds := make([]*types.ToDevice, 0, len(servers)*len(devices))
+	for _, server := range servers {
+		// Target is the server, not user, but we smuggle such updates through to-device
+		// internally (see the DeviceChangeIterator).
+		serverUserID := id.UserID("@:" + server)
+		for _, d := range devices {
+			keys, err := getDeviceKeys(d.ID)
+			if err != nil {
+				return nil, err
+			}
+			content := types.DeviceListUpdateEDUContent{
+				UserID:     joiner,
+				DeviceID:   d.ID,
+				DeviceKeys: keys,
+			}
+			b, _ := json.Marshal(content)
+			tds = append(tds, &types.ToDevice{
+				Type:    types.BabbleservRemoteDeviceListUpdate,
+				UserID:  serverUserID,
+				Content: b,
 			})
 		}
 	}
@@ -232,156 +310,88 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForJoinEvent(ev *types.Event
 	return tds, nil
 }
 
-// https://github.com/element-hq/synapse/issues/11374, m.device_list_edus are sent per spec:
-// ... when that user joins a room which contains servers which are not already receiving updates for that user’s device list
-func (e *DeviceJoinEventIterator) remoteDeviceChangesForJoinEvent(ev *types.Event) ([]*types.ToDevice, error) {
-	// TODO: this is inefficient and inconsistent - we should pull memberships shared between us
-	// and each other server inside a single txn alongside the encryption filtering.
+// serversNewToUser returns the servers that share none of the user's encrypted rooms but the one
+// they joined, so receive no updates of the user's device list yet
+func serversNewToUser(joinedRoomID id.RoomID, userEncryptedRooms types.Memberships, serverRooms map[string]types.Memberships) []string {
+	var servers []string
+	for server, rooms := range serverRooms {
+		shared := false
+		for roomID := range rooms {
+			if _, found := userEncryptedRooms[roomID]; found && roomID != joinedRoomID {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			servers = append(servers, server)
+		}
+	}
+	slices.Sort(servers)
+	return servers
+}
 
-	// Note: servers are always joined
-	localServerMemberships, err := e.db.Rooms.GetServerMemberships(e.ctx, e.config.ServerName)
+// Leave events tell each local user, the leaver or another member of the room, of the other side
+// once they no longer share an encrypted room (device_lists.left). Only local users are told, so
+// every check is whether a local user still shares an encrypted room with another user, read from
+// the local user's rows: a local leaver's for every member, otherwise each local member's for the
+// leaver. A remote user's rooms are never read.
+func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Event) ([]*types.ToDevice, error) {
+	roomMembers, err := e.db.Rooms.RoomMembers(e.ctx, ev.RoomID)
 	if err != nil {
 		return nil, err
 	}
-
-	roomServers, err := e.db.Rooms.GetCurrentRoomServers(e.ctx, ev.RoomID)
-	if err != nil {
-		return nil, err
+	leaver := ev.Sender
+	var others []id.UserID
+	for memberID := range roomMembers {
+		if memberID != leaver && (e.isLocal(leaver) || e.isLocal(memberID)) {
+			others = append(others, memberID)
+		}
 	}
-
-	devices, err := e.db.Accounts.GetUserDevices(e.ctx, ev.Sender)
-	if err != nil {
-		return nil, err
-	}
-
-	getDeviceKeys := util.MemoizeMap(func(k id.DeviceID) (*mautrix.DeviceKeys, error) {
-		// As above, requestUserID=""
-		return e.db.Accounts.GetDeviceKeys(e.ctx, ev.Sender, k, "")
-	}, 10)
-
-	tds := make([]*types.ToDevice, 0, len(roomServers))
-
-	for _, server := range roomServers {
-		// Find any other rooms shared with this server that also contain the joining user, if none
-		// we need to initialize the device updates we send to the server for this user. We do this
-		// by generating a m.device_list_update for each device of the joining user.
-		memberships, err := e.db.Rooms.GetServerMemberships(e.ctx, server)
-		if err != nil {
+	shared := make(map[id.UserID]bool, len(others))
+	if e.isLocal(leaver) {
+		if shared, err = e.db.Rooms.UsersSharingEncryptedRoom(e.ctx, leaver, others); err != nil {
 			return nil, err
 		}
-		var match bool
-		for roomID := range memberships {
-			if roomID == ev.RoomID {
-				continue
-			} else if _, ok := localServerMemberships[roomID]; !ok {
-				continue
-			} else if isEncrypted, err := e.db.Rooms.IsRoomEncrypted(e.ctx, ev.RoomID); err != nil {
-				return nil, err
-			} else if !isEncrypted {
-				continue
-			}
-			// Both us and the other server share this other room, check if our joining user is in it
-			rmMemberships, err := e.db.Rooms.GetCurrentRoomMemberships(e.ctx, ev.RoomID)
+	} else {
+		for _, memberID := range others {
+			sharing, err := e.db.Rooms.UsersSharingEncryptedRoom(e.ctx, memberID, []id.UserID{leaver})
 			if err != nil {
 				return nil, err
 			}
-			if mtup, ok := rmMemberships[ev.Sender]; ok && mtup.Membership == event.MembershipJoin {
-				match = true
-				break
-			}
-		}
-		if !match {
-			// Target is the server, not user, but we smuggle such updates through to-device
-			// internally (see the DeviceChangeIterator).
-			serverUserID := id.UserID("@:" + server)
-
-			// We have no matching rooms, generate an update for each joining users device
-			for _, d := range devices {
-				keys, err := getDeviceKeys(d.ID)
-				if err != nil {
-					return nil, err
-				}
-				content := types.DeviceListUpdateEDUContent{
-					UserID:     ev.Sender,
-					DeviceID:   d.ID,
-					DeviceKeys: keys,
-				}
-				b, _ := json.Marshal(content)
-				tds = append(tds, &types.ToDevice{
-					Type:    types.BabbleservRemoteDeviceListUpdate,
-					UserID:  serverUserID,
-					Content: b,
-				})
-			}
+			shared[memberID] = sharing[leaver]
 		}
 	}
-
-	return tds, nil
+	return leftDeviceChanges(e.isLocal, leaver, others, shared), nil
 }
 
-// Leave events are complicated - for every user in the room we need to determine if they still
-// share any encrypted memberships with the leaving user. If not we tell both them and the leaving
-// user they no longer share any encrypted rooms (device_lists.left).
-func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Event) ([]*types.ToDevice, error) {
-	leaverMemberships, err := e.db.Rooms.GetUserMemberships(e.ctx, ev.Sender)
-	if err != nil {
-		return nil, err
-	}
-	// We only care about rooms the leaving user is joined in
-	leaverMemberships = lo.PickBy(leaverMemberships, func(rid id.RoomID, mtup types.MembershipTup) bool {
-		return mtup.Membership == event.MembershipJoin
-	})
+func (e *DeviceJoinEventIterator) isLocal(userID id.UserID) bool {
+	return userID.Homeserver() == e.config.ServerName
+}
 
-	roomMembers, err := e.db.Rooms.GetCurrentRoomMemberships(e.ctx, ev.RoomID)
-	if err != nil {
-		return nil, err
-	}
-
-	tds := make([]*types.ToDevice, 0, len(roomMembers))
-
-	for memberID := range roomMembers {
-		if memberID == ev.Sender {
-			// Ignore our own leaves
-			continue
-		} else if ev.Sender.Homeserver() != e.config.ServerName && memberID.Homeserver() != e.config.ServerName {
-			// If neither the leaver or other member are local, nothing to do here
+// leftDeviceChanges tells the leaver and each other member, those of them that are local, of the other
+// side when they no longer share an encrypted room, as shared reports for each member
+func leftDeviceChanges(isLocal func(id.UserID) bool, leaver id.UserID, others []id.UserID, shared map[id.UserID]bool) []*types.ToDevice {
+	var tds []*types.ToDevice
+	for _, memberID := range others {
+		if shared[memberID] {
 			continue
 		}
-		memberships, err := e.db.Rooms.GetUserMemberships(e.ctx, memberID)
-		if err != nil {
-			return nil, err
+		if isLocal(leaver) {
+			tds = append(tds, &types.ToDevice{
+				Type:     types.BabbleservLocalDeviceLeft,
+				Sender:   memberID,
+				UserID:   leaver,
+				DeviceID: id.DeviceID("*"),
+			})
 		}
-		var match bool
-		for roomID, membershipTup := range memberships {
-			if membershipTup.Membership != event.MembershipJoin {
-				continue
-			}
-			if _, ok := leaverMemberships[roomID]; ok {
-				match = true
-				break
-			}
-		}
-		// The leaving user and the still joined user no longer share any room memberships, notify
-		// them both.
-		if !match {
-			if ev.Sender.Homeserver() == e.config.ServerName {
-				tds = append(tds, &types.ToDevice{
-					Type:     types.BabbleservLocalDeviceLeft,
-					Sender:   memberID,
-					UserID:   ev.Sender,
-					DeviceID: id.DeviceID("*"),
-				})
-			}
-			if memberID.Homeserver() == e.config.ServerName {
-				tds = append(tds, &types.ToDevice{
-					Type:     types.BabbleservLocalDeviceLeft,
-					Sender:   ev.Sender,
-					UserID:   memberID,
-					DeviceID: id.DeviceID("*"),
-				})
-			}
+		if isLocal(memberID) {
+			tds = append(tds, &types.ToDevice{
+				Type:     types.BabbleservLocalDeviceLeft,
+				Sender:   leaver,
+				UserID:   memberID,
+				DeviceID: id.DeviceID("*"),
+			})
 		}
 	}
-
-	return tds, nil
+	return tds
 }

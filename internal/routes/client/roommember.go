@@ -23,8 +23,8 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms"
@@ -45,20 +45,11 @@ type reqMemberOther struct {
 
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3joined_rooms
 func (c *ClientRoutes) GetJoinedRooms(w http.ResponseWriter, r *http.Request) {
-	userID := middleware.GetRequestUserID(r)
-	memberships, err := c.db.Rooms.GetUserMemberships(r.Context(), userID)
+	roomIDs, err := c.db.Rooms.JoinedRooms(r.Context(), middleware.GetRequestUserID(r))
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
-
-	roomIDs := make([]id.RoomID, 0)
-	for _, membership := range memberships {
-		if membership.Membership == event.MembershipJoin {
-			roomIDs = append(roomIDs, membership.RoomID)
-		}
-	}
-
 	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespJoinedRooms{JoinedRooms: roomIDs})
 }
 
@@ -73,7 +64,7 @@ func (c *ClientRoutes) ForgetRoom(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) SendRoomInvite(w http.ResponseWriter, r *http.Request) {
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
-	req, respErr := util.ParseRequestJSON[reqMemberOther](r)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -91,7 +82,7 @@ func (c *ClientRoutes) SendRoomInvite(w http.ResponseWriter, r *http.Request) {
 	content := makeMembershipContent(event.MembershipInvite, req.Reason)
 	partialEv := types.NewPartialEvent(roomID, event.StateMember, &sKey, userID, content)
 
-	inviteStateEvs, err := c.db.Rooms.GetCurrentRoomStrippedStateEvents(r.Context(), roomID)
+	inviteStateEvs, err := c.db.Rooms.RoomStrippedState(r.Context(), roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -144,13 +135,13 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
-	serverInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), c.config.ServerName, roomID)
+	serverInRoom, err := c.db.Rooms.IsServerJoined(r.Context(), roomID, c.config.ServerName)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -159,109 +150,17 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
 
 	if serverInRoom {
-		// The easy path - we're already in the room, so just send the join. We
-		// re-check the server in room within the send local transaction.
+		// The easy path - we're already in the room, so just send the join. The send local
+		// transaction fails with ErrServerNotInRoom should this server have left meanwhile.
 		sKey := userID.String()
 		content := makeMembershipContent(event.MembershipJoin, req.Reason)
 		ev := types.NewPartialEvent(roomID, event.StateMember, &sKey, userID, content)
 		c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 			return util.EmptyJSON
 		})
+	} else if err := c.remoteMembership(r, roomID, event.MembershipJoin, userID, getOtherServers(r, roomID)); err != nil {
+		responseRemoteMembershipError(w, r, err)
 	} else {
-		// TODO: lookup any invite
-		otherServers := getOtherServers(r, roomID)
-		ev, otherServer, err := c.makeFederatedEvent(r, roomID, otherServers, func(otherServer string) (federatedMakeResp, error) {
-			makeJoinResp, err := c.fclient.MakeJoin(
-				r.Context(),
-				spec.ServerName(c.config.ServerName),
-				spec.ServerName(otherServer),
-				roomID.String(),
-				userID.String(),
-			)
-			return federatedMakeResp{
-				makeJoinResp.JoinEvent,
-				makeJoinResp.RoomVersion,
-			}, err
-		})
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-
-		// Switch to a background context here - if the client drops the request
-		// we should still send/receive the join so the state on the remote HS
-		// and local don't end up diverged.
-		backgroundCtx := hlog.FromRequest(r).With().
-			Str("background_task", "SendFederatedJoin").
-			Str("server", otherServer).
-			Logger().
-			WithContext(context.Background())
-
-		sendJoinResp, err := c.fclient.SendJoin(
-			backgroundCtx,
-			spec.ServerName(c.config.ServerName),
-			spec.ServerName(otherServer),
-			ev.PDU(),
-		)
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-
-		// Merge the state + auth events, verifying each
-		eventCount := len(sendJoinResp.StateEvents) + len(sendJoinResp.AuthEvents)
-		allEvs := make([]*types.Event, 0, eventCount)
-		seenIDs := make(map[id.EventID]struct{}, eventCount)
-		for _, b := range append(sendJoinResp.StateEvents, sendJoinResp.AuthEvents...) {
-			remoteEv := &types.Event{RoomVersion: ev.RoomVersion}
-			if err := json.Unmarshal(b, remoteEv); err != nil {
-				util.ResponseErrorUnknownJSON(w, r, err)
-				return
-			}
-			// Verify the event is signed by the senders server (which may not be the one we are
-			// joining the room via).
-			verifyErr, err := util.VerifyEvent(backgroundCtx, remoteEv, c.keyStore)
-			if err != nil {
-				util.ResponseErrorUnknownJSON(w, r, err)
-				return
-			} else if verifyErr != nil {
-				zerolog.Ctx(backgroundCtx).
-					Err(verifyErr).
-					Stringer("event_id", remoteEv.ID).
-					Stringer("type", remoteEv.Type).
-					Any("ev", remoteEv).
-					Msg("Skipping event that failed verification during join")
-				continue
-			}
-			if _, found := seenIDs[remoteEv.ID]; found {
-				zerolog.Ctx(backgroundCtx).Warn().
-					Stringer("event_id", remoteEv.ID).
-					Msg("Skipping duplicate event in join response")
-				continue
-			}
-			allEvs = append(allEvs, remoteEv)
-			seenIDs[remoteEv.ID] = struct{}{}
-		}
-		// Finally, add our join event we just sent to the server
-		allEvs = append(allEvs, ev)
-
-		// TODO: check for and fill any missing auth events here
-		// THIS SHOULD NEVER HAPPEN? Synapse on beeper-dev misses an event in the auth chain
-
-		util.SortEventList(allEvs)
-
-		if _, err = c.db.SendFederatedEvents(
-			backgroundCtx, roomID, allEvs,
-			rooms.SendFederatedEventsOptions{
-				// We're joining *now* and won't have all prev event history, ultimately we have
-				// to trust the other HS is giving us the correct state.
-				RemoteJoinEventID: ev.ID,
-			},
-		); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-
 		util.ResponseJSON(w, r, http.StatusOK, struct {
 			RoomID id.RoomID `json:"room_id"`
 		}{roomID})
@@ -276,13 +175,13 @@ func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
-	serverInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), c.config.ServerName, roomID)
+	serverInRoom, err := c.db.Rooms.IsServerJoined(r.Context(), roomID, c.config.ServerName)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -299,60 +198,18 @@ func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request
 		c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 			return util.EmptyJSON
 		})
+	} else if err := c.remoteMembership(r, roomID, event.MembershipKnock, userID, getOtherServers(r, roomID)); err != nil {
+		responseRemoteMembershipError(w, r, err)
 	} else {
-		otherServers := getOtherServers(r, roomID)
-		ev, otherServer, err := c.makeFederatedEvent(r, roomID, otherServers, func(otherServer string) (federatedMakeResp, error) {
-			makeJoinResp, err := c.fclient.MakeKnock(
-				r.Context(),
-				spec.ServerName(c.config.ServerName),
-				spec.ServerName(otherServer),
-				roomID.String(),
-				userID.String(),
-				[]gomatrixserverlib.RoomVersion{},
-			)
-			return federatedMakeResp{
-				makeJoinResp.KnockEvent,
-				makeJoinResp.RoomVersion,
-			}, err
-		})
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-
-		// Switch to a background context here - if the client drops the request we should still
-		// send/receive the knock so the state on the remote HS and local don't end up diverged.
-		backgroundCtx := hlog.FromRequest(r).With().
-			Str("background_task", "SendFederatedKnock").
-			Logger().
-			WithContext(context.Background())
-
-		sendKnockResp, err := c.fclient.SendKnock(
-			backgroundCtx,
-			spec.ServerName(c.config.ServerName),
-			spec.ServerName(otherServer),
-			ev.PDU(),
-		)
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-		ev.SetUnsigned("knock_room_state", sendKnockResp.KnockRoomState)
-
-		if err := c.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), ev); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-
 		util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 	}
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidleave
 func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
-	var req reqMemberSelf
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberSelf](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 	userID := middleware.GetRequestUserID(r)
@@ -361,9 +218,9 @@ func (c *ClientRoutes) SendRoomLeave(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidkick
 func (c *ClientRoutes) SendRoomKick(w http.ResponseWriter, r *http.Request) {
-	var req reqMemberOther
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 	c.sendRoomLeaveOrKick(w, r, req.UserID, req.Reason)
@@ -375,7 +232,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	isLeave := middleware.GetRequestUserID(r) == leavingUserID
 
 	// This is the CS API, we're the sender
-	serverInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), c.config.ServerName, roomID)
+	serverInRoom, err := c.db.Rooms.IsServerJoined(r.Context(), roomID, c.config.ServerName)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -383,7 +240,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 
 	// Find membership of the leaving user
 	var membership event.Membership
-	mtup, currentMemberEv, err := c.db.Rooms.GetUserMembershipAndEvent(r.Context(), leavingUserID, roomID)
+	mtup, currentMemberEv, err := c.db.Rooms.GetCurrentMembershipAndEvent(r.Context(), leavingUserID, roomID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
@@ -419,21 +276,26 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	content := makeMembershipContent(event.MembershipLeave, reason)
 	partialEv := types.NewPartialEvent(roomID, event.StateMember, &sKey, sendingUserID, content)
 
-	// We're in the room - send the event locally and then, if the other HS isn't in the room, send
-	// it over to them.
+	// We're in the room - send the event locally and then, if it replaces an invite or knock whose
+	// other HS isn't in the room, send it over to them.
 	if serverInRoom {
-		otherServerInRoom, err := c.db.Rooms.IsServerJoinedRoom(r.Context(), otherHomeserver, roomID)
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
+		var outlierServer string
+		if membership != event.MembershipJoin && otherHomeserver != "" {
+			otherServerInRoom, err := c.db.Rooms.IsServerJoined(r.Context(), roomID, otherHomeserver)
+			if err != nil {
+				util.ResponseErrorUnknownJSON(w, r, err)
+				return
+			} else if !otherServerInRoom {
+				outlierServer = otherHomeserver
+			}
 		}
 		c.sendLocalEventHandleResults(w, r, roomID, partialEv, func(ev *types.Event) any {
-			if otherServerInRoom {
+			if outlierServer == "" {
 				return util.EmptyJSON
 			}
 
 			td := &types.ToDevice{
-				UserID:  id.UserID("@:" + otherHomeserver),
+				UserID:  id.UserID("@:" + outlierServer),
 				Type:    types.BabbleservRemoteOutlierEvent,
 				Content: exerrors.Must(json.Marshal(ev)),
 			}
@@ -451,35 +313,10 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	// We're not in the room but do know the other HS, whom we assume are in the room, so use them
 	// via the make_leave, send_leave
 	if otherHomeserver != "" {
-		leaveEv, otherServer, err := c.makeFederatedEvent(r, roomID, []string{otherHomeserver}, func(otherServer string) (federatedMakeResp, error) {
-			makeJoinResp, err := c.fclient.MakeLeave(
-				r.Context(),
-				spec.ServerName(c.config.ServerName),
-				spec.ServerName(otherServer),
-				roomID.String(),
-				leavingUserID.String(),
-			)
-			return federatedMakeResp{
-				makeJoinResp.LeaveEvent,
-				makeJoinResp.RoomVersion,
-			}, err
-		})
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		} else if err := c.fclient.SendLeave(
-			r.Context(),
-			spec.ServerName(c.config.ServerName),
-			spec.ServerName(otherServer),
-			leaveEv.PDU(),
-		); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		} else if err := c.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), leaveEv); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
+		if err := c.remoteMembership(r, roomID, event.MembershipLeave, leavingUserID, []string{otherHomeserver}); err != nil {
+			responseRemoteMembershipError(w, r, err)
 			return
 		}
-
 		util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 		return
 	}
@@ -523,9 +360,9 @@ func (c *ClientRoutes) SendRoomUnban(w http.ResponseWriter, r *http.Request) {
 func (c *ClientRoutes) sendBanOrUnban(w http.ResponseWriter, r *http.Request, membership event.Membership) {
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 
-	var req reqMemberOther
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseOptionalRequestJSON[reqMemberOther](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
@@ -537,4 +374,92 @@ func (c *ClientRoutes) sendBanOrUnban(w http.ResponseWriter, r *http.Request, me
 	c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 		return util.EmptyJSON
 	})
+}
+
+// Wraps why another server or this one refused a membership sent through the other
+var errMembershipRejected = errors.New("membership rejected")
+
+// remoteMembership sends target's membership of a room this server is not in via make_/send_ endpoints
+func (c *ClientRoutes) remoteMembership(
+	r *http.Request,
+	roomID id.RoomID,
+	membership event.Membership,
+	target id.UserID,
+	servers []string,
+) error {
+	origin := spec.ServerName(c.config.ServerName)
+	ev, server, err := c.makeFederatedEvent(r, roomID, membership, servers, func(server string) (federatedMakeResp, error) {
+		destination := spec.ServerName(server)
+		switch membership {
+		case event.MembershipJoin:
+			resp, err := c.fclient.MakeJoin(r.Context(), origin, destination, roomID.String(), target.String())
+			return federatedMakeResp{resp.JoinEvent, resp.RoomVersion}, err
+		case event.MembershipKnock:
+			resp, err := c.fclient.MakeKnock(r.Context(), origin, destination, roomID.String(), target.String(), []gomatrixserverlib.RoomVersion{})
+			return federatedMakeResp{resp.KnockEvent, resp.RoomVersion}, err
+		default:
+			resp, err := c.fclient.MakeLeave(r.Context(), origin, destination, roomID.String(), target.String())
+			return federatedMakeResp{resp.LeaveEvent, resp.RoomVersion}, err
+		}
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx := hlog.FromRequest(r).With().
+		Str("background_task", "SendFederatedMembership").
+		Str("membership", string(membership)).
+		Str("server", server).
+		Logger().
+		WithContext(context.Background())
+	destination := spec.ServerName(server)
+	switch membership {
+	case event.MembershipJoin:
+		resp, err := c.fclient.SendJoin(ctx, origin, destination, ev.PDU())
+		if err != nil {
+			return err
+		}
+		return c.verifyAndSendRemoteJoin(ctx, roomID, ev, resp)
+	case event.MembershipKnock:
+		resp, err := c.fclient.SendKnock(ctx, origin, destination, ev.PDU())
+		if err != nil {
+			return err
+		}
+		ev.SetUnsigned("knock_room_state", resp.KnockRoomState)
+	default:
+		if err := c.fclient.SendLeave(ctx, origin, destination, ev.PDU()); err != nil {
+			return err
+		}
+	}
+	return c.db.Rooms.SendFederatedOutlierMembershipEvent(ctx, ev)
+}
+
+func (c *ClientRoutes) verifyAndSendRemoteJoin(ctx context.Context, roomID id.RoomID, ev *types.Event, resp fclient.RespSendJoin) error {
+	seenIDs := make(map[id.EventID]struct{}, len(resp.StateEvents)+len(resp.AuthEvents))
+	stateEvs, err := util.VerifyRemoteEvents(ctx, resp.StateEvents, ev.RoomVersion, c.keyStore, seenIDs)
+	if err != nil {
+		return err
+	}
+	authEvs, err := util.VerifyRemoteEvents(ctx, resp.AuthEvents, ev.RoomVersion, c.keyStore, seenIDs)
+	if err != nil {
+		return err
+	}
+	res, err := c.db.SendRemoteJoin(ctx, roomID, ev, stateEvs, authEvs)
+	if errors.Is(err, rooms.ErrAuthStage4) || errors.Is(err, rooms.ErrAuthStage5) {
+		return fmt.Errorf("%w: %w", errMembershipRejected, err)
+	} else if err != nil {
+		return err
+	} else if len(res.Rejected) > 0 {
+		// A stored duplicate, or the fallback once another join got this server into the room
+		return fmt.Errorf("%w: %w", errMembershipRejected, res.Rejected[0].Error)
+	}
+	return nil
+}
+
+func responseRemoteMembershipError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errMembershipRejected) {
+		util.ResponseRejectedEventJSON(w, r, err)
+		return
+	}
+	responseMakeFederatedEventError(w, r, err)
 }

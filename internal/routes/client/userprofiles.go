@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -51,9 +50,9 @@ func (c *ClientRoutes) GetProfile(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.10/client-server-api/#put_matrixclientv3profileuseridavatar_url
 // https://spec.matrix.org/v1.10/client-server-api/#put_matrixclientv3profileuseriddisplayname
 func (c *ClientRoutes) PutProfile(w http.ResponseWriter, r *http.Request) {
-	var req map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseRequestJSON[map[string]any](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 

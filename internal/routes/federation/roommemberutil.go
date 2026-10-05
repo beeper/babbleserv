@@ -18,18 +18,6 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-func sendEventErrorResponse(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, rooms.ErrAuthStage4) {
-		// Stage4 errors happen when the events own auth events don't allow it, so this is an
-		// invalid input param.
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
-		return
-	}
-	// Stage5 errors happen based on the events prev_events (after passing stage4), so should
-	// be treated as an authorization error.
-	util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
-}
-
 func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -45,11 +33,13 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 			w, r, mautrix.MForbidden,
 			"UserID is from this server, cannot make federated event",
 		)
+		return
 	} else if otherServer != middleware.GetRequestServer(r) {
 		util.ResponseErrorMessageJSON(
 			w, r, mautrix.MForbidden,
 			"UserID does not match requesting server origin",
 		)
+		return
 	}
 
 	room, err := f.db.Rooms.GetRoom(r.Context(), roomID)
@@ -58,6 +48,10 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 		return
 	} else if room == nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found")
+		return
+	} else if membership == event.MembershipJoin && room.LocalMembers == 0 {
+		// As Synapse, a join to the stale state of a room this server left could not be sent
+		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Not an active room on this server")
 		return
 	} else if checkRequestVersions {
 		if !slices.Contains(r.URL.Query()["ver"], room.Version) {
@@ -102,7 +96,7 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if len(rejected) > 0 {
-		sendEventErrorResponse(w, r, rejected[0].Error)
+		util.ResponseRejectedEventJSON(w, r, rejected[0].Error)
 		return
 	}
 	ev := evs[0]
@@ -123,7 +117,7 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	w http.ResponseWriter,
 	r *http.Request,
 	membership event.Membership,
-	getResponseBeforeSend func(id.RoomID) (any, error),
+	responseAfterSend func(roomID id.RoomID, eventID id.EventID) (any, error),
 ) {
 	var ev types.Event
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
@@ -139,6 +133,13 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		return
 	} else if ev.Membership() != membership {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Membership is incorrect")
+		return
+	} else if ev.Sender.Homeserver() != middleware.GetRequestServer(r) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, "User not from origin")
+		return
+	} else if *ev.StateKey != ev.Sender.String() {
+		// As Synapse, before authorizing it: no kicks or bans
+		util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, "state_key and sender must match")
 		return
 	}
 
@@ -169,61 +170,31 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		return
 	}
 
-	var response any = util.EmptyJSON
-	if getResponseBeforeSend != nil {
-		response, err = getResponseBeforeSend(roomID)
-		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
+	// For a room this server is not in, none is taken, as a remote user's membership is never an
+	// outlier
+	res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, nil)
+	var rejection error
+	if err == nil && len(res.Rejected) > 0 {
+		rejection = res.Rejected[0].Error
 	}
-
-	isInRoom, err := f.db.Rooms.IsServerJoinedRoom(r.Context(), f.config.ServerName, roomID)
-	if err != nil {
+	if errors.Is(err, rooms.ErrServerNotInRoom) || errors.Is(rejection, rooms.ErrServerNotInRoom) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found")
+		return
+	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
-	} else if !isInRoom {
-		// We're not in the room - there's two cases where this might happen:
-		// - remote user is rejecting an invite sent from a local user who has now left
-		// - remote user is rescinding their own invite and we've never been in the room
-		if membership != event.MembershipLeave {
-			// Only leave memberships are valid here
-			util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found, sent membership is not leave")
-			return
-		}
-		targetUserMembership, targetUserMembershipEv, err := f.db.Rooms.GetUserMembershipAndEvent(r.Context(), id.UserID(*ev.StateKey), roomID)
+	} else if rejection != nil {
+		util.ResponseRejectedEventJSON(w, r, rejection)
+		return
+	}
+
+	var response any = util.EmptyJSON
+	if responseAfterSend != nil {
+		response, err = responseAfterSend(roomID, ev.ID)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
-		} else if targetUserMembership == nil || targetUserMembership.Membership != event.MembershipInvite {
-			// Unknown room leaves are only valid if the target user is currently invited
-			util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found, current membership is not invite")
-			return
-		}
-		if targetUserMembershipEv.Sender.Homeserver() == f.config.ServerName {
-			// Invite is from a local user (reject)
-		} else if targetUserMembershipEv.Sender == ev.Sender {
-			// Invite was sent by the remote user (rescind)
-		} else {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found, not an invite reject or rescind")
-			return
 		}
 	}
-
-	if !isInRoom {
-		if err := f.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), &ev); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		}
-	} else {
-		if res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, rooms.SendFederatedEventsOptions{}); err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
-			return
-		} else if len(res.Rejected) > 0 {
-			sendEventErrorResponse(w, r, res.Rejected[0].Error)
-			return
-		}
-	}
-
 	util.ResponseJSON(w, r, http.StatusOK, response)
 }

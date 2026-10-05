@@ -549,15 +549,13 @@ func (c *ClientRoutes) GetKeyChanges(w http.ResponseWriter, r *http.Request) {
 	userIDsInterestedIn[userID] = struct{}{}
 
 	for roomID := range memberships {
-		memberIDs, err := c.db.Rooms.GetCurrentRoomMemberships(r.Context(), roomID)
+		members, err := c.db.Rooms.RoomMembers(r.Context(), roomID, event.MembershipJoin)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
 		}
-		for memberID, membershipTup := range memberIDs {
-			if membershipTup.Membership == event.MembershipJoin {
-				userIDsInterestedIn[memberID] = struct{}{}
-			}
+		for memberID := range members {
+			userIDsInterestedIn[memberID] = struct{}{}
 		}
 	}
 

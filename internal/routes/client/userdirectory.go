@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	defaultUserDirectoryLimit          = 10
-	maxUserDirectoryLimit              = 100
-	maxUserDirectoryIndexCandidates    = 500
-	maxUserDirectoryIndexRows          = 2000
-	maxUserDirectoryMembershipRows     = 4096
-	maxUserDirectoryMembershipRowsUser = 256
+	defaultUserDirectoryLimit       = 10
+	maxUserDirectoryLimit           = 100
+	maxUserDirectoryIndexCandidates = 500
+	maxUserDirectoryIndexRows       = 2000
+	maxUserDirectoryLookups         = 4096
+	maxUserDirectoryLookupsPerUser  = 256
 )
 
 type userDirectorySearchRequest struct {
@@ -61,7 +61,7 @@ func (c *ClientRoutes) SearchUserDirectory(w http.ResponseWriter, r *http.Reques
 	}
 	visible, visibilityLimited, err := c.db.Rooms.FilterUserDirectoryCandidates(
 		r.Context(), middleware.GetRequestUserID(r), candidates, limit,
-		maxUserDirectoryMembershipRows, maxUserDirectoryMembershipRowsUser,
+		maxUserDirectoryLookups, maxUserDirectoryLookupsPerUser,
 	)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)

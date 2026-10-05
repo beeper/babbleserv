@@ -26,6 +26,24 @@ type keyConfig struct {
 	ExpiredTimestamp int64  `yaml:"expiredTimestamp"`
 }
 
+// What a publish's transaction may hold before the room record, leaving room under FoundationDB's
+// 10 MB for the record and a send's extra writes
+const PublishMandatoryMaxBytes = 9_000_000
+
+// Bounds on the work of one transaction when sending events to a room
+type stateBudgetConfig struct {
+	// Approximate bytes staged per transaction, leaving headroom for FoundationDB overhead
+	// Default: 5 MB
+	StagingBytes int `yaml:"stagingBytes"`
+	// Candidate events of a state resolution run inline, past which an artifact job runs it
+	// Default: 2000
+	InlineResolutionCandidates int `yaml:"inlineResolutionCandidates"`
+	// State tuples of the largest input of a state resolution run inline, past which an artifact job
+	// runs it, as its auth difference reads the auth header of every state event of its inputs
+	// Default: 10000
+	InlineResolutionStateTuples int `yaml:"inlineResolutionStateTuples"`
+}
+
 type NotifierConfig struct {
 	RedisAddr    string `yaml:"redisAddr"`
 	RedisChannel string `yaml:"redisChannel"`
@@ -53,6 +71,15 @@ type BabbleConfig struct {
 		// events sent per room in memory only.
 		// Default: 3h
 		CompactRoomNotificationsTimeout time.Duration `yaml:"compactRoomNotificationsTimeout"`
+
+		// Most initial_state events a create room request may carry, all published with the create
+		// event
+		// Default: 100
+		MaxCreateRoomInitialState int `yaml:"maxCreateRoomInitialState"`
+		// Default: 1000
+		MaxCreateRoomInvites int `yaml:"maxCreateRoomInvites"`
+
+		StateBudget stateBudgetConfig `yaml:"stateBudget"`
 	} `yaml:"rooms"`
 
 	Accounts struct {
@@ -176,11 +203,29 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 		cfg.Transient.PresenceTimeoutCheckInterval = time.Minute
 	}
 
+	if cfg.Rooms.DefaultVersion == "" {
+		cfg.Rooms.DefaultVersion = "11"
+	}
 	if cfg.Rooms.MaxNotificationsPerUserRoom == 0 {
 		cfg.Rooms.MaxNotificationsPerUserRoom = 100
 	}
 	if cfg.Rooms.CompactRoomNotificationsTimeout == 0 {
 		cfg.Rooms.CompactRoomNotificationsTimeout = 3 * time.Hour
+	}
+	if cfg.Rooms.MaxCreateRoomInitialState <= 0 {
+		cfg.Rooms.MaxCreateRoomInitialState = 100
+	}
+	if cfg.Rooms.MaxCreateRoomInvites <= 0 {
+		cfg.Rooms.MaxCreateRoomInvites = 1000
+	}
+	if cfg.Rooms.StateBudget.StagingBytes <= 0 {
+		cfg.Rooms.StateBudget.StagingBytes = 5_000_000
+	}
+	if cfg.Rooms.StateBudget.InlineResolutionCandidates <= 0 {
+		cfg.Rooms.StateBudget.InlineResolutionCandidates = 2000
+	}
+	if cfg.Rooms.StateBudget.InlineResolutionStateTuples <= 0 {
+		cfg.Rooms.StateBudget.InlineResolutionStateTuples = 10_000
 	}
 
 	return cfg

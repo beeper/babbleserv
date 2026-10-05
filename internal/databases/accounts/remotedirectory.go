@@ -21,6 +21,19 @@ func (a *AccountsDatabase) EnsureRemoteDirectoryUsers(
 	return err
 }
 
+// EnsureUnindexedRemoteDirectoryUsers is EnsureRemoteDirectoryUsers for those of the users with
+// neither a profile fetch queued nor a profile fetched, as when indexing every member of a room
+func (a *AccountsDatabase) EnsureUnindexedRemoteDirectoryUsers(
+	ctx context.Context,
+	sources []types.RemoteUserDirectorySource,
+	now, lookupAt time.Time,
+) error {
+	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
+		return nil, a.users.TxnEnsureUnindexedRemoteDirectoryUsers(txn, sources, now, lookupAt)
+	})
+	return err
+}
+
 func (a *AccountsDatabase) NextRemoteDirectoryProfileJob(
 	ctx context.Context,
 	now time.Time,

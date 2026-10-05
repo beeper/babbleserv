@@ -127,7 +127,7 @@ func (e *EventsIterator) notifyFederationSenders(tups []types.EventTupWithVersio
 	// Now get unique server names from those rooms
 	serverNames := make(map[string]struct{})
 	for roomID := range roomIDs {
-		servers, err := e.db.Rooms.GetCurrentRoomServers(e.ctx, roomID)
+		servers, err := e.db.Rooms.RoomServers(e.ctx, roomID)
 		if err != nil {
 			return err
 		}

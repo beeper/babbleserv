@@ -2,8 +2,8 @@ package types
 
 import (
 	"encoding/json"
+	"fmt"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -60,6 +60,10 @@ type Event struct {
 
 	Depth int64 `msgpack:"dpt" json:"depth"`
 
+	// Internal state contexts before and after the event, zero when unknown
+	BeforeState StateHash `msgpack:"bst" json:"-"`
+	AfterState  StateHash `msgpack:"ast" json:"-"`
+
 	// Only here for backwards compat ???
 	PrevState []id.EventID `msgpack:"pst" json:"prev_state,omitzero"`
 
@@ -70,11 +74,9 @@ type Event struct {
 	Signatures map[string]map[string]string `msgpack:"sig" json:"signatures"`
 
 	// Internal, in-memory only flags used for the lifetime of a request/background job
-	ClientTransactionID string             `msgpack:"-" json:"-"`
-	IsForClientAPI      bool               `msgpack:"-" json:"-"`
-	IsDuplicate         bool               `msgpack:"-" json:"-"`
-	IncompleteVersion   tuple.Versionstamp `msgpack:"-" json:"-"`
-	PrevStateEvent      *Event             `msgpack:"-" json:"-"`
+	ClientTransactionID string `msgpack:"-" json:"-"`
+	IsForClientAPI      bool   `msgpack:"-" json:"-"`
+	IsDuplicate         bool   `msgpack:"-" json:"-"`
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
@@ -128,16 +130,37 @@ func (ev *PartialEvent) SetUnsigned(key string, value any) {
 	ev.Unsigned[key] = value
 }
 
-func eventIDsFromProtoEvent(input any) []id.EventID {
-	ids := input.([]any)
-	evIDs := make([]id.EventID, 0, len(ids))
-	for _, ev := range ids {
-		evIDs = append(evIDs, id.EventID(ev.(string)))
+func eventIDsFromProtoEvent(input any) ([]id.EventID, error) {
+	var out []id.EventID
+	switch ids := input.(type) {
+	case nil:
+	case []string:
+		for _, value := range ids {
+			out = append(out, id.EventID(value))
+		}
+	case []any:
+		for _, value := range ids {
+			eventID, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("unsupported proto-event reference %T", value)
+			}
+			out = append(out, id.EventID(eventID))
+		}
+	default:
+		return nil, fmt.Errorf("unsupported proto-event references %T", input)
 	}
-	return evIDs
+	return out, nil
 }
 
-func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) *Event {
+func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) (*Event, error) {
+	authEventIDs, err := eventIDsFromProtoEvent(protoEv.AuthEvents)
+	if err != nil {
+		return nil, err
+	}
+	prevEventIDs, err := eventIDsFromProtoEvent(protoEv.PrevEvents)
+	if err != nil {
+		return nil, err
+	}
 	return &Event{
 		PartialEvent: PartialEvent{
 			RoomID:   id.RoomID(protoEv.RoomID),
@@ -149,9 +172,9 @@ func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) *Event {
 			Redacts:  id.EventID(protoEv.Redacts),
 		},
 		Depth:        protoEv.Depth,
-		AuthEventIDs: eventIDsFromProtoEvent(protoEv.AuthEvents),
-		PrevEventIDs: eventIDsFromProtoEvent(protoEv.PrevEvents),
-	}
+		AuthEventIDs: authEventIDs,
+		PrevEventIDs: prevEventIDs,
+	}, nil
 }
 
 type marshalEvent Event
@@ -194,10 +217,16 @@ func (ev *Event) ToMsgpack() []byte {
 }
 
 func (ev Event) MarshalJSON() ([]byte, error) {
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
+	domainlessCreate := ev.Type == event.StateCreate && err == nil && roomSpec.DomainlessRoomIDs()
 	if ev.IsForClientAPI {
 		// Client API removes room_id, adds event_id
 		b := exerrors.Must(json.Marshal(ev.PartialEvent))
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
+		// Clients need the derived room ID even though v12 create PDUs omit it.
+		if domainlessCreate {
+			b = exerrors.Must(sjson.SetBytes(b, "room_id", ev.RoomID))
+		}
 		b = exerrors.Must(sjson.SetBytes(b, "event_id", ev.ID))
 		// Only locally looked-up metadata may expose a client transaction ID.
 		b = exerrors.Must(sjson.DeleteBytes(b, "unsigned.transaction_id"))
@@ -214,13 +243,42 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 		ev.PrevEventIDs = make([]id.EventID, 0)
 	}
 	b := exerrors.Must(json.Marshal((marshalEvent)(ev)))
+	if domainlessCreate {
+		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
+	}
 	// Strip unsigned from any S2S API calls
 	b = exerrors.Must(sjson.DeleteBytes(b, "unsigned"))
 	return b, nil
 }
 
 func (ev *Event) UnmarshalJSON(b []byte) error {
-	return json.Unmarshal(b, (*marshalEvent)(ev))
+	if err := json.Unmarshal(b, (*marshalEvent)(ev)); err != nil {
+		return err
+	}
+	if ev.Type != event.StateCreate {
+		return nil
+	}
+	roomVersion := ev.RoomVersion
+	if roomVersion == "" {
+		roomVersion = gjson.GetBytes(ev.Content, "room_version").String()
+	}
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(gomatrixserverlib.RoomVersion(roomVersion))
+	if err != nil || !roomSpec.DomainlessRoomIDs() {
+		return nil
+	}
+	ev.RoomVersion = roomVersion
+	if gjson.GetBytes(b, "room_id").Exists() {
+		return fmt.Errorf("v12 create event must omit room_id")
+	}
+	if ev.StateKey == nil || *ev.StateKey != "" {
+		return fmt.Errorf("create event must have an empty state key")
+	}
+	pdu, err := roomSpec.NewEventFromTrustedJSON(b, false)
+	if err != nil {
+		return err
+	}
+	ev.RoomID = id.RoomID(pdu.RoomID().String())
+	return nil
 }
 
 func (ev *Event) EventTup() EventTup {
@@ -232,19 +290,6 @@ func (ev *Event) EventTup() EventTup {
 	}
 }
 
-func (ev *Event) EventStateTup() EventStateTup {
-	if ev.StateKey == nil {
-		panic("not a state event")
-	}
-	return EventStateTup{
-		EventID: ev.ID,
-		StateTup: StateTup{
-			Type:     ev.Type,
-			StateKey: *ev.StateKey,
-		},
-	}
-}
-
 func (ev *Event) StateTup() StateTup {
 	if ev.StateKey == nil {
 		panic("not a state event")
@@ -253,6 +298,15 @@ func (ev *Event) StateTup() StateTup {
 		Type:     ev.Type,
 		StateKey: *ev.StateKey,
 	}
+}
+
+// StateEntry is what a state context holds for the state event
+func (ev *Event) StateEntry() StateEntry {
+	entry := StateEntry{EventID: ev.ID}
+	if ev.Type == event.StateMember {
+		entry.Membership = ev.Membership()
+	}
+	return entry
 }
 
 func (ev *Event) MembershipTup() MembershipTup {
@@ -283,8 +337,8 @@ func (ev *Event) MustGetRoomSpec() gomatrixserverlib.IRoomVersion {
 	return roomSpec
 }
 
-func (ev *Event) IsProfileUpdate() bool {
-	return gjson.GetBytes(ev.Content, "babbleserv.is_profile_update").Bool()
+func (ev *Event) IsBabbleProfileUpdate() bool {
+	return gjson.GetBytes(ev.Content, `babbleserv\.is_profile_update`).Bool()
 }
 
 func (ev *Event) Membership() event.Membership {
@@ -333,7 +387,53 @@ func (ev *Event) GetRedactedEvent() (*Event, error) {
 	if err := json.Unmarshal(b, &redacted); err != nil {
 		return nil, err
 	}
+	redacted.RoomVersion, redacted.RoomID, redacted.ID = ev.RoomVersion, ev.RoomID, ev.ID
 	redacted.Redacted = true
 
 	return &redacted, err
+}
+
+// ImplicitCreateEventID is the create event committed to by a domainless room ID.
+func (ev *Event) ImplicitCreateEventID() id.EventID {
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
+	if err != nil || !roomSpec.DomainlessRoomIDs() || len(ev.RoomID) < 2 || ev.RoomID[0] != '!' {
+		return ""
+	}
+	return id.EventID("$" + ev.RoomID[1:])
+}
+
+// DomainlessRoomID is the room ID a create event commits to, the inverse of ImplicitCreateEventID.
+func (ev *Event) DomainlessRoomID() id.RoomID {
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
+	if err != nil || !roomSpec.DomainlessRoomIDs() || ev.Type != event.StateCreate || len(ev.ID) < 2 || ev.ID[0] != '$' {
+		return ""
+	}
+	return id.RoomID("!" + ev.ID[1:])
+}
+
+// AuthDependencyIDs are the event's auth events, preceded by the create event that it cites
+// implicitly in a room with a domainless room ID.
+func (ev *Event) AuthDependencyIDs() []id.EventID {
+	if createID := ev.ImplicitCreateEventID(); createID != "" && ev.Type != event.StateCreate {
+		return append([]id.EventID{createID}, ev.AuthEventIDs...)
+	}
+	return ev.AuthEventIDs
+}
+
+// HasStateIn reports whether the event, which may be nil, is in the room with known state contexts.
+// BeforeState and AfterState are always set together, and an outlier never has them.
+func (ev *Event) HasStateIn(roomID id.RoomID) bool {
+	return ev != nil && !ev.Outlier && ev.RoomID == roomID && !ev.AfterState.IsZero()
+}
+
+// ResetOutcome clears what authorizing the event decided: its rejection, soft failure and state.
+func (ev *Event) ResetOutcome() {
+	ev.Rejected, ev.SoftFailed = false, false
+	ev.BeforeState, ev.AfterState = StateHash{}, StateHash{}
+}
+
+// CopyOutcome gives the event what authorizing another copy of it decided.
+func (ev *Event) CopyOutcome(from *Event) {
+	ev.Rejected, ev.SoftFailed = from.Rejected, from.SoftFailed
+	ev.BeforeState, ev.AfterState = from.BeforeState, from.AfterState
 }

@@ -8,8 +8,11 @@ import (
 	"runtime/debug"
 
 	"github.com/matrix-org/gomatrix"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
+
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 var (
@@ -79,6 +82,11 @@ func MakeMatrixError(error mautrix.RespError, message string) mautrix.RespError 
 }
 
 func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, types.ErrRoomTooLarge) {
+		hlog.FromRequest(r).Warn().Err(err).Msg("Refusing a change too large to publish")
+		ResponseJSON(w, r, http.StatusInternalServerError, errorData{MUnknown.ErrCode, err.Error()})
+		return
+	}
 	var httpErr gomatrix.HTTPError
 	if errors.As(err, &httpErr) {
 		hlog.FromRequest(r).Error().
@@ -95,6 +103,28 @@ func ResponseErrorUnknownJSON(w http.ResponseWriter, r *http.Request, err error)
 		Type("type", err).
 		Msgf("Unknown error processing request: %s", debug.Stack())
 	ResponseErrorJSON(w, r, MUnknown)
+}
+
+// IsInvalidEvent reports whether an event was refused for its JSON, its sender's fault
+func IsInvalidEvent(err error) bool {
+	var invalid *gomatrixserverlib.EventValidationError
+	return errors.As(err, &invalid) && invalid.Code == http.StatusBadRequest
+}
+
+// RejectedEventError is the error refusing an event: invalid event JSON is a bad request, an event
+// over the size limits too large, any other reason forbidden, as Synapse answers
+func RejectedEventError(err error) mautrix.RespError {
+	var invalid *gomatrixserverlib.EventValidationError
+	if IsInvalidEvent(err) {
+		return mautrix.MBadJSON
+	} else if errors.As(err, &invalid) && invalid.Code == http.StatusRequestEntityTooLarge {
+		return mautrix.MTooLarge
+	}
+	return mautrix.MForbidden
+}
+
+func ResponseRejectedEventJSON(w http.ResponseWriter, r *http.Request, err error) {
+	ResponseErrorMessageJSON(w, r, RejectedEventError(err), err.Error())
 }
 
 func ResponseErrorJSON(w http.ResponseWriter, r *http.Request, error mautrix.RespError) {
