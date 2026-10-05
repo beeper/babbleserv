@@ -42,12 +42,13 @@ func (c *ClientRoutes) sendLocalEventHandleResultsWithOptions(
 	res, err := c.db.SendLocalEvents(r.Context(), roomID, []*types.PartialEvent{partialEv}, options)
 	if errors.Is(err, types.ErrRoomNotFound) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, err.Error())
+	} else if errors.Is(err, rooms.ErrServerNotInRoom) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
 	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if len(res.Rejected) > 0 {
-		err := res.Rejected[0].Error
-		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, err.Error())
+		util.ResponseRejectedEventJSON(w, r, res.Rejected[0].Error)
 		return
 	} else {
 		ev := res.Allowed[0]
@@ -68,11 +69,12 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 	if err != nil {
 		return nil, nil, err
 	} else if len(rejected) > 0 {
-		return nil, &mautrix.MForbidden, rejected[0].Error
+		respErr := util.RejectedEventError(rejected[0].Error)
+		return nil, &respErr, rejected[0].Error
 	}
 	ev := evs[0]
 
-	inviteStateEvs, err := c.db.Rooms.GetCurrentRoomStrippedStateEvents(ctx, roomID)
+	inviteStateEvs, err := c.db.Rooms.RoomStrippedState(ctx, roomID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -124,14 +126,14 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 	// Now that we've prepared, other HS signed and we verified the event we  can send it. We send
 	// it as if it's a federated event which triggers all the authorization checks, accounting for
 	// any state changes in the room during the signing process above.
-	results, err := c.db.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, rooms.SendFederatedEventsOptions{})
+	results, err := c.db.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if len(results.Rejected) > 0 {
-		err := results.Rejected[0].Error
-		return nil, &mautrix.MForbidden, err
+		respErr := util.RejectedEventError(results.Rejected[0].Error)
+		return nil, &respErr, results.Rejected[0].Error
 	}
 
 	return results, nil, nil

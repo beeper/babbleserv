@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
+	"fmt"
 	"math"
 	"net/http"
 	"slices"
@@ -33,8 +33,8 @@ type reqTransaction struct {
 	Origin          string `json:"origin"`
 	OriginTimestamp int64  `json:"origin_server_ts"`
 
-	PDUs []*types.Event `json:"pdus"`
-	EDUs []*types.EDU   `json:"edus"`
+	PDUs []json.RawMessage `json:"pdus"`
+	EDUs []*types.EDU      `json:"edus"`
 }
 
 type respTransactionResult struct {
@@ -78,18 +78,14 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 	var resp *respTransaction
 	var pduErr, eduErr error
 
-	wg.Add(1)
-	go func() {
-		resp, pduErr = f.processTransactionPDUs(r, req.Origin, req.PDUs)
-		wg.Done()
-	}()
-
-	wg.Add(1)
-	go func() {
-		eduErr = f.processTransactionEDUs(r, req.EDUs)
-		wg.Done()
-	}()
-
+	wg.Go(func() {
+		defer util.RecoverPanic(&log, &pduErr)
+		resp, pduErr = f.processTransactionPDUs(r, req.Origin, parseTransactionPDUs(&log, req.PDUs))
+	})
+	wg.Go(func() {
+		defer util.RecoverPanic(&log, &eduErr)
+		eduErr = f.processTransactionEDUs(r, req.Origin, req.EDUs)
+	})
 	wg.Wait()
 
 	if pduErr != nil {
@@ -105,7 +101,7 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 	util.ResponseJSON(w, r, http.StatusOK, resp)
 }
 
-func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types.EDU) error {
+func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 
 	// Group edus by type
@@ -116,10 +112,9 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 
 	var wg sync.WaitGroup
 
-	for eduType, eus := range edusByType {
-		wg.Add(1)
-		go func(eduType types.EDUType, edus []*types.EDU) {
-			defer wg.Done()
+	for eduType, edus := range edusByType {
+		wg.Go(func() {
+			defer util.RecoverPanic(log, nil)
 
 			switch eduType {
 			case types.EDUTypeDeviceListUpdate:
@@ -127,11 +122,13 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 					var content types.DeviceListUpdateEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
 						log.Err(err).Msg("Failed to unmarshal m.device_list_update content")
-						return
+						continue
+					} else if !checkEDUOrigin(log, origin, eduType, content.UserID) {
+						continue
 					}
 					if err := f.db.Accounts.StoreDeviceChange(r.Context(), content.UserID, content.DeviceID); err != nil {
 						log.Err(err).Msg("Failed to store remote device change")
-						return
+						continue
 					}
 					f.notifiers.Accounts.SendChange(notifier.Change{
 						UserIDs: []id.UserID{content.UserID},
@@ -149,11 +146,13 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 					var content types.SigningKeyUpdateEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
 						log.Err(err).Msg("Failed to unmarshal m.signing_key_update content")
-						return
+						continue
+					} else if !checkEDUOrigin(log, origin, eduType, content.UserID) {
+						continue
 					}
 					if err := f.db.Accounts.StoreDeviceChange(r.Context(), content.UserID, "*"); err != nil {
 						log.Err(err).Msg("Failed to store remote device change")
-						return
+						continue
 					}
 					f.notifiers.Accounts.SendChange(notifier.Change{
 						UserIDs: []id.UserID{content.UserID},
@@ -162,14 +161,12 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 						Str("user_id", content.UserID.String()).
 						Msg("Processed remote signing key update")
 
-					// TODO: store the keys!
 				}
 
 			case types.EDUTypeReceipt:
 				// TODO
 
 			case types.EDUTypePresence:
-				origin := middleware.GetRequestServer(r)
 				for _, edu := range edus {
 					var content types.PresenceEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
@@ -177,9 +174,7 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 						continue
 					}
 					for _, presenceItem := range content.Push {
-						if presenceItem.UserID.Homeserver() != origin {
-							log.Warn().Str("origin", origin).Stringer("user_id", presenceItem.UserID).
-								Msg("Ignoring unauthorized m.presence EDU item")
+						if !checkEDUOrigin(log, origin, eduType, presenceItem.UserID) {
 							continue
 						}
 						if localpart, _, err := presenceItem.UserID.ParseAndValidateRelaxed(); err != nil || localpart == "" ||
@@ -209,7 +204,7 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 							log.Err(err).
 								Str("user_id", presenceItem.UserID.String()).
 								Msg("Failed to store remote presence")
-							return
+							continue
 						}
 						log.Debug().
 							Str("user_id", presenceItem.UserID.String()).
@@ -223,7 +218,10 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 				for _, edu := range edus {
 					var content types.ToDeviceEDUContent
 					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						panic(err)
+						log.Err(err).Msg("Failed to unmarshal m.direct_to_device content")
+						continue
+					} else if !checkEDUOrigin(log, origin, eduType, content.Sender) {
+						continue
 					}
 
 					for userID, deviceIDToContent := range content.Messages {
@@ -231,6 +229,7 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 							log.Error().
 								Str("user_id", userID.String()).
 								Msg("Ignoring to-device for nonlocal user")
+							continue
 						}
 						for deviceID, contentB := range deviceIDToContent {
 							cnt, err := json.Marshal(contentB)
@@ -250,77 +249,128 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, edus []*types
 						}
 					}
 				}
-
-				_, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{})
-				if err != nil {
-					panic(err)
+				if _, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{}); err != nil {
+					log.Err(err).Msg("Failed to store remote to-device messages")
 				}
 
 			default:
 				log.Error().Str("type", string(eduType)).Msg("Ignoring unknown EDU type")
 			}
-		}(eduType, eus)
+		})
 	}
 
 	wg.Wait()
 	return nil
 }
 
-func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string, pdus []*types.Event) (*respTransaction, error) {
-	type results struct {
-		rooms.SendEventsResult
-		Outliers []*types.Event
+func checkEDUOrigin(log *zerolog.Logger, origin string, eduType types.EDUType, userID id.UserID) bool {
+	if userID.Homeserver() == origin {
+		return true
 	}
-	verifyResults := results{
-		Outliers: make([]*types.Event, 0),
-		SendEventsResult: rooms.SendEventsResult{
-			Allowed:  make([]*types.Event, 0, len(pdus)),
-			Rejected: make([]rooms.RejectedEvent, 0),
-		},
-	}
+	log.Warn().
+		Str("type", string(eduType)).
+		Stringer("user_id", userID).
+		Str("origin", origin).
+		Msg("Dropping EDU about a user of another server")
+	return false
+}
 
-	roomVersions := make(map[id.RoomID]string, 1)
+// As Synapse does, a PDU that cannot be parsed is dropped without a result
+func parseTransactionPDUs(log *zerolog.Logger, raws []json.RawMessage) []*types.Event {
+	pdus := make([]*types.Event, 0, len(raws))
+	for _, raw := range raws {
+		var ev *types.Event
+		if err := json.Unmarshal(raw, &ev); err != nil || ev == nil {
+			log.Warn().Err(err).Msg("Dropping PDU that cannot be parsed")
+			continue
+		}
+		pdus = append(pdus, ev)
+	}
+	return pdus
+}
+
+type pduRoomLookups interface {
+	GetRoom(ctx context.Context, roomID id.RoomID) (*types.Room, error)
+	GetCurrentMembershipAndEvent(ctx context.Context, userID id.UserID, roomID id.RoomID) (*types.MembershipTup, *types.Event, error)
+}
+
+// pduRoom is the room of a transaction's PDUs: the version they are verified with, empty for a room
+// unknown here, and whether this server is joined to it
+type pduRoom struct {
+	version string
+	joined  bool
+}
+
+// pduRooms looks up the room of each PDU of a transaction once
+type pduRooms struct {
+	ctx         context.Context
+	db          pduRoomLookups
+	serverName  string
+	createRooms bool
+	rooms       map[id.RoomID]pduRoom
+}
+
+func newPDURooms(ctx context.Context, db pduRoomLookups, serverName string, createRooms bool) *pduRooms {
+	return &pduRooms{
+		ctx:         ctx,
+		db:          db,
+		serverName:  serverName,
+		createRooms: createRooms,
+		rooms:       make(map[id.RoomID]pduRoom, 1),
+	}
+}
+
+// roomVersion returns the version of the PDU's room. A room without a record takes the version of
+// its create event, or for a leave of a local user, the version of the invite the leave answers.
+func (p *pduRooms) roomVersion(ev *types.Event) (string, error) {
+	room, found := p.rooms[ev.RoomID]
+	if !found {
+		stored, err := p.db.GetRoom(p.ctx, ev.RoomID)
+		if err != nil {
+			return "", err
+		} else if stored != nil {
+			room = pduRoom{version: stored.Version, joined: stored.LocalMembers > 0}
+		}
+		p.rooms[ev.RoomID] = room
+	}
+	if room.version != "" {
+		return room.version, nil
+	} else if ev.Type == event.StateCreate && p.createRooms {
+		// If no room, and this is a create event, and we're allowed to receive create
+		// events over federation - pull the room version from the event content.
+		room.version = gjson.GetBytes(ev.Content, "room_version").String()
+		p.rooms[ev.RoomID] = room
+		return room.version, nil
+	}
+	return p.invitedVersion(ev)
+}
+
+func (p *pduRooms) invitedVersion(ev *types.Event) (string, error) {
+	if ev.Type != event.StateMember || ev.StateKey == nil || ev.Membership() != event.MembershipLeave {
+		return "", nil
+	}
+	targetUserID := id.UserID(*ev.StateKey)
+	if targetUserID.Homeserver() != p.serverName {
+		return "", nil
+	}
+	membershipTup, membershipEv, err := p.db.GetCurrentMembershipAndEvent(p.ctx, targetUserID, ev.RoomID)
+	if err != nil || membershipTup == nil || membershipTup.Membership != event.MembershipInvite {
+		return "", err
+	}
+	return membershipEv.RoomVersion, nil
+}
+
+func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string, pdus []*types.Event) (*respTransaction, error) {
+	resp := respTransaction{make(map[id.EventID]respTransactionResult, len(pdus))}
+	txnRooms := newPDURooms(r.Context(), f.db.Rooms, f.config.ServerName, f.config.SecretSwitches.EnableFederatedSendRoomCreate)
 
 	// Run some pre-checks before we send the events to the database layer
+	roomToEvs := make(map[id.RoomID][]*types.Event, 5)
 	for _, ev := range pdus {
-		if roomVersions[ev.RoomID] == "" {
-			room, err := f.db.Rooms.GetRoom(r.Context(), ev.RoomID)
-			if err != nil {
-				return nil, err
-			} else if room == nil {
-				if ev.Type == event.StateCreate && f.config.SecretSwitches.EnableFederatedSendRoomCreate {
-					// If no room, and this is a create event, and we're allowed to receive create
-					// events over federation - pull the room version from the event content.
-					rmver := gjson.GetBytes(ev.Content, "room_version")
-					if rmver.Exists() {
-						roomVersions[ev.RoomID] = rmver.String()
-					}
-				}
-			} else {
-				roomVersions[ev.RoomID] = room.Version
-			}
-		}
-
-		if roomVersions[ev.RoomID] == "" {
-			// Edge case: this is a leave event rescinding a previously sent remote invite for a
-			// local user, so we don't know the room but we still need to handle the leave as an
-			// outlier so the target local user sees it.
-			if ev.Type == event.StateMember {
-				targetUserID := id.UserID(*ev.StateKey)
-				if targetUserID.Homeserver() == f.config.ServerName {
-					membershipTup, membershipEv, err := f.db.Rooms.GetUserMembershipAndEvent(r.Context(), targetUserID, ev.RoomID)
-					if err != nil {
-						return nil, err
-					} else if membershipTup != nil && membershipTup.Membership == event.MembershipInvite && membershipEv.Sender == ev.Sender {
-						// Set the romm version and flag the event as an outlier
-						roomVersions[ev.RoomID] = membershipEv.RoomVersion
-						ev.Outlier = true
-					}
-				}
-			}
-		}
-
-		if roomVersions[ev.RoomID] == "" {
+		roomVersion, err := txnRooms.roomVersion(ev)
+		if err != nil {
+			return nil, err
+		} else if roomVersion == "" {
 			// If we have no room version we can't calculate the reference hash,
 			// so we *silently* drop it (synapse + dendrite do this, spec unclear).
 			hlog.FromRequest(r).Warn().
@@ -329,129 +379,120 @@ func (f *FederationRoutes) processTransactionPDUs(r *http.Request, origin string
 				Msg("Silently dropping event from unknown room")
 			continue
 		}
-		ev.RoomVersion = roomVersions[ev.RoomID]
+		ev.RoomVersion = roomVersion
 
-		verifyErr, err := util.VerifyEvent(r.Context(), ev, f.keyStore)
+		verifiedEv, verifyErr, err := util.VerifyRemoteEvent(r.Context(), ev, f.keyStore)
 		if err != nil {
 			return nil, err
-		} else if errors.Is(verifyErr, types.ErrEventRedacted) {
-			redactedEv, err := ev.GetRedactedEvent()
-			if err != nil {
-				return nil, err
-			}
-			redactedEv.RoomVersion = roomVersions[ev.RoomID]
-			redactedEv.ID = ev.ID
-			verifyResults.Allowed = append(verifyResults.Allowed, redactedEv)
-			hlog.FromRequest(r).Warn().
-				Stringer("room_id", ev.RoomID).
-				Stringer("event_id", ev.ID).
-				Msg("Processing redacted event over federation")
 		} else if verifyErr != nil {
-			verifyResults.Rejected = append(verifyResults.Rejected, rooms.RejectedEvent{
-				Event: ev,
-				Error: verifyErr,
-			})
+			// https://spec.matrix.org/v1.14/server-server-api/#rejection
+			// "If an event in an incoming transaction is rejected, this should not cause the transaction request to be responded to with an error response."
+			resp.PDUs[ev.ID] = respTransactionResult{}
 			hlog.FromRequest(r).Err(verifyErr).
 				Stringer("room_id", ev.RoomID).
 				Stringer("event_id", ev.ID).
 				Msg("Federated event failed verification")
-		} else if ev.Outlier {
-			verifyResults.Outliers = append(verifyResults.Outliers, ev)
+			continue
+		}
+
+		if verifiedEv.Redacted {
 			hlog.FromRequest(r).Warn().
 				Stringer("room_id", ev.RoomID).
 				Stringer("event_id", ev.ID).
-				Msg("Processing outlier event over federation")
-		} else {
-			verifyResults.Allowed = append(verifyResults.Allowed, ev)
+				Msg("Processing redacted event over federation")
 		}
-	}
-
-	// Split up the PDUs by room
-	roomToEvs := make(map[id.RoomID][]*types.Event, 5)
-	for _, pdu := range verifyResults.Allowed {
-		if _, found := roomToEvs[pdu.RoomID]; !found {
-			roomToEvs[pdu.RoomID] = make([]*types.Event, 0)
-		}
-		roomToEvs[pdu.RoomID] = append(roomToEvs[pdu.RoomID], pdu)
+		roomToEvs[verifiedEv.RoomID] = append(roomToEvs[verifiedEv.RoomID], verifiedEv)
 	}
 
 	var wg sync.WaitGroup
-	resultsCh := make(chan *rooms.SendEventsResult, len(roomToEvs)+1) // +1 for any outliers result
+	resultsCh := make(chan *rooms.SendEventsResult, len(roomToEvs))
 
 	for roomID, evs := range roomToEvs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Now we have all the events we're going to try to send, fetch any missing
-			// prev or auth events so we can send those as well (or we'll reject).
-			var err error
-			evs, err = f.getMissingEventsForSendBatch(r.Context(), origin, roomID, roomVersions[roomID], evs)
-			if err != nil {
-				hlog.FromRequest(r).Err(err).Msg("Get missing events failed")
-				return
+		room := txnRooms.rooms[roomID]
+		wg.Go(func() {
+			log := hlog.FromRequest(r).With().Stringer("room_id", roomID).Logger()
+			// A panic leaves the room's events out of the response, as an error does
+			defer util.RecoverPanic(&log, nil)
+			var prevStates *rooms.GivenStates
+			// Events of a room this server is not in are only kept as outlier memberships, which
+			// need no missing events
+			if room.joined {
+				// Now we have all the events we're going to try to send, fetch any missing
+				// prev or auth events so we can send those as well (or we'll reject).
+				pulled, err := f.getMissingEventsForSendBatch(r.Context(), origin, roomID, room.version, evs)
+				if err != nil {
+					log.Err(err).Msg("Get missing events failed")
+					return
+				}
+				// Pulled events are older so go first, the send keeps the order of unrelated events
+				evs = slices.Concat(pulled, evs)
+				prevStates = f.getPrevEventStatesForSendBatch(r.Context(), origin, roomID, room.version, evs, pulled)
 			}
-			options := rooms.SendFederatedEventsOptions{}
-			results, err := f.db.SendFederatedEvents(r.Context(), roomID, evs, options)
+			results, err := f.db.SendFederatedEvents(r.Context(), roomID, evs, prevStates)
 			if err != nil {
 				// This is *BAD*, an unexpected error handling results for a room, we can't bail the
 				// request here as we'll poison other parallel room sends. So we just log and none
 				// of the events in question will be in the response.
 				// Does this make other servers angry? Will they retry those events?
-				hlog.FromRequest(r).Err(err).Msg("Sending federated events failed")
+				log.Err(err).Msg("Sending federated events failed")
 				return
 			}
 			resultsCh <- results
-		}()
-	}
-
-	if len(verifyResults.Outliers) > 0 {
-		// Spin up another goroutine to send any outliers
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			results := &rooms.SendEventsResult{
-				Allowed: make([]*types.Event, 0, len(verifyResults.Outliers)),
-			}
-			for _, ev := range verifyResults.Outliers {
-				if err := f.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), ev); err != nil {
-					hlog.FromRequest(r).Err(err).Msg("Sending federated outlier event failed")
-					continue
-				}
-				results.Allowed = append(results.Allowed, ev)
-			}
-			resultsCh <- results
-		}()
+		})
 	}
 
 	wg.Wait()
 	close(resultsCh)
-
-	resp := respTransaction{make(map[id.EventID]respTransactionResult, len(pdus))}
-
-	for _, rejected := range verifyResults.Rejected {
-		resp.PDUs[rejected.Event.ID] = respTransactionResult{
-			// https://spec.matrix.org/v1.14/server-server-api/#rejection
-			// "If an event in an incoming transaction is rejected, this should not cause the transaction request to be responded to with an error response."
-			// Error: rejected.Error.Error(),
-		}
-	}
 
 	for results := range resultsCh {
 		for _, allowed := range results.Allowed {
 			resp.PDUs[allowed.ID] = respTransactionResult{}
 		}
 		for _, rejected := range results.Rejected {
-			resp.PDUs[rejected.Event.ID] = respTransactionResult{
-				// As above
-				// Error: rejected.Error.Error(),
+			result := respTransactionResult{}
+			if errors.Is(rejected.Error, rooms.ErrEventDropped) {
+				// Not stored at all, unlike rejected events
+				result.Error = rejected.Error.Error()
+				hlog.FromRequest(r).Warn().
+					Err(rejected.Error).
+					Stringer("room_id", rejected.Event.RoomID).
+					Stringer("event_id", rejected.Event.ID).
+					Msg("Dropped federated event from batch")
 			}
+			resp.PDUs[rejected.Event.ID] = result
 		}
 	}
 
 	return &resp, nil
 }
 
+const (
+	// Prev events of a room's batch whose state is fetched from the sending server. Events citing
+	// the others are dropped, and the state fetched again with the next event citing them.
+	maxPrevEventStatesFetched = 10
+	// Events of a prev event's state fetched concurrently when too few are missing to fetch it whole
+	prevEventStatesFetchConcurrency = 5
+	// Both fetches fit in the minute a sending server typically waits for its transaction
+	getMissingEventsTimeout     = 20 * time.Second
+	prevEventStatesFetchTimeout = 30 * time.Second
+)
+
+// Keeps the events of the room, which another server may not stick to
+func eventsInRoom(ctx context.Context, evs []*types.Event, roomID id.RoomID) []*types.Event {
+	return slices.DeleteFunc(evs, func(ev *types.Event) bool {
+		if ev.RoomID == roomID {
+			return false
+		}
+		zerolog.Ctx(ctx).Warn().
+			Stringer("event_id", ev.ID).
+			Stringer("event_room_id", ev.RoomID).
+			Msg("Remote event is for another room, ignoring")
+		return true
+	})
+}
+
+// Pulls the events missing between the room's extremities and the batch events citing prev events
+// that are missing here, returning those pulled
 func (f *FederationRoutes) getMissingEventsForSendBatch(
 	ctx context.Context,
 	origin string,
@@ -459,70 +500,213 @@ func (f *FederationRoutes) getMissingEventsForSendBatch(
 	roomVersion string,
 	evs []*types.Event,
 ) ([]*types.Event, error) {
-	eventsWithMissingPrevs := make(map[id.EventID]struct{}, len(evs))
-	eventsWeHave := make(map[id.EventID]struct{}, len(evs))
-	// Add these events incase they reference each other
-	for _, ev := range evs {
-		eventsWeHave[ev.ID] = struct{}{}
+	missing, err := f.db.Rooms.GetMissingEventsRequest(ctx, roomID, evs)
+	if err != nil {
+		return nil, err
+	} else if len(missing.Missing) == 0 {
+		return nil, nil
 	}
-
-	// Find events that have one or more missing events
+	var latestIDs []id.EventID
 	for _, ev := range evs {
-		for _, prevID := range ev.PrevEventIDs {
-			if _, ok := eventsWeHave[prevID]; ok {
-				continue
-			} else if exists, err := f.db.Rooms.DoesEventExist(ctx, prevID); err != nil {
-				return nil, err
-			} else if exists {
-				eventsWeHave[prevID] = struct{}{}
-				continue
-			} else {
-				eventsWithMissingPrevs[ev.ID] = struct{}{}
-				break
-			}
+		if slices.ContainsFunc(ev.PrevEventIDs, func(prevID id.EventID) bool {
+			_, found := slices.BinarySearch(missing.Missing, prevID)
+			return found
+		}) {
+			latestIDs = append(latestIDs, ev.ID)
 		}
 	}
 
-	if len(eventsWithMissingPrevs) == 0 {
-		return evs, nil
-	}
-
-	// Now get the current room extremeties we know of, because it's possible we have none of the
-	// prev events and we need to tell the other HS where to stop searching.
-	roomExtremIDs, err := f.db.Rooms.GetRoomCurrentExtremEventIDs(ctx, roomID)
-	if err != nil {
-		return nil, err
-	}
-
+	ctx, cancel := context.WithTimeout(ctx, getMissingEventsTimeout)
+	defer cancel()
 	// TODO: paginate if this doesn't get everything
-	remoteEvs, err := f.fedclient.GetMissingEvents(ctx, &federation.ReqGetMissingEvents{
+	// Events from before this server's earliest timeline event, such as its join, are kept out of the
+	// timeline as Synapse does, and the state at them fetched instead
+	resp, err := f.fedclient.GetMissingEvents(ctx, &federation.ReqGetMissingEvents{
 		ServerName:     origin,
 		RoomID:         roomID,
-		EarliestEvents: roomExtremIDs,
-		LatestEvents:   slices.Collect(maps.Keys(eventsWithMissingPrevs)),
+		EarliestEvents: missing.Extremities,
+		LatestEvents:   latestIDs,
 		Limit:          f.config.Federation.MaxFetchMissingEvents,
+		MinDepth:       int(missing.MinDepth),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	for _, b := range remoteEvs.Events {
-		var ev types.Event
-		if err := json.Unmarshal(b, &ev); err != nil {
-			return nil, err
-		}
-		ev.RoomVersion = roomVersion
+	seenIDs := make(map[id.EventID]struct{}, len(evs)+len(resp.Events))
+	for _, ev := range evs {
+		seenIDs[ev.ID] = struct{}{}
+	}
+	remoteEvs, err := util.VerifyRemoteEvents(ctx, resp.Events, roomVersion, f.keyStore, seenIDs)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(eventsInRoom(ctx, remoteEvs, roomID), func(ev *types.Event) bool {
+		// Not every server honours min_depth
+		return ev.Depth < missing.MinDepth
+	}), nil
+}
 
-		if verifyErr, err := util.VerifyEvent(ctx, &ev, f.keyStore); err != nil {
-			return nil, err
-		} else if verifyErr != nil {
-			zerolog.Ctx(ctx).Warn().Err(verifyErr).Msg("Missing event failed verification, ignoring")
-			continue
-		}
+func (f *FederationRoutes) getPrevEventStatesForSendBatch(
+	ctx context.Context,
+	origin string,
+	roomID id.RoomID,
+	roomVersion string,
+	evs, pulled []*types.Event,
+) *rooms.GivenStates {
+	log := zerolog.Ctx(ctx).With().
+		Stringer("room_id", roomID).
+		Str("origin", origin).
+		Logger()
 
-		evs = append(evs, &ev)
+	if len(pulled) == 0 {
+		return nil
+	}
+	prevIDs, err := f.db.Rooms.GetPrevEventsWithoutState(ctx, roomID, evs, pulled)
+	if err != nil {
+		log.Err(err).Msg("Failed to get prev events without state")
+		return nil
+	} else if len(prevIDs) == 0 {
+		return nil
+	} else if len(prevIDs) > maxPrevEventStatesFetched {
+		log.Warn().
+			Int("prev_events", len(prevIDs)).
+			Msg("Too many prev events without state, fetching the state at some of them")
+		prevIDs = prevIDs[:maxPrevEventStatesFetched]
 	}
 
-	util.SortEventList(evs)
-	return evs, nil
+	ctx, cancel := context.WithTimeout(ctx, prevEventStatesFetchTimeout)
+	defer cancel()
+
+	known := make(map[id.EventID]struct{}, len(evs))
+	for _, ev := range evs {
+		known[ev.ID] = struct{}{}
+	}
+	prevStates := &rooms.GivenStates{BeforePrevs: make(map[id.EventID][]id.EventID, len(prevIDs))}
+	for _, prevID := range prevIDs {
+		stateIDs, fetched, err := f.fetchPrevEventState(ctx, origin, roomID, roomVersion, prevID, known)
+		if err != nil {
+			log.Warn().Err(err).Stringer("prev_event_id", prevID).Msg("Failed to fetch the state at prev event")
+			continue
+		}
+		prevStates.BeforePrevs[prevID] = stateIDs
+		prevStates.Events = append(prevStates.Events, fetched...)
+		for _, ev := range fetched {
+			known[ev.ID] = struct{}{}
+		}
+	}
+	return prevStates
+}
+
+func (f *FederationRoutes) fetchPrevEventState(
+	ctx context.Context,
+	origin string,
+	roomID id.RoomID,
+	roomVersion string,
+	prevID id.EventID,
+	known map[id.EventID]struct{},
+) ([]id.EventID, []*types.Event, error) {
+	stateIDs, err := f.fedclient.GetStateIDs(ctx, origin, roomID, prevID)
+	if err != nil {
+		return nil, nil, err
+	} else if stateIDs == nil {
+		return nil, nil, fmt.Errorf("null state_ids response for %s", prevID)
+	}
+	wanted := slices.DeleteFunc(
+		slices.Concat([]id.EventID{prevID}, stateIDs.PDUs, stateIDs.AuthChain),
+		func(eventID id.EventID) bool {
+			_, found := known[eventID]
+			return found
+		},
+	)
+	slices.Sort(wanted)
+	missing, err := f.db.Rooms.GetUnstoredEventIDs(ctx, slices.Compact(wanted))
+	if err != nil {
+		return nil, nil, err
+	}
+	unfetched := make(map[id.EventID]struct{}, len(missing))
+	for _, eventID := range missing {
+		unfetched[eventID] = struct{}{}
+	}
+
+	var pdus []federation.PDU
+	// Fetching each event has a lot of overhead, so as Synapse does the whole state is fetched when
+	// many are missing
+	if len(missing)*10 >= len(stateIDs.PDUs)+len(stateIDs.AuthChain) {
+		resp, err := f.fedclient.GetState(ctx, origin, roomID, prevID)
+		if err != nil {
+			return nil, nil, err
+		} else if resp == nil {
+			return nil, nil, fmt.Errorf("null state response for %s", prevID)
+		}
+		pdus = slices.Concat(resp.PDUs, resp.AuthChain)
+		if _, found := unfetched[prevID]; found {
+			pdus = append(pdus, f.fetchEvents(ctx, origin, []id.EventID{prevID})...)
+		}
+	} else {
+		pdus = f.fetchEvents(ctx, origin, missing)
+	}
+
+	pdus = wantedPDUs(ctx, pdus, roomVersion, unfetched)
+	remoteEvs, err := util.VerifyRemoteEvents(ctx, pdus, roomVersion, f.keyStore, make(map[id.EventID]struct{}))
+	if err != nil {
+		return nil, nil, err
+	}
+	fetched := make([]*types.Event, 0, len(missing))
+	for _, ev := range eventsInRoom(ctx, remoteEvs, roomID) {
+		if _, found := unfetched[ev.ID]; found {
+			delete(unfetched, ev.ID)
+			fetched = append(fetched, ev)
+		}
+	}
+	if _, found := unfetched[prevID]; found {
+		return nil, nil, fmt.Errorf("failed to fetch prev event %s", prevID)
+	} else if len(unfetched) > 0 {
+		zerolog.Ctx(ctx).Warn().
+			Stringer("prev_event_id", prevID).
+			Int("events", len(unfetched)).
+			Msg("Failed to fetch some events of the state at prev event")
+	}
+	return stateIDs.PDUs, fetched, nil
+}
+
+// Keeps the PDUs of the wanted events, told apart by reference hash before any is verified
+func wantedPDUs(ctx context.Context, pdus []federation.PDU, roomVersion string, wanted map[id.EventID]struct{}) []federation.PDU {
+	kept := make([]federation.PDU, 0, len(wanted))
+	for _, pdu := range pdus {
+		ev := &types.Event{RoomVersion: roomVersion}
+		var eventID id.EventID
+		err := json.Unmarshal(pdu, ev)
+		if err == nil {
+			eventID, err = util.GetEventReferenceHash(ev)
+		}
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Skipping fetched event that cannot be parsed")
+		} else if _, found := wanted[eventID]; found {
+			kept = append(kept, pdu)
+		}
+	}
+	return kept
+}
+
+// Fetches events from a server one request each, skipping any that fail
+func (f *FederationRoutes) fetchEvents(ctx context.Context, origin string, eventIDs []id.EventID) []federation.PDU {
+	pdus := make([][]federation.PDU, len(eventIDs))
+	limit := make(chan struct{}, prevEventStatesFetchConcurrency)
+	var wg sync.WaitGroup
+	for i, eventID := range eventIDs {
+		limit <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-limit }()
+			defer util.RecoverPanic(zerolog.Ctx(ctx), nil)
+			resp, err := f.fedclient.GetEvent(ctx, origin, eventID)
+			if err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Stringer("event_id", eventID).Msg("Failed to fetch event")
+				return
+			}
+			pdus[i] = resp.PDUs
+		})
+	}
+	wg.Wait()
+	return slices.Concat(pdus...)
 }

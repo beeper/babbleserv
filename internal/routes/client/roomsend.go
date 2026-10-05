@@ -19,6 +19,10 @@ func (c *ClientRoutes) SendRoomStateEvent(w http.ResponseWriter, r *http.Request
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 	evType := util.EventTypeFromRequestURLParam(r, "eventType")
 	stateKey := util.StateKeyFromRequestURLParam(r, "stateKey")
+	if evType == event.StateCreate {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, "Create events can only be sent by createRoom")
+		return
+	}
 
 	content, respErr := util.ParseRequestJSON[map[string]any](r)
 	if respErr != nil {

@@ -72,6 +72,13 @@ type BabbleConfig struct {
 		// Default: 3h
 		CompactRoomNotificationsTimeout time.Duration `yaml:"compactRoomNotificationsTimeout"`
 
+		// Most initial_state events a create room request may carry, all published with the create
+		// event
+		// Default: 100
+		MaxCreateRoomInitialState int `yaml:"maxCreateRoomInitialState"`
+		// Default: 1000
+		MaxCreateRoomInvites int `yaml:"maxCreateRoomInvites"`
+
 		StateBudget stateBudgetConfig `yaml:"stateBudget"`
 	} `yaml:"rooms"`
 
@@ -196,11 +203,20 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 		cfg.Transient.PresenceTimeoutCheckInterval = time.Minute
 	}
 
+	if cfg.Rooms.DefaultVersion == "" {
+		cfg.Rooms.DefaultVersion = "11"
+	}
 	if cfg.Rooms.MaxNotificationsPerUserRoom == 0 {
 		cfg.Rooms.MaxNotificationsPerUserRoom = 100
 	}
 	if cfg.Rooms.CompactRoomNotificationsTimeout == 0 {
 		cfg.Rooms.CompactRoomNotificationsTimeout = 3 * time.Hour
+	}
+	if cfg.Rooms.MaxCreateRoomInitialState <= 0 {
+		cfg.Rooms.MaxCreateRoomInitialState = 100
+	}
+	if cfg.Rooms.MaxCreateRoomInvites <= 0 {
+		cfg.Rooms.MaxCreateRoomInvites = 1000
 	}
 	if cfg.Rooms.StateBudget.StagingBytes <= 0 {
 		cfg.Rooms.StateBudget.StagingBytes = 5_000_000
