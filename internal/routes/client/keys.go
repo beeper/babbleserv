@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -322,16 +321,18 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 
 	// Third pass: now we've confirmed all target objects both a) exist/match and b) have valid
 	// signatures, we can safely store those signatures.
-	signaturesToStore := make(map[id.UserID]map[id.KeyID]signatures.Signatures, len(req))
+	targets := make([]types.KeySignatureTarget, 0, len(req))
 	for targetUserID, targetObjects := range req {
 		for targetKey, targetObject := range targetObjects {
-			if _, ok := signaturesToStore[targetUserID]; !ok {
-				signaturesToStore[targetUserID] = make(map[id.KeyID]signatures.Signatures, 1)
-			}
-			signaturesToStore[targetUserID][id.KeyID(targetKey)] = targetObject.Signatures
+			targets = append(targets, types.KeySignatureTarget{
+				UserID:     targetUserID,
+				KeyID:      id.KeyID(targetKey),
+				DeviceID:   targetObject.DeviceID,
+				Signatures: targetObject.Signatures,
+			})
 		}
 	}
-	if err := c.db.Accounts.StoreKeySignatures(r.Context(), signaturesToStore); err != nil {
+	if _, err := c.db.Accounts.StoreKeySignatures(r.Context(), u.UserID, targets); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}

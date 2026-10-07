@@ -205,7 +205,7 @@ func (a *AccountsDatabase) LoginWithPassword(
 			resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
 		}
 
-		if _, err = a.devices.TxnGetOrCreateDevice(txn, userID, deviceID, initialDeviceDisplayName); err != nil {
+		if err := a.txnGetOrCreateDevice(txn, userID, deviceID, initialDeviceDisplayName); err != nil {
 			return resp, err
 		}
 
@@ -256,7 +256,7 @@ func (a *AccountsDatabase) RegisterWithPasswordHash(
 			if expiry := a.config.Accounts.RefreshAccessTokenExpire; withRefreshToken && expiry > 0 {
 				resp.ExpiresInMS = max(expiry.Milliseconds(), 1)
 			}
-			if _, err := a.devices.TxnGetOrCreateDevice(txn, resp.UserID, deviceID, initialDeviceDisplayName); err != nil {
+			if err := a.txnGetOrCreateDevice(txn, resp.UserID, deviceID, initialDeviceDisplayName); err != nil {
 				return resp, err
 			}
 		}

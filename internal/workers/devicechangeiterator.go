@@ -7,7 +7,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exerrors"
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
-	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
@@ -249,70 +247,21 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 		}
 	}
 
-	// Lazy getters for user XS + device keys, needed if we're notifying servers not local users
-	getCrossSigningKeys := util.Memoize(func() (*types.UserCrossSigningKeys, error) {
-		// Note requestUserID="" here such that we only see/push the "public" view
-		return d.db.Accounts.GetUserCrossSigningKeys(d.ctx, change.UserID, "")
-	})
-	getDeviceKeys := util.Memoize(func() (*mautrix.DeviceKeys, error) {
-		// As above, requestUserID=""
-		return d.db.Accounts.GetDeviceKeys(d.ctx, change.UserID, change.DeviceID, "")
-	})
-	getDevice := util.Memoize(func() (*types.Device, error) {
-		return d.db.Accounts.GetUserDevice(d.ctx, change.UserID, change.DeviceID)
-	})
-
-	for serverName := range remoteServerNames {
-		// Target is the server, not user, but we smuggle such updates through to-device
-		// internally (see the DeviceChangeIterator).
-		serverUserID := id.UserID("@:" + serverName)
-
-		if change.DeviceID == "*" {
-			// If change.DeviceID == "*" cross signing keys have been updated, we must send them in
-			// a m.signing_key_update EDU to the server.
-			keys, err := getCrossSigningKeys()
-			if err != nil {
-				return err
-			} else if keys == nil {
-				d.log.Warn().Msg("Got empty cross signing keys for device change, ignoring")
-				continue
+	if len(remoteServerNames) > 0 {
+		eduType, content, err := d.remoteDeviceChangeEDU(change)
+		if err != nil {
+			return err
+		}
+		if content != nil {
+			for serverName := range remoteServerNames {
+				// Target is the server, not user, but we smuggle such updates through to-device
+				// internally (see the DeviceChangeIterator).
+				tds = append(tds, &types.ToDevice{
+					Type:    eduType,
+					UserID:  id.UserID("@:" + serverName),
+					Content: content,
+				})
 			}
-			content := types.SigningKeyUpdateEDUContent{
-				UserID:      change.UserID,
-				MasterKey:   keys.Master.CrossSigningKeys,
-				SelfSigning: keys.SelfSigning.CrossSigningKeys,
-			}
-			tds = append(tds, &types.ToDevice{
-				Type:    types.BabbleservRemoteSigningKeyUpdate,
-				UserID:  serverUserID,
-				Content: exerrors.Must(json.Marshal(content)),
-			})
-		} else {
-			// Device list update, we must send the device and keys in a m.device_list_update EDU to
-			// the server.
-			keys, err := getDeviceKeys()
-			if err != nil {
-				return err
-			}
-			content := types.DeviceListUpdateEDUContent{
-				UserID:     change.UserID,
-				DeviceID:   change.DeviceID,
-				DeviceKeys: keys,
-			}
-
-			// Check the device exists, if not this is a deleted notification
-			device, err := getDevice()
-			if err != nil {
-				return err
-			} else if device == nil {
-				content.Deleted = true
-			}
-
-			tds = append(tds, &types.ToDevice{
-				Type:    types.BabbleservRemoteDeviceListUpdate,
-				UserID:  serverUserID,
-				Content: exerrors.Must(json.Marshal(content)),
-			})
 		}
 	}
 
@@ -321,4 +270,55 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 		LockTxnRefresh: lock.TxnRefresh,
 	})
 	return err
+}
+
+// A `*` change means the cross-signing keys were updated, sent as m.signing_key_update; any other
+// change is one device, sent as m.device_list_update. Nil content when there is nothing to send.
+func (d *DeviceChangeIterator) remoteDeviceChangeEDU(change types.UserDeviceChange) (event.Type, json.RawMessage, error) {
+	if change.DeviceID != "*" {
+		update, err := d.db.Accounts.GetDeviceListUpdate(d.ctx, change.UserID, change.DeviceID)
+		if err != nil {
+			return event.Type{}, nil, err
+		}
+		content := deviceListUpdateContent(change.UserID, change.DeviceID, update, change.Stream)
+		return types.BabbleservRemoteDeviceListUpdate, exerrors.Must(json.Marshal(content)), nil
+	}
+
+	// requestUserID="" such that we only see/push the "public" view
+	keys, err := d.db.Accounts.GetUserCrossSigningKeys(d.ctx, change.UserID, "")
+	if err != nil {
+		return event.Type{}, nil, err
+	} else if keys == nil {
+		d.log.Warn().Msg("Got empty cross signing keys for device change, ignoring")
+		return event.Type{}, nil, nil
+	}
+	content := types.SigningKeyUpdateEDUContent{
+		UserID:      change.UserID,
+		MasterKey:   keys.Master.CrossSigningKeys,
+		SelfSigning: keys.SelfSigning.CrossSigningKeys,
+	}
+	return types.BabbleservRemoteSigningKeyUpdate, exerrors.Must(json.Marshal(content)), nil
+}
+
+func deviceListUpdateContent(
+	userID id.UserID,
+	deviceID id.DeviceID,
+	update types.LocalDeviceListUpdate,
+	stream *types.DeviceListStream,
+) types.DeviceListUpdateEDUContent {
+	content := types.DeviceListUpdateEDUContent{
+		UserID:     userID,
+		DeviceID:   deviceID,
+		StreamID:   update.Version,
+		DeviceKeys: update.Keys,
+		Deleted:    update.Device == nil,
+	}
+	if stream != nil {
+		content.StreamID = stream.StreamID
+		content.PrevID = []int64{stream.PrevID}
+	}
+	if update.Device != nil {
+		content.DeviceDisplayName = update.Device.DisplayName
+	}
+	return content
 }
