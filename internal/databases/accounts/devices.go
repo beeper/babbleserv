@@ -33,6 +33,109 @@ func (a *AccountsDatabase) StoreDeviceChange(ctx context.Context, userID id.User
 	return err
 }
 
+func (a *AccountsDatabase) txnStoreDeviceListChange(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, index uint16) error {
+	stream, err := a.users.TxnAllocateDeviceListVersion(txn, userID)
+	if err != nil {
+		return err
+	}
+	a.devices.TxnStoreDeviceListChange(txn, userID, deviceID, tuple.IncompleteVersionstamp(index), stream)
+	return nil
+}
+
+func (a *AccountsDatabase) txnGetOrCreateDevice(
+	txn fdb.Transaction,
+	userID id.UserID,
+	deviceID id.DeviceID,
+	initialDisplayName string,
+) error {
+	_, created, err := a.devices.TxnGetOrCreateDevice(txn, userID, deviceID, initialDisplayName)
+	if err != nil || !created {
+		return err
+	}
+	return a.txnStoreDeviceListChange(txn, userID, deviceID, 0)
+}
+
+func (a *AccountsDatabase) GetDeviceListUpdate(
+	ctx context.Context,
+	userID id.UserID,
+	deviceID id.DeviceID,
+) (types.LocalDeviceListUpdate, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (types.LocalDeviceListUpdate, error) {
+		var update types.LocalDeviceListUpdate
+		getUser, err := a.users.TxnGetLocalUserFuture(txn, userID)
+		if err != nil {
+			return update, err
+		}
+		device, keys, err := a.devices.TxnGetDeviceWithKeys(txn, userID, deviceID)
+		if err != nil {
+			return update, err
+		}
+		user, err := getUser()
+		if err != nil {
+			return update, err
+		} else if user == nil {
+			return update, fmt.Errorf("%w: %s", types.ErrUserNotFound, userID)
+		}
+
+		update.Version = user.DeviceListVersion
+		update.Device = device
+		update.Keys = keys
+		if keys == nil {
+			return update, nil
+		}
+
+		deviceKeyID := id.KeyID(deviceID)
+		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, []id.KeyID{deviceKeyID})
+		update.Keys.Signatures = withOwnerSignatures(update.Keys.Signatures, userID, ownerSignatures[deviceKeyID])
+		return update, nil
+	})
+}
+
+// Nil when the local user does not exist
+func (a *AccountsDatabase) GetLocalUserDevicesSnapshot(ctx context.Context, userID id.UserID) (*types.LocalDeviceSnapshot, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*types.LocalDeviceSnapshot, error) {
+		user, err := a.users.TxnGetLocalUser(txn, userID)
+		if err != nil || user == nil {
+			return nil, err
+		}
+		devices, err := a.devices.TxnGetUserDevicesWithKeys(txn, userID)
+		if err != nil {
+			return nil, err
+		}
+		crossSigningKeys, err := a.users.TxnGetUserCrossSigningKeys(txn, userID)
+		if err != nil {
+			return nil, err
+		}
+
+		keyIDs := make([]id.KeyID, 0, len(devices)+2)
+		for _, device := range devices {
+			if device.Keys != nil {
+				keyIDs = append(keyIDs, id.KeyID(device.Device.ID))
+			}
+		}
+		if crossSigningKeys != nil {
+			keyIDs = append(keyIDs, crossSigningKeys.Master.KeyID(), crossSigningKeys.SelfSigning.KeyID())
+		}
+		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, keyIDs)
+
+		for _, device := range devices {
+			if device.Keys != nil {
+				device.Keys.Signatures = withOwnerSignatures(device.Keys.Signatures, userID, ownerSignatures[id.KeyID(device.Device.ID)])
+			}
+		}
+
+		snapshot := &types.LocalDeviceSnapshot{
+			Version: user.DeviceListVersion,
+			Devices: devices,
+		}
+		if crossSigningKeys != nil {
+			snapshot.MasterKey = ownerSignedCrossSigningKey(crossSigningKeys.Master, userID, ownerSignatures)
+			snapshot.SelfSigningKey = ownerSignedCrossSigningKey(crossSigningKeys.SelfSigning, userID, ownerSignatures)
+		}
+		return snapshot, nil
+	})
+}
+
 func (a *AccountsDatabase) GetUserDevice(
 	ctx context.Context,
 	userID id.UserID,
@@ -86,10 +189,9 @@ func (a *AccountsDatabase) UpdateUserDevice(
 		device.DisplayName = displayName
 		a.devices.TxnStoreDevice(txn, userID, device)
 
-		// And send a device change so this gets sent out to relevant users/servers
-		version := tuple.IncompleteVersionstamp(0)
-		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
-
+		if err := a.txnStoreDeviceListChange(txn, userID, deviceID, 0); err != nil {
+			return false, err
+		}
 		return true, nil
 	})
 
@@ -160,8 +262,7 @@ func (a *AccountsDatabase) txnDeleteUserDevices(txn fdb.Transaction, userID id.U
 			return false, err
 		}
 		a.devices.TxnDeleteDevice(txn, userID, deviceID)
-		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, tuple.IncompleteVersionstamp(uint16(index)))
-		if err := a.users.TxnIncrementUserDeviceListVersion(txn, userID); err != nil {
+		if err := a.txnStoreDeviceListChange(txn, userID, deviceID, uint16(index)); err != nil {
 			return false, err
 		}
 		changed = true

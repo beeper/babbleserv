@@ -7,7 +7,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"maunium.net/go/mautrix"
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -16,7 +16,6 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
-	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
@@ -274,35 +273,27 @@ func (e *DeviceJoinEventIterator) remoteDeviceChangesForJoin(roomID id.RoomID, j
 		return nil, nil
 	}
 
-	devices, err := e.db.Accounts.GetUserDevices(e.ctx, joiner)
-	if err != nil {
+	snapshot, err := e.db.Accounts.GetLocalUserDevicesSnapshot(e.ctx, joiner)
+	if err != nil || snapshot == nil {
 		return nil, err
 	}
-	getDeviceKeys := util.MemoizeMap(func(k id.DeviceID) (*mautrix.DeviceKeys, error) {
-		// As above, requestUserID=""
-		return e.db.Accounts.GetDeviceKeys(e.ctx, joiner, k, "")
-	}, 10)
 
-	tds := make([]*types.ToDevice, 0, len(servers)*len(devices))
+	contents := make([]json.RawMessage, len(snapshot.Devices))
+	for i, d := range snapshot.Devices {
+		update := types.LocalDeviceListUpdate{Version: snapshot.Version, Device: &d.Device, Keys: d.Keys}
+		contents[i] = exerrors.Must(json.Marshal(deviceListUpdateContent(joiner, d.Device.ID, update, nil)))
+	}
+
+	tds := make([]*types.ToDevice, 0, len(servers)*len(contents))
 	for _, server := range servers {
 		// Target is the server, not user, but we smuggle such updates through to-device
 		// internally (see the DeviceChangeIterator).
 		serverUserID := id.UserID("@:" + server)
-		for _, d := range devices {
-			keys, err := getDeviceKeys(d.ID)
-			if err != nil {
-				return nil, err
-			}
-			content := types.DeviceListUpdateEDUContent{
-				UserID:     joiner,
-				DeviceID:   d.ID,
-				DeviceKeys: keys,
-			}
-			b, _ := json.Marshal(content)
+		for _, content := range contents {
 			tds = append(tds, &types.ToDevice{
 				Type:    types.BabbleservRemoteDeviceListUpdate,
 				UserID:  serverUserID,
-				Content: b,
+				Content: content,
 			})
 		}
 	}

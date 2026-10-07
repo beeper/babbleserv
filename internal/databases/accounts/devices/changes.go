@@ -16,11 +16,42 @@ func (d *DevicesDirectory) keyForDeviceChange(version tuple.Versionstamp) fdb.Ke
 	return key
 }
 
+func deviceChangeValue(userID id.UserID, deviceID id.DeviceID, stream *types.DeviceListStream) tuple.Tuple {
+	if stream == nil {
+		return tuple.Tuple{userID.String(), deviceID.String()}
+	}
+	return tuple.Tuple{userID.String(), deviceID.String(), stream.StreamID, stream.PrevID}
+}
+
+func deviceChangeFromTuples(keyTup, valueTup tuple.Tuple) types.UserDeviceChange {
+	change := types.UserDeviceChange{
+		Version: keyTup[0].(tuple.Versionstamp),
+		UserDevice: types.UserDevice{
+			UserID:   id.UserID(valueTup[0].(string)),
+			DeviceID: id.DeviceID(valueTup[1].(string)),
+		},
+	}
+	if len(valueTup) == 4 {
+		change.Stream = &types.DeviceListStream{
+			StreamID: valueTup[2].(int64),
+			PrevID:   valueTup[3].(int64),
+		}
+	}
+	return change
+}
+
 func (d *DevicesDirectory) TxnStoreDeviceChange(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, version tuple.Versionstamp) {
-	txn.SetVersionstampedKey(
-		d.keyForDeviceChange(version),
-		tuple.Tuple{userID.String(), deviceID.String()}.Pack(),
-	)
+	txn.SetVersionstampedKey(d.keyForDeviceChange(version), deviceChangeValue(userID, deviceID, nil).Pack())
+}
+
+func (d *DevicesDirectory) TxnStoreDeviceListChange(
+	txn fdb.Transaction,
+	userID id.UserID,
+	deviceID id.DeviceID,
+	version tuple.Versionstamp,
+	stream types.DeviceListStream,
+) {
+	txn.SetVersionstampedKey(d.keyForDeviceChange(version), deviceChangeValue(userID, deviceID, &stream).Pack())
 }
 
 // Remove any device changes from zero through to and including toVersion
@@ -45,13 +76,7 @@ func (d *DevicesDirectory) TxnPaginateDeviceChanges(
 		}
 		keyTup, _ := d.deviceChanges.Unpack(kv.Key)
 		valueTup, _ := tuple.Unpack(kv.Value)
-		ids = append(ids, types.UserDeviceChange{
-			Version: keyTup[0].(tuple.Versionstamp),
-			UserDevice: types.UserDevice{
-				UserID:   id.UserID(valueTup[0].(string)),
-				DeviceID: id.DeviceID(valueTup[1].(string)),
-			},
-		})
+		ids = append(ids, deviceChangeFromTuples(keyTup, valueTup))
 	}
 
 	return ids, nil
