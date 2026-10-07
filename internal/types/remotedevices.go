@@ -21,7 +21,7 @@ const (
 )
 
 // RemoteDevice is a remote user's device as the cache stores it. Keys is canonical JSON without
-// unsigned and with only the owner's signatures, nil for a device without E2E keys.
+// unsigned, nil for a device without E2E keys.
 type RemoteDevice struct {
 	DisplayName string
 	Keys        json.RawMessage
