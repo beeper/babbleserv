@@ -97,18 +97,22 @@ func (a *AccountsDatabase) PublishRemoteDeviceSnapshot(
 	snapshot *types.RemoteDeviceSnapshot,
 	checkWorkerLock func(fdb.Transaction),
 ) (bool, error) {
-	published, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
+	type publishOutcome struct {
+		published bool
+		notify    bool
+	}
+	outcome, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (publishOutcome, error) {
 		checkWorkerLock(txn)
-		published, err := a.remotedevices.TxnPublishSnapshot(txn, job, snapshot, time.Now().UTC())
-		if err == nil && published {
+		published, notify, err := a.remotedevices.TxnPublishSnapshot(txn, job, snapshot, time.Now().UTC())
+		if err == nil && notify {
 			a.devices.TxnStoreDeviceChange(txn, job.UserID, id.DeviceID("*"), tuple.IncompleteVersionstamp(0))
 		}
-		return published, err
+		return publishOutcome{published: published, notify: notify}, err
 	})
-	if err == nil && published {
+	if err == nil && outcome.notify {
 		a.notifier.SendChange(notifier.Change{UserIDs: []id.UserID{job.UserID}})
 	}
-	return published, err
+	return outcome.published, err
 }
 
 // GetRemoteDeviceCaches reads each user's cache in a transaction of its own, since a snapshot may

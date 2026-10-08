@@ -27,6 +27,9 @@ type meta struct {
 	StreamID    *int64 `msgpack:"sid,omitempty"`
 	DeviceCount int    `msgpack:"dct"`
 	AcceptSeq   int64  `msgpack:"asq"`
+	// Stream ID of the last update local clients were told of while there was no snapshot to apply it
+	// to; a snapshot published at it tells them nothing new
+	NotifiedStreamID *int64 `msgpack:"nsid,omitempty"`
 }
 
 func (m meta) cached() bool {
@@ -139,4 +142,5 @@ func (r *RemoteDevicesDirectory) txnClearData(txn fdb.Transaction, userID id.Use
 	txn.ClearRange(r.rangeForSigningKeys(userID))
 	m.StreamID = nil
 	m.DeviceCount = 0
+	m.NotifiedStreamID = nil
 }

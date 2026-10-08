@@ -24,7 +24,6 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
-	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
@@ -101,157 +100,35 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 	util.ResponseJSON(w, r, http.StatusOK, resp)
 }
 
+const remoteDeviceIngestConcurrency = 4
+
 func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 
-	// Group edus by type
 	edusByType := make(map[types.EDUType][]*types.EDU, 3)
 	for _, edu := range edus {
-		edusByType[edu.Type] = append(edusByType[edu.Type], edu)
+		if edu != nil {
+			edusByType[edu.Type] = append(edusByType[edu.Type], edu)
+		}
 	}
 
 	var wg sync.WaitGroup
-
 	for eduType, edus := range edusByType {
 		wg.Go(func() {
 			defer util.RecoverPanic(log, nil)
 
 			switch eduType {
-			case types.EDUTypeDeviceListUpdate:
-				for _, edu := range edus {
-					var content types.DeviceListUpdateEDUContent
-					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Err(err).Msg("Failed to unmarshal m.device_list_update content")
-						continue
-					} else if !checkEDUOrigin(log, origin, eduType, content.UserID) {
-						continue
-					}
-					if err := f.db.Accounts.StoreDeviceChange(r.Context(), content.UserID, content.DeviceID); err != nil {
-						log.Err(err).Msg("Failed to store remote device change")
-						continue
-					}
-					f.notifiers.Accounts.SendChange(notifier.Change{
-						UserIDs: []id.UserID{content.UserID},
-					})
-					log.Debug().
-						Str("user_id", content.UserID.String()).
-						Str("device_id", content.DeviceID.String()).
-						Msg("Processed remote device list update")
-
-					// TODO: store the keys! Check streamID! Bump user device list version!
-				}
-
-			case types.EDUTypeSigningKeyUpdate:
-				for _, edu := range edus {
-					var content types.SigningKeyUpdateEDUContent
-					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Err(err).Msg("Failed to unmarshal m.signing_key_update content")
-						continue
-					} else if !checkEDUOrigin(log, origin, eduType, content.UserID) {
-						continue
-					}
-					if err := f.db.Accounts.StoreDeviceChange(r.Context(), content.UserID, "*"); err != nil {
-						log.Err(err).Msg("Failed to store remote device change")
-						continue
-					}
-					f.notifiers.Accounts.SendChange(notifier.Change{
-						UserIDs: []id.UserID{content.UserID},
-					})
-					log.Debug().
-						Str("user_id", content.UserID.String()).
-						Msg("Processed remote signing key update")
-
-				}
+			case types.EDUTypeDeviceListUpdate, types.EDUTypeSigningKeyUpdate:
+				f.processTransactionDeviceListEDUs(r, origin, eduType, edus)
 
 			case types.EDUTypeReceipt:
 				// TODO
 
 			case types.EDUTypePresence:
-				for _, edu := range edus {
-					var content types.PresenceEDUContent
-					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Warn().Err(err).Msg("Ignoring invalid m.presence content")
-						continue
-					}
-					for _, presenceItem := range content.Push {
-						if !checkEDUOrigin(log, origin, eduType, presenceItem.UserID) {
-							continue
-						}
-						if localpart, _, err := presenceItem.UserID.ParseAndValidateRelaxed(); err != nil || localpart == "" ||
-							presenceItem.LastActiveAgo < 0 ||
-							presenceItem.LastActiveAgo > int64(math.MaxInt64/time.Millisecond) ||
-							(presenceItem.Presence != event.PresenceOnline &&
-								presenceItem.Presence != event.PresenceOffline &&
-								presenceItem.Presence != event.PresenceUnavailable) {
-							log.Warn().Stringer("user_id", presenceItem.UserID).
-								Msg("Ignoring invalid m.presence EDU item")
-							continue
-						}
-						// Calculate last active time from last_active_ago
-						lastActive := time.Now()
-						if presenceItem.LastActiveAgo > 0 {
-							lastActive = lastActive.Add(-time.Duration(presenceItem.LastActiveAgo) * time.Millisecond)
-						}
-
-						presence := &types.Presence{
-							UserID:     presenceItem.UserID,
-							Presence:   presenceItem.Presence,
-							Message:    presenceItem.StatusMsg,
-							LastActive: lastActive,
-						}
-
-						if err := f.db.Transient.UpdateUserPresence(r.Context(), presenceItem.UserID, presence); err != nil {
-							log.Err(err).
-								Str("user_id", presenceItem.UserID.String()).
-								Msg("Failed to store remote presence")
-							continue
-						}
-						log.Debug().
-							Str("user_id", presenceItem.UserID.String()).
-							Str("presence", string(presenceItem.Presence)).
-							Msg("Processed remote presence update")
-					}
-				}
+				f.processTransactionPresenceEDUs(r, origin, eduType, edus)
 
 			case types.EDUTypeToDevice:
-				tds := make([]*types.ToDevice, 0, len(edus))
-				for _, edu := range edus {
-					var content types.ToDeviceEDUContent
-					if err := json.Unmarshal(edu.Content, &content); err != nil {
-						log.Err(err).Msg("Failed to unmarshal m.direct_to_device content")
-						continue
-					} else if !checkEDUOrigin(log, origin, eduType, content.Sender) {
-						continue
-					}
-
-					for userID, deviceIDToContent := range content.Messages {
-						if userID.Homeserver() != f.config.ServerName {
-							log.Error().
-								Str("user_id", userID.String()).
-								Msg("Ignoring to-device for nonlocal user")
-							continue
-						}
-						for deviceID, contentB := range deviceIDToContent {
-							cnt, err := json.Marshal(contentB)
-							if err != nil {
-								log.Err(err).
-									Any("content", contentB).
-									Msg("Ignoring federated to-device message with invalid JSON content")
-								continue
-							}
-							tds = append(tds, &types.ToDevice{
-								Sender:   content.Sender,
-								Type:     content.Type,
-								UserID:   userID,
-								DeviceID: deviceID,
-								Content:  cnt,
-							})
-						}
-					}
-				}
-				if _, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{}); err != nil {
-					log.Err(err).Msg("Failed to store remote to-device messages")
-				}
+				f.processTransactionToDeviceEDUs(r, origin, eduType, edus)
 
 			default:
 				log.Error().Str("type", string(eduType)).Msg("Ignoring unknown EDU type")
@@ -261,6 +138,142 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string
 
 	wg.Wait()
 	return nil
+}
+
+func (f *FederationRoutes) processTransactionDeviceListEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+	log := hlog.FromRequest(r)
+	userEDUs := make(map[id.UserID][]types.RemoteDeviceEDU)
+	for _, edu := range edus {
+		var (
+			userID id.UserID
+			parsed types.RemoteDeviceEDU
+			err    error
+		)
+		if eduType == types.EDUTypeDeviceListUpdate {
+			var update types.RemoteDeviceListUpdate
+			userID, update, err = util.ParseDeviceListUpdateEDU(edu.Content)
+			parsed.DeviceList = &update
+		} else {
+			var update types.RemoteSigningKeyUpdate
+			userID, update, err = util.ParseSigningKeyUpdateEDU(edu.Content)
+			parsed.SigningKeys = &update
+		}
+		if err != nil {
+			log.Warn().Err(err).Str("type", string(eduType)).Msg("Dropping EDU that cannot be attributed to a user")
+		} else if checkEDUOrigin(log, origin, eduType, userID) {
+			userEDUs[userID] = append(userEDUs[userID], parsed)
+		}
+	}
+
+	var ingests sync.WaitGroup
+	running := make(chan struct{}, remoteDeviceIngestConcurrency)
+	for userID, updates := range userEDUs {
+		running <- struct{}{}
+		ingests.Go(func() {
+			defer func() { <-running }()
+			log := log.With().Stringer("user_id", userID).Logger()
+			defer util.RecoverPanic(&log, nil)
+
+			notified, err := f.db.Accounts.IngestRemoteDeviceUpdates(r.Context(), userID, updates)
+			if err != nil {
+				log.Err(err).Msg("Failed to ingest remote device updates")
+				return
+			}
+			log.Debug().Int("updates", len(updates)).Bool("notified", notified).Msg("Ingested remote device updates")
+		})
+	}
+	ingests.Wait()
+}
+
+func (f *FederationRoutes) processTransactionPresenceEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+	log := hlog.FromRequest(r)
+	for _, edu := range edus {
+		var content types.PresenceEDUContent
+		if err := json.Unmarshal(edu.Content, &content); err != nil {
+			log.Warn().Err(err).Msg("Ignoring invalid m.presence content")
+			continue
+		}
+		for _, presenceItem := range content.Push {
+			if !checkEDUOrigin(log, origin, eduType, presenceItem.UserID) {
+				continue
+			}
+			if localpart, _, err := presenceItem.UserID.ParseAndValidateRelaxed(); err != nil || localpart == "" ||
+				presenceItem.LastActiveAgo < 0 ||
+				presenceItem.LastActiveAgo > int64(math.MaxInt64/time.Millisecond) ||
+				(presenceItem.Presence != event.PresenceOnline &&
+					presenceItem.Presence != event.PresenceOffline &&
+					presenceItem.Presence != event.PresenceUnavailable) {
+				log.Warn().Stringer("user_id", presenceItem.UserID).
+					Msg("Ignoring invalid m.presence EDU item")
+				continue
+			}
+			// Calculate last active time from last_active_ago
+			lastActive := time.Now()
+			if presenceItem.LastActiveAgo > 0 {
+				lastActive = lastActive.Add(-time.Duration(presenceItem.LastActiveAgo) * time.Millisecond)
+			}
+
+			presence := &types.Presence{
+				UserID:     presenceItem.UserID,
+				Presence:   presenceItem.Presence,
+				Message:    presenceItem.StatusMsg,
+				LastActive: lastActive,
+			}
+
+			if err := f.db.Transient.UpdateUserPresence(r.Context(), presenceItem.UserID, presence); err != nil {
+				log.Err(err).
+					Str("user_id", presenceItem.UserID.String()).
+					Msg("Failed to store remote presence")
+				continue
+			}
+			log.Debug().
+				Str("user_id", presenceItem.UserID.String()).
+				Str("presence", string(presenceItem.Presence)).
+				Msg("Processed remote presence update")
+		}
+	}
+}
+
+func (f *FederationRoutes) processTransactionToDeviceEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+	log := hlog.FromRequest(r)
+	tds := make([]*types.ToDevice, 0, len(edus))
+	for _, edu := range edus {
+		var content types.ToDeviceEDUContent
+		if err := json.Unmarshal(edu.Content, &content); err != nil {
+			log.Err(err).Msg("Failed to unmarshal m.direct_to_device content")
+			continue
+		} else if !checkEDUOrigin(log, origin, eduType, content.Sender) {
+			continue
+		}
+
+		for userID, deviceIDToContent := range content.Messages {
+			if userID.Homeserver() != f.config.ServerName {
+				log.Error().
+					Str("user_id", userID.String()).
+					Msg("Ignoring to-device for nonlocal user")
+				continue
+			}
+			for deviceID, contentB := range deviceIDToContent {
+				cnt, err := json.Marshal(contentB)
+				if err != nil {
+					log.Err(err).
+						Any("content", contentB).
+						Msg("Ignoring federated to-device message with invalid JSON content")
+					continue
+				}
+				tds = append(tds, &types.ToDevice{
+					Sender:   content.Sender,
+					Type:     content.Type,
+					UserID:   userID,
+					DeviceID: deviceID,
+					Content:  cnt,
+				})
+			}
+		}
+	}
+	if _, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{}); err != nil {
+		log.Err(err).Msg("Failed to store remote to-device messages")
+	}
 }
 
 func checkEDUOrigin(log *zerolog.Logger, origin string, eduType types.EDUType, userID id.UserID) bool {
