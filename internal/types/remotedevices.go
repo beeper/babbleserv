@@ -18,6 +18,7 @@ const (
 	MaxRemoteDeviceStreamHistory    = 200
 
 	RemoteDeviceStreamHistoryRetention = 30 * time.Minute
+	RemoteDeviceCacheRetention         = 30 * 24 * time.Hour
 )
 
 // RemoteDevice is a remote user's device as the cache stores it. Keys is canonical JSON without
@@ -57,49 +58,16 @@ type RemoteDeviceSnapshot struct {
 	SelfSigningKey json.RawMessage
 }
 
-// RemoteDeviceCache is a tracked user's valid snapshot with every accepted delta applied
+// RemoteDeviceCache is a cached user's valid snapshot with every accepted delta applied
 type RemoteDeviceCache struct {
 	UserID id.UserID
 	RemoteDeviceSnapshot
 }
 
-type RemoteDeviceIngestResult struct {
-	// The cache was cleared and a refetch scheduled
-	Deleted bool
-	// A change record was written, local clients will be told
-	Notified bool
-}
-
-type RemoteDeviceTrackingChange struct {
-	UserID  id.UserID
-	RoomID  id.RoomID
-	Tracked bool
-}
-
-type RemoteDeviceTrackingResult struct {
-	Started []id.UserID
-	Stopped []id.UserID
-}
-
+// RemoteDeviceJob is a due snapshot fetch and the generation its snapshot must be published against
 type RemoteDeviceJob struct {
-	UserID   id.UserID
-	Identity int64
-	DueAt    time.Time
-	Attempts int
-}
-
-// RemoteDeviceFetch is a claimed job and the generation read with the claim. Job.DueAt is the lease.
-type RemoteDeviceFetch struct {
-	Job        RemoteDeviceJob
+	UserID     id.UserID
+	DueAt      time.Time
+	Attempts   int
 	Generation int64
 }
-
-type RemoteDevicePublishOutcome string
-
-const (
-	RemoteDevicePublished         RemoteDevicePublishOutcome = "published"
-	RemoteDevicePublishedFollowUp RemoteDevicePublishOutcome = "published_follow_up"
-	RemoteDevicePublishCompleted  RemoteDevicePublishOutcome = "completed_live_cache"
-	RemoteDevicePublishRetry      RemoteDevicePublishOutcome = "retry"
-	RemoteDevicePublishSuperseded RemoteDevicePublishOutcome = "superseded"
-)
