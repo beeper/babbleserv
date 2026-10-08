@@ -3,6 +3,7 @@ package workers
 import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/federation"
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
@@ -25,6 +26,7 @@ func NewWorkers(
 	db *databases.Databases,
 	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
+	fedClient *federation.Client,
 ) *Workers {
 	log := logger.With().
 		Str("component", "workers").
@@ -33,6 +35,8 @@ func NewWorkers(
 	workers := []Worker{
 		NewUIASessionCleanupIterator(log, cfg, db, notifiers),
 		NewRemoteUserDirectoryIterator(log, cfg, db, notifiers, fclient),
+		// Remote device list fetches -> remote device cache in accounts, plus stale cache eviction
+		NewRemoteDeviceCacheWorker(log, cfg, db, notifiers, fedClient),
 		// Wakes up relevant federation senders for new events
 		NewEventsIterator(log, cfg, db, notifiers),
 		// Federation sender per remote homeserver

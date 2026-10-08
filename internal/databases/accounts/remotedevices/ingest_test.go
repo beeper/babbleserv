@@ -92,21 +92,23 @@ func storedDeviceOf(keys json.RawMessage) *types.RemoteDevice {
 	return &types.RemoteDevice{DisplayName: "device", Keys: keys}
 }
 
+// assertWipe checks the batch is discarded for a refetch and the change it reports is notified
 func assertWipe(t *testing.T, plan ingestPlan) {
 	t.Helper()
-	assert.Equal(t, ingestPlan{wipe: true, refetch: true}, plan)
+	assert.Equal(t, ingestPlan{wipe: true, refetch: true, notify: true}, plan)
 }
 
 func assertRefetch(t *testing.T, plan ingestPlan) {
 	t.Helper()
-	assert.Equal(t, ingestPlan{refetch: true}, plan)
+	assert.Equal(t, ingestPlan{refetch: true, notify: true}, plan)
 }
 
-// assertNoWrite checks TxnIngest would write nothing for the plan
+// assertNoWrite checks TxnIngest would write and notify nothing for the plan
 func assertNoWrite(t *testing.T, plan ingestPlan) {
 	t.Helper()
 	assert.False(t, plan.wipe)
 	assert.False(t, plan.refetch)
+	assert.False(t, plan.notify)
 	assert.Empty(t, plan.accepted)
 	assert.Empty(t, plan.devices)
 	assert.Nil(t, plan.signingKeys)
@@ -119,6 +121,7 @@ func TestConnectedChangeStoresAndNotifies(t *testing.T) {
 	assert.Equal(t, []int64{6}, plan.accepted)
 	assert.Equal(t, map[id.DeviceID]*types.RemoteDevice{"A": storedDeviceOf(keysA2)}, plan.devices)
 	assert.Equal(t, state.meta.DeviceCount, plan.deviceCount)
+	assert.True(t, plan.notify)
 }
 
 func TestAddedSignatureUnderSameSignerIsAChange(t *testing.T) {
@@ -137,6 +140,7 @@ func TestIdenticalContentAdvancesSilentlyAndSuccessorConnects(t *testing.T) {
 	assert.False(t, plan.wipe)
 	assert.Equal(t, []int64{6}, plan.accepted, "an unchanged delta still advances the stream")
 	assert.Empty(t, plan.devices)
+	assert.False(t, plan.notify)
 
 	plan = planIngest(state, []types.RemoteDeviceEDU{
 		deviceEDU("A", 6, []int64{5}, keysA1),
@@ -144,6 +148,7 @@ func TestIdenticalContentAdvancesSilentlyAndSuccessorConnects(t *testing.T) {
 	}, testNow)
 	assert.Equal(t, []int64{6, 7}, plan.accepted)
 	assert.Equal(t, map[id.DeviceID]*types.RemoteDevice{"A": storedDeviceOf(keysA2)}, plan.devices)
+	assert.True(t, plan.notify)
 
 	next := applyPlan(t, state, planIngest(state, []types.RemoteDeviceEDU{deviceEDU("A", 6, []int64{5}, keysA1)}, testNow), testNow)
 	plan = planIngest(next, []types.RemoteDeviceEDU{deviceEDU("A", 7, []int64{6}, keysA2)}, testNow)
@@ -361,7 +366,7 @@ func TestContinuityIsDecidedBeforeReplay(t *testing.T) {
 
 	// A known stream ID without predecessors is a reset, not a replay
 	plan := planIngest(state, []types.RemoteDeviceEDU{deviceEDU("A", 5, nil, keysA1)}, testNow)
-	assertWipe(t, plan)
+	assert.Equal(t, ingestPlan{wipe: true, refetch: true}, plan, "a stream start reports no change")
 
 	// A known stream ID is a replay however many predecessors it names
 	prevIDs := make([]int64, types.MaxRemoteDevicePrevIDs+1)
@@ -436,9 +441,12 @@ func TestEDUWithoutSnapshotRefetches(t *testing.T) {
 	invalid := signingKeysEDU(master2, nil)
 	invalid.SigningKeys.Invalid = true
 	assertRefetch(t, planIngest(state, []types.RemoteDeviceEDU{invalid}, testNow))
+
+	plan := planIngest(state, []types.RemoteDeviceEDU{deviceEDU("A", 6, nil, keysA1)}, testNow)
+	assert.Equal(t, ingestPlan{refetch: true}, plan, "a stream start reports no change")
 }
 
-func TestUncachedIgnoresEverything(t *testing.T) {
+func TestUncachedStoresNothing(t *testing.T) {
 	uncached := validState(5, nil)
 	uncached.meta.WrittenAt = 0
 	plan := planIngest(uncached, []types.RemoteDeviceEDU{
@@ -446,10 +454,40 @@ func TestUncachedIgnoresEverything(t *testing.T) {
 		deviceEDU("A", 6, []int64{5}, keysA1),
 		signingKeysEDU(master1, nil),
 	}, testNow)
-	assert.Equal(t, ingestPlan{}, plan)
+	assert.Equal(t, ingestPlan{notify: true}, plan)
+
+	plan = planIngest(uncached, []types.RemoteDeviceEDU{deviceEDU("A", 6, nil, keysA1)}, testNow)
+	assert.Equal(t, ingestPlan{}, plan, "a join announcement")
 
 	plan = planIngest(validState(5, nil), nil, testNow)
 	assert.Equal(t, ingestPlan{}, plan)
+}
+
+func TestStreamStartsReportNoChange(t *testing.T) {
+	assert.False(t, reportsChange([]types.RemoteDeviceEDU{
+		deviceEDU("A", 6, nil, keysA1),
+		deletionEDU("B", 7, nil),
+	}), "a join announcement")
+	assert.True(t, reportsChange([]types.RemoteDeviceEDU{
+		deviceEDU("A", 6, nil, keysA1),
+		deviceEDU("A", 7, []int64{6}, keysA2),
+	}))
+	assert.True(t, reportsChange([]types.RemoteDeviceEDU{signingKeysEDU(master1, nil)}))
+	assert.False(t, reportsChange(nil))
+}
+
+func TestLastValidStreamID(t *testing.T) {
+	current := int64(3)
+	invalid := deviceEDU("A", 8, []int64{7}, nil)
+	invalid.DeviceList.Invalid = true
+	assert.Equal(t, int64(7), *lastValidStreamID([]types.RemoteDeviceEDU{
+		deviceEDU("A", 6, []int64{5}, keysA1),
+		deviceEDU("A", 7, []int64{6}, keysA2),
+		invalid,
+		signingKeysEDU(master1, nil),
+	}, &current))
+	assert.Same(t, &current, lastValidStreamID([]types.RemoteDeviceEDU{signingKeysEDU(master1, nil), invalid}, &current))
+	assert.Nil(t, lastValidStreamID(nil, nil))
 }
 
 func TestSigningKeyUpdates(t *testing.T) {
@@ -463,6 +501,7 @@ func TestSigningKeyUpdates(t *testing.T) {
 	assert.Equal(t, &storedSigningKeys{MasterKey: master2, SelfSigningKey: selfSig1}, plan.signingKeys,
 		"a changed signature under the same signer is a change, and an omitted key is never a deletion")
 	assert.Empty(t, plan.accepted, "signing keys have no stream ID")
+	assert.True(t, plan.notify)
 
 	plan = planIngest(state, []types.RemoteDeviceEDU{signingKeysEDU(master2, nil), signingKeysEDU(nil, nil)}, testNow)
 	assert.Equal(t, &storedSigningKeys{MasterKey: master2, SelfSigningKey: selfSig1}, plan.signingKeys)

@@ -19,23 +19,26 @@ type acceptance struct {
 	seq int64
 }
 
-// TxnPublishSnapshot stores a fetched snapshot unless the generation moved since the job was read
+// TxnPublishSnapshot stores a fetched snapshot unless the generation moved since the job was read,
+// and reports whether local clients must be told
 func (r *RemoteDevicesDirectory) TxnPublishSnapshot(
 	txn fdb.Transaction,
 	job types.RemoteDeviceJob,
 	snapshot *types.RemoteDeviceSnapshot,
 	now time.Time,
-) (bool, error) {
+) (published, notify bool, err error) {
 	userID := job.UserID
 	if err := r.checkRemote(userID); err != nil {
-		return false, err
+		return false, false, err
 	}
 	metaFuture := txn.Get(r.keyForMeta(userID))
 	jobFuture := txn.Get(r.keyForJob(userID))
 	m := decodeMeta(metaFuture.MustGet())
 	if m.Generation != job.Generation {
-		return false, nil
+		return false, false, nil
 	}
+	// Clients told of the update the snapshot is at have already queried it live
+	notify = m.NotifiedStreamID == nil || *m.NotifiedStreamID != snapshot.StreamID
 
 	txn.ClearRange(r.rangeForDevices(userID))
 	txn.ClearRange(r.rangeForSigningKeys(userID))
@@ -53,11 +56,12 @@ func (r *RemoteDevicesDirectory) TxnPublishSnapshot(
 
 	streamID := snapshot.StreamID
 	m.StreamID = &streamID
+	m.NotifiedStreamID = nil
 	m.DeviceCount = len(snapshot.Devices)
 	m.WrittenAt = now.UnixMilli()
 	m.Generation++
 	r.txnWriteMeta(txn, userID, m)
-	return true, nil
+	return true, notify, nil
 }
 
 // TxnIngest applies a user's device-list and signing-key EDUs in received order
@@ -122,17 +126,19 @@ func (r *RemoteDevicesDirectory) TxnIngest(
 	}
 
 	plan := planIngest(state, edus, now)
-	notified := len(plan.devices) > 0 || plan.signingKeys != nil
 
 	m := state.meta
 	if plan.wipe {
 		r.txnClearData(txn, userID, &m)
 	}
 	if plan.refetch {
+		if plan.notify {
+			m.NotifiedStreamID = lastValidStreamID(edus, m.NotifiedStreamID)
+		}
 		m.Generation++
 		r.txnEnsureJob(txn, userID, decodeJob(userID, jobFuture.MustGet()), now)
 		r.txnWriteMeta(txn, userID, m)
-		return notified, nil
+		return plan.notify, nil
 	}
 
 	for deviceID, device := range plan.devices {
@@ -146,7 +152,7 @@ func (r *RemoteDevicesDirectory) TxnIngest(
 		r.txnStoreSigningKeys(txn, userID, *plan.signingKeys)
 	}
 	if len(plan.accepted) == 0 {
-		return notified, nil
+		return plan.notify, nil
 	}
 	for _, streamID := range plan.accepted {
 		history[streamID] = r.txnStoreStreamID(txn, userID, &m, streamID, now)
@@ -159,7 +165,7 @@ func (r *RemoteDevicesDirectory) TxnIngest(
 	m.DeviceCount = plan.deviceCount
 	m.WrittenAt = now.UnixMilli()
 	r.txnWriteMeta(txn, userID, m)
-	return notified, nil
+	return plan.notify, nil
 }
 
 type ingestState struct {
@@ -177,6 +183,9 @@ type ingestPlan struct {
 	// Move the generation and ensure a fetch: deltas cannot apply without a snapshot, so a fetch in
 	// flight is retried
 	refetch bool
+	// Tell local clients the user's devices changed: the batch applied changes, or could not be
+	// applied and reports a change, which their live key queries see
+	notify bool
 	// In order, the last becomes the current stream ID
 	accepted []int64
 	// Device writes, nil deletes
@@ -186,12 +195,13 @@ type ingestPlan struct {
 }
 
 func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) ingestPlan {
-	wipeAndRefetch := ingestPlan{wipe: true, refetch: true}
+	reported := reportsChange(edus)
+	wipeAndRefetch := ingestPlan{wipe: true, refetch: true, notify: reported}
 	switch {
 	case len(edus) == 0, !state.meta.cached():
-		return ingestPlan{}
+		return ingestPlan{notify: reported}
 	case !state.meta.hasSnapshot():
-		return ingestPlan{refetch: true}
+		return ingestPlan{refetch: true, notify: reported}
 	case len(edus) > types.MaxRemoteDeviceEDUsPerIngest:
 		return wipeAndRefetch
 	}
@@ -272,7 +282,32 @@ func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) 
 		known[update.StreamID] = struct{}{}
 		plan.accepted = append(plan.accepted, update.StreamID)
 	}
+	plan.notify = len(plan.devices) > 0 || plan.signingKeys != nil
 	return plan
+}
+
+// reportsChange is whether EDUs that cannot be applied tell local clients of a change. A device-list
+// update without prev IDs starts the stream to this server, as when the user joins a room shared
+// with it, and local members already learn of a joiner from the join itself.
+func reportsChange(edus []types.RemoteDeviceEDU) bool {
+	for _, edu := range edus {
+		if edu.SigningKeys != nil || (edu.DeviceList != nil && len(edu.DeviceList.PrevIDs) > 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastValidStreamID is the stream ID of the last valid device-list update, or current when there is
+// none
+func lastValidStreamID(edus []types.RemoteDeviceEDU, current *int64) *int64 {
+	for _, edu := range slices.Backward(edus) {
+		if edu.DeviceList != nil && !edu.DeviceList.Invalid {
+			streamID := edu.DeviceList.StreamID
+			return &streamID
+		}
+	}
+	return current
 }
 
 // historyToPrune returns the stream IDs accepted up to the last expired one, then the oldest beyond

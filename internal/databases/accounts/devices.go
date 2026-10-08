@@ -24,15 +24,6 @@ func (a *AccountsDatabase) PaginateDeviceChanges(
 	})
 }
 
-func (a *AccountsDatabase) StoreDeviceChange(ctx context.Context, userID id.UserID, deviceID id.DeviceID) error {
-	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
-		version := tuple.IncompleteVersionstamp(0)
-		a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
-		return nil, nil
-	})
-	return err
-}
-
 func (a *AccountsDatabase) txnStoreDeviceListChange(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, index uint16) error {
 	stream, err := a.users.TxnAllocateDeviceListVersion(txn, userID)
 	if err != nil {
