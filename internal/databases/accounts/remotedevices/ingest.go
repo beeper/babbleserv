@@ -122,7 +122,7 @@ func (r *RemoteDevicesDirectory) TxnIngest(
 	}
 
 	plan := planIngest(state, edus, now)
-	notified := len(plan.devices) > 0 || plan.signingKeys != nil
+	notified := len(plan.devices) > 0 || plan.signingKeys != nil || (!state.meta.cached() && reportsUncachedChange(edus))
 
 	m := state.meta
 	if plan.wipe {
@@ -273,6 +273,18 @@ func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) 
 		plan.accepted = append(plan.accepted, update.StreamID)
 	}
 	return plan
+}
+
+// reportsUncachedChange is whether EDUs for a user without a cache tell local clients of a change. A
+// device-list update without prev IDs starts the stream to this server, as when the user joins a
+// room shared with it, and local members already learn of a joiner from the join itself.
+func reportsUncachedChange(edus []types.RemoteDeviceEDU) bool {
+	for _, edu := range edus {
+		if edu.SigningKeys != nil || (edu.DeviceList != nil && len(edu.DeviceList.PrevIDs) > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // historyToPrune returns the stream IDs accepted up to the last expired one, then the oldest beyond

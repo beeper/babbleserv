@@ -452,6 +452,19 @@ func TestUncachedIgnoresEverything(t *testing.T) {
 	assert.Equal(t, ingestPlan{}, plan)
 }
 
+func TestUncachedChangeExcludesStreamStarts(t *testing.T) {
+	assert.False(t, reportsUncachedChange([]types.RemoteDeviceEDU{
+		deviceEDU("A", 6, nil, keysA1),
+		deletionEDU("B", 7, nil),
+	}), "a join announcement")
+	assert.True(t, reportsUncachedChange([]types.RemoteDeviceEDU{
+		deviceEDU("A", 6, nil, keysA1),
+		deviceEDU("A", 7, []int64{6}, keysA2),
+	}))
+	assert.True(t, reportsUncachedChange([]types.RemoteDeviceEDU{signingKeysEDU(master1, nil)}))
+	assert.False(t, reportsUncachedChange(nil))
+}
+
 func TestSigningKeyUpdates(t *testing.T) {
 	state := validState(5, nil)
 	state.signingKeys = storedSigningKeys{MasterKey: master1, SelfSigningKey: selfSig1}
