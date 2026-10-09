@@ -2,6 +2,7 @@ package workers
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 	"time"
 
@@ -156,6 +157,9 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 			tds, err = e.deviceChangesForJoin(ev, tup.Version)
 		case event.MembershipLeave:
 			tds, err = e.localDeviceChangesForLeaveEvent(ev)
+			e.evictUnsharedRemoteCaches(ev)
+		case event.MembershipBan:
+			e.evictUnsharedRemoteCaches(ev)
 		default:
 		}
 		if err != nil {
@@ -353,6 +357,50 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Even
 		}
 	}
 	return leftDeviceChanges(e.isLocal, leaver, others, shared), nil
+}
+
+// A remote server only sends a user's device-list updates while they share a room with a local
+// user, so once that may have stopped the cache is evicted and rebuilt by the next query. A local
+// leaver's remote co-members are evicted whenever no local member remains rather than reading each
+// of their rooms: one still sharing another room is merely refetched. Failing here loses nothing
+// the batch carries, so it only logs.
+func (e *DeviceJoinEventIterator) evictUnsharedRemoteCaches(ev *types.Event) {
+	leaver := id.UserID(*ev.StateKey)
+	unshared, err := e.unsharedRemoteUsers(ev.RoomID, leaver)
+	if err == nil && len(unshared) > 0 {
+		var evicted []id.UserID
+		if evicted, err = e.db.Accounts.EvictRemoteDeviceCaches(e.ctx, unshared); len(evicted) > 0 {
+			e.log.Debug().Stringer("room_id", ev.RoomID).Int("evicted", len(evicted)).Msg("Evicted remote device caches no longer shared")
+		}
+	}
+	if err != nil {
+		e.log.Err(err).Stringer("room_id", ev.RoomID).Stringer("user_id", leaver).Msg("Failed to evict unshared remote device caches")
+	}
+}
+
+func (e *DeviceJoinEventIterator) unsharedRemoteUsers(roomID id.RoomID, leaver id.UserID) ([]id.UserID, error) {
+	if !e.isLocal(leaver) {
+		// Only rooms with joined local members are returned; the left room is dropped since it may
+		// already show a rejoin
+		rooms, err := e.db.Rooms.GetUserJoinedMembershipsWithEncryption(e.ctx, leaver)
+		if err != nil {
+			return nil, err
+		}
+		delete(rooms, roomID)
+		if len(rooms) > 0 {
+			return nil, nil
+		}
+		return []id.UserID{leaver}, nil
+	}
+	room, err := e.db.Rooms.GetRoom(e.ctx, roomID)
+	if err != nil || room == nil || room.LocalMembers > 0 {
+		return nil, err
+	}
+	members, err := e.db.Rooms.RoomMembers(e.ctx, roomID, event.MembershipJoin)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Collect(maps.Keys(members)), nil
 }
 
 func (e *DeviceJoinEventIterator) isLocal(userID id.UserID) bool {

@@ -38,7 +38,8 @@ const (
 
 // RemoteDeviceCacheWorker fetches a device list snapshot for each remote user whose cache is waiting
 // for one and publishes it to the Accounts cache, retrying failed fetches with backoff. It also evicts
-// the caches nothing has written to for types.RemoteDeviceCacheRetention.
+// the caches of users no longer sharing an encrypted room instead of fetching, and those nothing has
+// written to for types.RemoteDeviceCacheRetention.
 type RemoteDeviceCacheWorker struct {
 	iteratorWorker
 	client *federation.Client
@@ -160,21 +161,8 @@ func (w *RemoteDeviceCacheWorker) nextJobs(inFlight map[id.UserID]struct{}) []ty
 func (w *RemoteDeviceCacheWorker) processJob(ctx context.Context, workerLock lock.Lock, job types.RemoteDeviceJob) {
 	log := w.log.With().Stringer("user_id", job.UserID).Logger()
 
-	snapshot, err := w.fetchSnapshot(ctx, job.UserID)
-	if err == nil {
-		var published bool
-		published, err = w.db.Accounts.PublishRemoteDeviceSnapshot(ctx, job, snapshot, workerLock.TxnRefresh)
-		if err == nil {
-			log.Debug().
-				Int64("stream_id", snapshot.StreamID).
-				Int("devices", len(snapshot.Devices)).
-				Bool("published", published).
-				Msg("Processed remote device snapshot")
-			return
-		}
-		err = fmt.Errorf("failed to publish snapshot: %w", err)
-	}
-	if ctx.Err() != nil {
+	err := w.refreshCache(ctx, log, workerLock, job)
+	if err == nil || ctx.Err() != nil {
 		return
 	}
 
@@ -191,6 +179,43 @@ func (w *RemoteDeviceCacheWorker) processJob(ctx context.Context, workerLock loc
 			Dur("retry_in", delay).
 			Msg("Remote device snapshot fetch failed, will retry")
 	}
+}
+
+// refreshCache publishes a fetched snapshot, or evicts the cache once the user shares no encrypted
+// room with a local user. A leave evicted nothing if it was handled before a key query created the
+// cache, but rooms read after creation show it; a later leave evicts the cache itself and moves the
+// generation, so the publish is refused.
+func (w *RemoteDeviceCacheWorker) refreshCache(
+	ctx context.Context,
+	log zerolog.Logger,
+	workerLock lock.Lock,
+	job types.RemoteDeviceJob,
+) error {
+	rooms, err := w.db.Rooms.GetUserJoinedMembershipsWithEncryption(ctx, job.UserID)
+	if err != nil {
+		return fmt.Errorf("failed to read shared encrypted rooms: %w", err)
+	} else if len(rooms) == 0 {
+		if _, err := w.db.Accounts.EvictRemoteDeviceCaches(ctx, []id.UserID{job.UserID}); err != nil {
+			return fmt.Errorf("failed to evict unshared cache: %w", err)
+		}
+		log.Debug().Msg("Evicted remote device cache no longer shared")
+		return nil
+	}
+
+	snapshot, err := w.fetchSnapshot(ctx, job.UserID)
+	if err != nil {
+		return err
+	}
+	published, err := w.db.Accounts.PublishRemoteDeviceSnapshot(ctx, job, snapshot, workerLock.TxnRefresh)
+	if err != nil {
+		return fmt.Errorf("failed to publish snapshot: %w", err)
+	}
+	log.Debug().
+		Int64("stream_id", snapshot.StreamID).
+		Int("devices", len(snapshot.Devices)).
+		Bool("published", published).
+		Msg("Processed remote device snapshot")
+	return nil
 }
 
 func (w *RemoteDeviceCacheWorker) fetchSnapshot(ctx context.Context, userID id.UserID) (*types.RemoteDeviceSnapshot, error) {
