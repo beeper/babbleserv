@@ -17,14 +17,14 @@ import (
 
 const (
 	remoteDeviceCacheReadConcurrency = 8
-	remoteDeviceEnsureChunk          = 100
+	remoteDeviceUserChunk            = 100
 )
 
 // EnsureRemoteDeviceCaches creates the caches of remote users a local client queried, returning
 // those created. Callers check the querier shares an encrypted room with each user.
 func (a *AccountsDatabase) EnsureRemoteDeviceCaches(ctx context.Context, userIDs []id.UserID) ([]id.UserID, error) {
 	var created []id.UserID
-	for chunk := range slices.Chunk(userIDs, remoteDeviceEnsureChunk) {
+	for chunk := range slices.Chunk(userIDs, remoteDeviceUserChunk) {
 		chunkCreated, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) ([]id.UserID, error) {
 			return a.remotedevices.TxnEnsureCaches(txn, chunk, time.Now().UTC())
 		})
@@ -34,6 +34,20 @@ func (a *AccountsDatabase) EnsureRemoteDeviceCaches(ctx context.Context, userIDs
 		created = append(created, chunkCreated...)
 	}
 	return created, nil
+}
+
+func (a *AccountsDatabase) EvictRemoteDeviceCaches(ctx context.Context, userIDs []id.UserID) ([]id.UserID, error) {
+	var evicted []id.UserID
+	for chunk := range slices.Chunk(userIDs, remoteDeviceUserChunk) {
+		chunkEvicted, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) ([]id.UserID, error) {
+			return a.remotedevices.TxnEvict(txn, chunk)
+		})
+		if err != nil {
+			return nil, err
+		}
+		evicted = append(evicted, chunkEvicted...)
+	}
+	return evicted, nil
 }
 
 func (a *AccountsDatabase) EvictStaleRemoteDeviceCaches(

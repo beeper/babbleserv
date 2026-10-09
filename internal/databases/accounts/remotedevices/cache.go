@@ -146,12 +146,39 @@ func (r *RemoteDevicesDirectory) TxnEvictStale(
 			txn.Clear(kvs[i].Key)
 			continue
 		}
-		r.txnClearData(txn, userID, &m)
-		r.txnCancelJob(txn, decodeJob(userID, jobFutures[i].MustGet()))
-		r.txnSetWrittenAt(txn, userID, &m, 0)
-		m.Generation++
-		r.txnWriteMeta(txn, userID, m)
+		r.txnEvict(txn, userID, m, decodeJob(userID, jobFutures[i].MustGet()))
 		evicted = append(evicted, userID)
 	}
 	return evicted, len(kvs) < limit, nil
+}
+
+// TxnEvict evicts the caches of those of the users that are cached, returning them
+func (r *RemoteDevicesDirectory) TxnEvict(txn fdb.Transaction, userIDs []id.UserID) ([]id.UserID, error) {
+	metaFutures := make([]fdb.FutureByteSlice, len(userIDs))
+	jobFutures := make([]fdb.FutureByteSlice, len(userIDs))
+	for i, userID := range userIDs {
+		if err := r.checkRemote(userID); err != nil {
+			return nil, err
+		}
+		metaFutures[i] = txn.Get(r.keyForMeta(userID))
+		jobFutures[i] = txn.Get(r.keyForJob(userID))
+	}
+	var evicted []id.UserID
+	for i, userID := range userIDs {
+		m := decodeMeta(metaFutures[i].MustGet())
+		if !m.cached() {
+			continue
+		}
+		r.txnEvict(txn, userID, m, decodeJob(userID, jobFutures[i].MustGet()))
+		evicted = append(evicted, userID)
+	}
+	return evicted, nil
+}
+
+func (r *RemoteDevicesDirectory) txnEvict(txn fdb.Transaction, userID id.UserID, m meta, job *types.RemoteDeviceJob) {
+	r.txnClearData(txn, userID, &m)
+	r.txnCancelJob(txn, job)
+	r.txnSetWrittenAt(txn, userID, &m, 0)
+	m.Generation++
+	r.txnWriteMeta(txn, userID, m)
 }
