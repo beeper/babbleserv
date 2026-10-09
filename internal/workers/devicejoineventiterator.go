@@ -2,12 +2,13 @@ package workers
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"maunium.net/go/mautrix"
+	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -16,7 +17,6 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
-	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
@@ -157,6 +157,9 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 			tds, err = e.deviceChangesForJoin(ev, tup.Version)
 		case event.MembershipLeave:
 			tds, err = e.localDeviceChangesForLeaveEvent(ev)
+			e.evictUnsharedRemoteCaches(ev)
+		case event.MembershipBan:
+			e.evictUnsharedRemoteCaches(ev)
 		default:
 		}
 		if err != nil {
@@ -274,35 +277,27 @@ func (e *DeviceJoinEventIterator) remoteDeviceChangesForJoin(roomID id.RoomID, j
 		return nil, nil
 	}
 
-	devices, err := e.db.Accounts.GetUserDevices(e.ctx, joiner)
-	if err != nil {
+	snapshot, err := e.db.Accounts.GetLocalUserDevicesSnapshot(e.ctx, joiner)
+	if err != nil || snapshot == nil {
 		return nil, err
 	}
-	getDeviceKeys := util.MemoizeMap(func(k id.DeviceID) (*mautrix.DeviceKeys, error) {
-		// As above, requestUserID=""
-		return e.db.Accounts.GetDeviceKeys(e.ctx, joiner, k, "")
-	}, 10)
 
-	tds := make([]*types.ToDevice, 0, len(servers)*len(devices))
+	contents := make([]json.RawMessage, len(snapshot.Devices))
+	for i, d := range snapshot.Devices {
+		update := types.LocalDeviceListUpdate{Version: snapshot.Version, Device: &d.Device, Keys: d.Keys}
+		contents[i] = exerrors.Must(json.Marshal(deviceListUpdateContent(joiner, d.Device.ID, update, nil)))
+	}
+
+	tds := make([]*types.ToDevice, 0, len(servers)*len(contents))
 	for _, server := range servers {
 		// Target is the server, not user, but we smuggle such updates through to-device
 		// internally (see the DeviceChangeIterator).
 		serverUserID := id.UserID("@:" + server)
-		for _, d := range devices {
-			keys, err := getDeviceKeys(d.ID)
-			if err != nil {
-				return nil, err
-			}
-			content := types.DeviceListUpdateEDUContent{
-				UserID:     joiner,
-				DeviceID:   d.ID,
-				DeviceKeys: keys,
-			}
-			b, _ := json.Marshal(content)
+		for _, content := range contents {
 			tds = append(tds, &types.ToDevice{
 				Type:    types.BabbleservRemoteDeviceListUpdate,
 				UserID:  serverUserID,
-				Content: b,
+				Content: content,
 			})
 		}
 	}
@@ -362,6 +357,50 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Even
 		}
 	}
 	return leftDeviceChanges(e.isLocal, leaver, others, shared), nil
+}
+
+// A remote server only sends a user's device-list updates while they share a room with a local
+// user, so once that may have stopped the cache is evicted and rebuilt by the next query. A local
+// leaver's remote co-members are evicted whenever no local member remains rather than reading each
+// of their rooms: one still sharing another room is merely refetched. Failing here loses nothing
+// the batch carries, so it only logs.
+func (e *DeviceJoinEventIterator) evictUnsharedRemoteCaches(ev *types.Event) {
+	leaver := id.UserID(*ev.StateKey)
+	unshared, err := e.unsharedRemoteUsers(ev.RoomID, leaver)
+	if err == nil && len(unshared) > 0 {
+		var evicted []id.UserID
+		if evicted, err = e.db.Accounts.EvictRemoteDeviceCaches(e.ctx, unshared); len(evicted) > 0 {
+			e.log.Debug().Stringer("room_id", ev.RoomID).Int("evicted", len(evicted)).Msg("Evicted remote device caches no longer shared")
+		}
+	}
+	if err != nil {
+		e.log.Err(err).Stringer("room_id", ev.RoomID).Stringer("user_id", leaver).Msg("Failed to evict unshared remote device caches")
+	}
+}
+
+func (e *DeviceJoinEventIterator) unsharedRemoteUsers(roomID id.RoomID, leaver id.UserID) ([]id.UserID, error) {
+	if !e.isLocal(leaver) {
+		// Only rooms with joined local members are returned; the left room is dropped since it may
+		// already show a rejoin
+		rooms, err := e.db.Rooms.GetUserJoinedMembershipsWithEncryption(e.ctx, leaver)
+		if err != nil {
+			return nil, err
+		}
+		delete(rooms, roomID)
+		if len(rooms) > 0 {
+			return nil, nil
+		}
+		return []id.UserID{leaver}, nil
+	}
+	room, err := e.db.Rooms.GetRoom(e.ctx, roomID)
+	if err != nil || room == nil || room.LocalMembers > 0 {
+		return nil, err
+	}
+	members, err := e.db.Rooms.RoomMembers(e.ctx, roomID, event.MembershipJoin)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Collect(maps.Keys(members)), nil
 }
 
 func (e *DeviceJoinEventIterator) isLocal(userID id.UserID) bool {

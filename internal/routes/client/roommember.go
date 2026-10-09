@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix"
@@ -310,20 +311,26 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// We're not in the room but do know the other HS, whom we assume are in the room, so use them
-	// via the make_leave, send_leave
+	// Try rejecting through the other HS. An invite can still be rejected locally if that server
+	// is unavailable or has left the room. Local storage errors must still fail the request.
 	if otherHomeserver != "" {
 		if err := c.remoteMembership(r, roomID, event.MembershipLeave, leavingUserID, []string{otherHomeserver}); err != nil {
-			responseRemoteMembershipError(w, r, err)
+			if !isLeave || membership != event.MembershipInvite || !errors.Is(err, errRemoteLeaveFailed) {
+				responseRemoteMembershipError(w, r, err)
+				return
+			}
+			hlog.FromRequest(r).Warn().Err(err).
+				Stringer("room_id", roomID).
+				Str("server", otherHomeserver).
+				Msg("Failed to reject invite over federation, recording leave locally")
+		} else {
+			util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 			return
 		}
-		util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
-		return
 	}
 
-	// We're not in the room and we've no idea who, if any, the other HS is supposed to be, so we
-	// just throw together a half complete local event and send as an outlier. This means our local
-	// user can always leave themselves from rooms. We reject kicks here.
+	// With no other HS, or after a failed remote invite rejection, record the local user's leave
+	// as an outlier. This changes their membership stream without publishing room state.
 	if !isLeave {
 		util.ResponseErrorUnknownJSON(w, r, fmt.Errorf("cannot kick unknown nonlocal user from unknown room"))
 		return
@@ -332,10 +339,16 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	outlierLeaveEv := &types.Event{
 		RoomVersion:  currentMemberEv.RoomVersion,
 		PartialEvent: *partialEv,
+		Local:        true,
+		PrevEventIDs: []id.EventID{currentMemberEv.ID},
 	}
+	outlierLeaveEv.Timestamp = time.Now().UTC().UnixMilli()
 
 	keyID, key := c.config.MustGetActiveSigningKey()
-	util.HashAndSignEvent(outlierLeaveEv, c.config.ServerName, keyID, key)
+	if err := util.HashAndSignEvent(outlierLeaveEv, c.config.ServerName, keyID, key); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
 
 	// Now send it as a local outlier
 	if err := c.db.Rooms.SendFederatedOutlierMembershipEvent(r.Context(), outlierLeaveEv); err != nil {
@@ -379,6 +392,9 @@ func (c *ClientRoutes) sendBanOrUnban(w http.ResponseWriter, r *http.Request, me
 // Wraps why another server or this one refused a membership sent through the other
 var errMembershipRejected = errors.New("membership rejected")
 
+// A make_leave or send_leave failure, before the membership is stored locally
+var errRemoteLeaveFailed = errors.New("remote leave failed")
+
 // remoteMembership sends target's membership of a room this server is not in via make_/send_ endpoints
 func (c *ClientRoutes) remoteMembership(
 	r *http.Request,
@@ -403,6 +419,9 @@ func (c *ClientRoutes) remoteMembership(
 		}
 	})
 	if err != nil {
+		if membership == event.MembershipLeave {
+			return fmt.Errorf("%w: %w", errRemoteLeaveFailed, err)
+		}
 		return err
 	}
 
@@ -428,7 +447,7 @@ func (c *ClientRoutes) remoteMembership(
 		ev.SetUnsigned("knock_room_state", resp.KnockRoomState)
 	default:
 		if err := c.fclient.SendLeave(ctx, origin, destination, ev.PDU()); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errRemoteLeaveFailed, err)
 		}
 	}
 	return c.db.Rooms.SendFederatedOutlierMembershipEvent(ctx, ev)

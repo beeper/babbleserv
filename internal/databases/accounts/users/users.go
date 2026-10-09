@@ -181,14 +181,26 @@ func (u *UsersDirectory) TxnGetRemoteUser(txn fdb.ReadTransaction, userID id.Use
 	return u.txnGetUser(txn, userID)
 }
 
-func (u *UsersDirectory) txnGetUser(txn fdb.ReadTransaction, userID id.UserID) (*types.User, error) {
-	b, err := txn.Get(u.keyForUser(userID)).Get()
-	if err != nil {
-		return nil, err
-	} else if b == nil {
-		return nil, nil
+func (u *UsersDirectory) TxnGetLocalUserFuture(txn fdb.ReadTransaction, userID id.UserID) (func() (*types.User, error), error) {
+	if userID.Homeserver() != u.serverName {
+		return nil, fmt.Errorf("userid is not local: %s", userID)
 	}
-	return types.NewUserFromBytes(b, userID.Localpart(), userID.Homeserver())
+	return u.txnGetUserFuture(txn, userID), nil
+}
+
+func (u *UsersDirectory) txnGetUser(txn fdb.ReadTransaction, userID id.UserID) (*types.User, error) {
+	return u.txnGetUserFuture(txn, userID)()
+}
+
+func (u *UsersDirectory) txnGetUserFuture(txn fdb.ReadTransaction, userID id.UserID) func() (*types.User, error) {
+	future := txn.Get(u.keyForUser(userID))
+	return func() (*types.User, error) {
+		b, err := future.Get()
+		if err != nil || b == nil {
+			return nil, err
+		}
+		return types.NewUserFromBytes(b, userID.Localpart(), userID.Homeserver())
+	}
 }
 
 func (u *UsersDirectory) TxnCreateLocalUser(txn fdb.Transaction, user *types.User, hashedPassword []byte) error {
@@ -232,26 +244,19 @@ func (u *UsersDirectory) txnCreateUser(txn fdb.Transaction, user *types.User) er
 	return nil
 }
 
-func (u *UsersDirectory) TxnIncrementUserDeviceListVersion(txn fdb.Transaction, userID id.UserID) error {
-	user, err := u.txnGetUser(txn, userID)
+func (u *UsersDirectory) TxnAllocateDeviceListVersion(txn fdb.Transaction, userID id.UserID) (types.DeviceListStream, error) {
+	user, err := u.TxnGetLocalUser(txn, userID)
 	if err != nil {
-		return nil
+		return types.DeviceListStream{}, err
 	} else if user == nil {
-		if userID.Homeserver() == u.serverName {
-			return fmt.Errorf("user not found for local userid: %s", userID)
-		}
-
-		// We lazily create remote users to track their device list versions
-		user = &types.User{
-			Username:   userID.Localpart(),
-			ServerName: userID.Homeserver(),
-		}
-		if err := u.txnCreateUser(txn, user); err != nil {
-			return err
-		}
+		return types.DeviceListStream{}, fmt.Errorf("%w: %s", types.ErrUserNotFound, userID)
 	}
 
-	user.DeviceListVersion += 1
+	stream := types.DeviceListStream{
+		StreamID: user.DeviceListVersion + 1,
+		PrevID:   user.DeviceListVersion,
+	}
+	user.DeviceListVersion = stream.StreamID
 	txn.Set(u.keyForUser(userID), user.ToMsgpack())
-	return nil
+	return stream, nil
 }

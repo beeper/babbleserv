@@ -56,7 +56,7 @@ func (d *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 	deviceOTKCounts := make(map[id.DeviceID]mautrix.OTKCount, len(devices))
 	deviceFallbackKeys := make(map[id.DeviceID]map[id.KeyAlgorithm]types.FallbackKey, len(devices))
 	for _, device := range devices {
-		keys, err := d.db.Accounts.GetDeviceKeys(r.Context(), userID, device.ID, userID)
+		keys, err := d.db.Accounts.GetDeviceKeys(r.Context(), userID, device.ID)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return

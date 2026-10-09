@@ -86,7 +86,7 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 
 	var wrks *workers.Workers
 	if cfg.WorkersEnabled {
-		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient)
+		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient, fedClient)
 	} else {
 		log.Info().Msg("Workers disabled")
 	}

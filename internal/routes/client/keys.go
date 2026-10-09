@@ -1,21 +1,26 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"slices"
 	"sync"
+	"time"
 
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib/spec"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
+	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/routes/shared"
 	"github.com/beeper/babbleserv/internal/types"
@@ -110,97 +115,153 @@ func (c *ClientRoutes) QueryKeys(w http.ResponseWriter, r *http.Request) {
 
 	u := middleware.GetRequestUserDevice(r)
 
-	resp, serverToUserDevices, err := shared.GetUserKeys(r.Context(), c.config, c.db, req.DeviceKeys, u.UserID)
+	keys, missing, err := shared.CollectUserKeys(r.Context(), c.config, c.db, req.DeviceKeys, u.UserID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
 
 	var wg sync.WaitGroup
-	type result struct {
-		server string
-		err    error
-		res    mautrix.RespQueryKeys
-	}
-	resultsCh := make(chan result, len(serverToUserDevices))
-	for server, userToDeviceIDs := range serverToUserDevices {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	wg.Go(func() { c.ensureRemoteDeviceCaches(r, u.UserID, missing) })
 
-			udmap := make(map[string][]string, len(userToDeviceIDs))
-			for userID, deviceIDs := range userToDeviceIDs {
-				dids := make([]string, len(deviceIDs))
-				for i, did := range deviceIDs {
-					dids[i] = did.String()
-				}
-				udmap[userID.String()] = dids
-			}
-
-			res, err := c.fclient.QueryKeys(
-				r.Context(),
-				spec.ServerName(c.config.ServerName),
-				spec.ServerName(server),
-				udmap,
-			)
-
-			// Gross: convert fclient.RespQueryKeys -> mautrix.RespQueryKeys
-			b, _ := json.Marshal(res)
-			var mres mautrix.RespQueryKeys
-			json.Unmarshal(b, &mres)
-
-			resultsCh <- result{server, err, mres}
-		}()
-	}
-
+	// Live results are returned without populating the cache: they carry no stream ID
+	ctx, cancel := context.WithTimeout(r.Context(), remoteKeyQueryTimeout(req.Timeout))
+	liveKeys, failures := c.queryRemoteUserKeys(ctx, missing)
+	cancel()
 	wg.Wait()
-	close(resultsCh)
+	maps.Copy(keys, liveKeys)
 
-	// TODO: cache the results?
-
-	for res := range resultsCh {
-		if res.err != nil {
-			hlog.FromRequest(r).Warn().
-				Err(res.err).
-				Str("server", res.server).
-				Msg("Failed to fetch user keys from server")
-			continue
-		}
-
-		for uid, key := range res.res.MasterKeys {
-			if _, found := serverToUserDevices[res.server][uid]; !found {
-				hlog.FromRequest(r).Warn().
-					Str("server", res.server).
-					Str("user_id", uid.String()).
-					Msg("Got remote master keys for user we did not request")
-				continue
-			}
-			resp.MasterKeys[uid] = key
-		}
-		for uid, key := range res.res.UserSigningKeys {
-			if _, found := serverToUserDevices[res.server][uid]; !found {
-				hlog.FromRequest(r).Warn().
-					Str("server", res.server).
-					Str("user_id", uid.String()).
-					Msg("Got remote user signing keys for user we did not request")
-				continue
-			}
-			resp.UserSigningKeys[uid] = key
-		}
-		// By definition, should be impossible: SelfSigningKeys
-		for uid, devices := range res.res.DeviceKeys {
-			if _, found := serverToUserDevices[res.server][uid]; !found {
-				hlog.FromRequest(r).Warn().
-					Str("server", res.server).
-					Str("user_id", uid.String()).
-					Msg("Got remote device keys for user we did not request")
-				continue
-			}
-			resp.DeviceKeys[uid] = devices
-		}
+	resp, err := shared.BuildUserKeysResponse(r.Context(), c.db, req.DeviceKeys, keys, u.UserID)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	if len(failures) > 0 {
+		resp.Failures = failures
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, resp)
+}
+
+// A remote user without a cache gets one when a local user sharing an encrypted room with them
+// queries their keys; the worker fills it, so this query is still served live
+func (c *ClientRoutes) ensureRemoteDeviceCaches(r *http.Request, requester id.UserID, missing shared.MissingUserKeysByServer) {
+	log := hlog.FromRequest(r)
+	var userIDs []id.UserID
+	for _, users := range missing {
+		for userID := range users {
+			userIDs = append(userIDs, userID)
+		}
+	}
+	if len(userIDs) == 0 {
+		return
+	}
+	sharing, err := c.db.Rooms.UsersSharingEncryptedRoom(r.Context(), requester, userIDs)
+	if err != nil {
+		log.Err(err).Msg("Failed to check shared encrypted rooms for remote device caches")
+		return
+	}
+	userIDs = userIDs[:0]
+	for userID, shared := range sharing {
+		if shared {
+			userIDs = append(userIDs, userID)
+		}
+	}
+	if len(userIDs) == 0 {
+		return
+	}
+	if created, err := c.db.Accounts.EnsureRemoteDeviceCaches(r.Context(), userIDs); err != nil {
+		log.Err(err).Msg("Failed to create remote device caches")
+	} else if len(created) > 0 {
+		log.Debug().Int("created", len(created)).Msg("Created remote device caches")
+	}
+}
+
+const (
+	maxRemoteKeyQueryServers       = 10
+	minRemoteKeyQueryTimeoutMillis = 1000
+	maxRemoteKeyQueryTimeoutMillis = 10_000
+)
+
+func remoteKeyQueryTimeout(timeoutMillis int64) time.Duration {
+	if timeoutMillis <= 0 {
+		timeoutMillis = maxRemoteKeyQueryTimeoutMillis
+	}
+	return time.Duration(min(max(timeoutMillis, minRemoteKeyQueryTimeoutMillis), maxRemoteKeyQueryTimeoutMillis)) * time.Millisecond
+}
+
+func (c *ClientRoutes) queryRemoteUserKeys(
+	ctx context.Context,
+	missing shared.MissingUserKeysByServer,
+) (map[id.UserID]shared.UserKeys, map[string]any) {
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		keys     = make(map[id.UserID]shared.UserKeys)
+		failures = make(map[string]any)
+		running  = make(chan struct{}, maxRemoteKeyQueryServers)
+	)
+	for server, userDeviceIDs := range missing {
+		running <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-running }()
+			res, err := c.queryServerUserKeys(ctx, server, userDeviceIDs)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				zerolog.Ctx(ctx).Warn().
+					Err(err).
+					Str("server", server).
+					Msg("Failed to fetch user keys from server")
+				failures[server] = remoteKeyQueryFailure(err)
+				return
+			}
+			for userID := range userDeviceIDs {
+				keys[userID] = shared.UserKeysFromQueryResponse(userID, res)
+			}
+		})
+	}
+	wg.Wait()
+	return keys, failures
+}
+
+func (c *ClientRoutes) queryServerUserKeys(
+	ctx context.Context,
+	server string,
+	userDeviceIDs map[id.UserID]mautrix.DeviceIDList,
+) (mautrix.RespQueryKeys, error) {
+	query := make(map[string][]string, len(userDeviceIDs))
+	for userID, deviceIDs := range userDeviceIDs {
+		query[userID.String()] = util.StringersToStrs(deviceIDs)
+	}
+
+	res, err := c.fclient.QueryKeys(ctx, spec.ServerName(c.config.ServerName), spec.ServerName(server), query)
+	if err != nil {
+		return mautrix.RespQueryKeys{}, err
+	}
+
+	// Gross: convert fclient.RespQueryKeys -> mautrix.RespQueryKeys
+	b, err := json.Marshal(res)
+	if err != nil {
+		return mautrix.RespQueryKeys{}, err
+	}
+	var converted mautrix.RespQueryKeys
+	err = json.Unmarshal(b, &converted)
+	return converted, err
+}
+
+func remoteKeyQueryFailure(err error) map[string]any {
+	status := http.StatusServiceUnavailable
+	var httpErr gomatrix.HTTPError
+	if errors.As(err, &httpErr) {
+		status = httpErr.Code
+	}
+	return map[string]any{"status": status, "message": err.Error()}
+}
+
+type respUploadSignatures struct {
+	Failures map[id.UserID]map[string]*mautrix.RespError `json:"failures,omitempty"`
 }
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keyssignaturesupload
@@ -211,16 +272,61 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	ctx := r.Context()
 	u := middleware.GetRequestUserDevice(r)
 
 	// Memoize cross signing keys since they contain 3 keys and might need dupe fetches
 	getCrossSigningKeys := util.MemoizeMap(func(uid id.UserID) (*types.UserCrossSigningKeys, error) {
-		return c.db.Accounts.GetUserCrossSigningKeys(r.Context(), uid, u.UserID)
+		return c.db.Accounts.GetUserCrossSigningKeys(ctx, uid, u.UserID)
 	}, len(req))
 
-	// First pass: loop through the target objects to sign and validate they exist and match
+	userXSKeys, err := getCrossSigningKeys(u.UserID)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	var userSigningKey *mautrix.CrossSigningKeys
+	if userXSKeys != nil && userXSKeys.UserSigning.KeyID() != "" {
+		userSigningKey = &userXSKeys.UserSigning.CrossSigningKeys
+	}
+
+	remoteUserIDs := make([]id.UserID, 0, len(req))
+	for targetUserID := range req {
+		if targetUserID.Homeserver() != c.config.ServerName {
+			remoteUserIDs = append(remoteUserIDs, targetUserID)
+		}
+	}
+	remoteCaches, err := c.db.Accounts.GetRemoteDeviceCaches(ctx, remoteUserIDs)
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+
+	targets := make([]types.KeySignatureTarget, 0, len(req))
+	localObjects := make([]mautrix.ReqKeysSignatures, 0, len(req))
+	failures := make(map[id.UserID]map[string]*mautrix.RespError)
+
+	// First pass: loop through the target objects to sign and validate they exist and match. Remote
+	// targets are fully checked here and fail individually.
 	for targetUserID, targetObjects := range req {
 		for targetKey, targetObject := range targetObjects {
+			if targetUserID.Homeserver() != c.config.ServerName {
+				failure := shared.RemoteSignatureTargetFailure(u.UserID, userSigningKey, remoteCaches[targetUserID], targetKey, targetObject)
+				if failure != nil {
+					if failures[targetUserID] == nil {
+						failures[targetUserID] = make(map[string]*mautrix.RespError, 1)
+					}
+					failures[targetUserID][targetKey] = failure
+					continue
+				}
+				targets = append(targets, types.KeySignatureTarget{
+					UserID:     targetUserID,
+					KeyID:      id.KeyID(targetKey),
+					Signatures: targetObject.Signatures,
+				})
+				continue
+			}
+
 			if targetObject.DeviceID == "" {
 				// Target is one of the users cross signing keys
 				targetXSKeys, err := getCrossSigningKeys(targetUserID)
@@ -231,19 +337,21 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 
 				// Find and validate the relevant cross signing key matches the input
 				var targetXSKey *types.CrossSigningKey
-				switch targetKey {
-				case targetXSKeys.Master.FirstKey().String():
-					targetXSKey = &targetXSKeys.Master
-				case targetXSKeys.SelfSigning.FirstKey().String():
-					targetXSKey = &targetXSKeys.SelfSigning
-				case targetXSKeys.UserSigning.FirstKey().String():
-					if u.UserID != targetUserID {
-						// This should be impossible, if the client has access to the actual user
-						// signing key of another user we screwed up big time.
-						util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Cannot access another users user signing key")
-						return
+				if targetXSKeys != nil {
+					switch targetKey {
+					case targetXSKeys.Master.FirstKey().String():
+						targetXSKey = &targetXSKeys.Master
+					case targetXSKeys.SelfSigning.FirstKey().String():
+						targetXSKey = &targetXSKeys.SelfSigning
+					case targetXSKeys.UserSigning.FirstKey().String():
+						if u.UserID != targetUserID {
+							// This should be impossible, if the client has access to the actual user
+							// signing key of another user we screwed up big time.
+							util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Cannot access another users user signing key")
+							return
+						}
+						targetXSKey = &targetXSKeys.UserSigning
 					}
-					targetXSKey = &targetXSKeys.UserSigning
 				}
 				if targetXSKey == nil {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Target cross signing key does not exist")
@@ -253,8 +361,13 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 			} else {
-				// Target is one of the users device keys
-				targetDeviceKeys, err := c.db.Accounts.GetDeviceKeys(r.Context(), targetUserID, targetObject.DeviceID, u.UserID)
+				// Target is one of the users device keys. Synapse keys the target by the map key, so
+				// a different device_id would sign one device and announce another.
+				if targetObject.DeviceID.String() != targetKey {
+					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Target device ID does not match its key")
+					return
+				}
+				targetDeviceKeys, err := c.db.Accounts.GetDeviceKeys(ctx, targetUserID, targetObject.DeviceID)
 				if err != nil {
 					util.ResponseErrorUnknownJSON(w, r, err)
 					return
@@ -266,50 +379,45 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 			}
+
+			targets = append(targets, types.KeySignatureTarget{
+				UserID:     targetUserID,
+				KeyID:      id.KeyID(targetKey),
+				DeviceID:   targetObject.DeviceID,
+				Signatures: targetObject.Signatures,
+			})
+			localObjects = append(localObjects, targetObject)
 		}
 	}
 
-	// Second pass: now we're happy with the objects, pull all the users keys (ie all the possible
-	// signing keys), loop the target objects to sign and validate the signatures from those keys.
-	userDevices, err := c.db.Accounts.GetUserDevices(r.Context(), u.UserID)
-	if err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	}
-	userKeys := make(map[id.KeyID]id.Ed25519, 3+len(userDevices))
-	for _, device := range userDevices {
-		deviceKeys, err := c.db.Accounts.GetDeviceKeys(r.Context(), u.UserID, device.ID, u.UserID)
+	// Second pass: now we're happy with the local objects, pull all the users keys (ie all the
+	// possible signing keys), loop the target objects to sign and validate the signatures from those
+	// keys.
+	if len(localObjects) > 0 {
+		userKeys, err := c.getSignerPublicKeys(ctx, u.UserID, userXSKeys)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
 		}
-		keys := make(map[id.KeyID]id.Ed25519)
-		for k, v := range deviceKeys.Keys {
-			keys[id.KeyID(k)] = id.Ed25519(v)
-		}
-		maps.Copy(userKeys, keys)
-	}
-	userXSKeys, err := getCrossSigningKeys(u.UserID)
-	if err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	}
-	maps.Copy(userKeys, userXSKeys.Master.Keys)
-	maps.Copy(userKeys, userXSKeys.SelfSigning.Keys)
-	maps.Copy(userKeys, userXSKeys.UserSigning.Keys)
 
-	for _, targetObjects := range req {
-		for _, targetObject := range targetObjects {
+		for _, targetObject := range localObjects {
 			// Now we need to, for each signature we need to grab the relevant device or xs key
 			for signingUserID, keyToSig := range targetObject.Signatures {
 				if signingUserID != u.UserID {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid signing user ID")
 					return
 				}
-				// For each signature check the relevant key has signed the object
+				// For each signature check the relevant key has signed the object. Only ed25519
+				// keys are verified, so any other key ID would pass unchecked.
 				for keyID := range keyToSig {
+					key, ok := userKeys[keyID]
+					algorithm, _ := keyID.Parse()
+					if !ok || algorithm != id.KeyAlgorithmEd25519 {
+						util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf("Unknown signing key: %s", keyID))
+						return
+					}
 					keys := map[id.KeyID]id.Ed25519{
-						keyID: userKeys[keyID],
+						keyID: key,
 					}
 					if verifyErr := util.VerifyObjectWithEd25519Keys(u.UserID, keys, targetObject); verifyErr != nil {
 						util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Errorf("unable to verify object: %w", verifyErr).Error())
@@ -322,21 +430,73 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 
 	// Third pass: now we've confirmed all target objects both a) exist/match and b) have valid
 	// signatures, we can safely store those signatures.
-	signaturesToStore := make(map[id.UserID]map[id.KeyID]signatures.Signatures, len(req))
-	for targetUserID, targetObjects := range req {
-		for targetKey, targetObject := range targetObjects {
-			if _, ok := signaturesToStore[targetUserID]; !ok {
-				signaturesToStore[targetUserID] = make(map[id.KeyID]signatures.Signatures, 1)
-			}
-			signaturesToStore[targetUserID][id.KeyID(targetKey)] = targetObject.Signatures
+	if len(targets) > 0 {
+		if err := c.db.Accounts.StoreKeySignatures(ctx, u.UserID, targets); err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
+		}
+		if err := c.notifyCrossSignatures(ctx, u.UserID, targets); err != nil {
+			util.ResponseErrorUnknownJSON(w, r, err)
+			return
 		}
 	}
-	if err := c.db.Accounts.StoreKeySignatures(r.Context(), signaturesToStore); err != nil {
-		util.ResponseErrorUnknownJSON(w, r, err)
-		return
-	}
 
-	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
+	util.ResponseJSON(w, r, http.StatusOK, respUploadSignatures{Failures: failures})
+}
+
+func (c *ClientRoutes) getSignerPublicKeys(
+	ctx context.Context,
+	userID id.UserID,
+	xsKeys *types.UserCrossSigningKeys,
+) (map[id.KeyID]id.Ed25519, error) {
+	devices, err := c.db.Accounts.GetUserDevices(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	keys := make(map[id.KeyID]id.Ed25519, 3+len(devices))
+	for _, device := range devices {
+		deviceKeys, err := c.db.Accounts.GetDeviceKeys(ctx, userID, device.ID)
+		if err != nil {
+			return nil, err
+		} else if deviceKeys == nil {
+			continue
+		}
+		for keyID, key := range deviceKeys.Keys {
+			keys[id.KeyID(keyID)] = id.Ed25519(key)
+		}
+	}
+	if xsKeys != nil {
+		maps.Copy(keys, xsKeys.Master.Keys)
+		maps.Copy(keys, xsKeys.SelfSigning.Keys)
+		maps.Copy(keys, xsKeys.UserSigning.Keys)
+	}
+	return keys, nil
+}
+
+// Cross-signatures are private to the signer, so only their own devices see the target change. No
+// change record, device-list version or EDU. Every accepted target is announced, changed or not, so
+// retrying an upload whose notification failed still reaches the signer's other devices.
+func (c *ClientRoutes) notifyCrossSignatures(ctx context.Context, requestUserID id.UserID, targets []types.KeySignatureTarget) error {
+	targetUserIDs := make(map[id.UserID]struct{}, len(targets))
+	for _, target := range targets {
+		if target.UserID != requestUserID {
+			targetUserIDs[target.UserID] = struct{}{}
+		}
+	}
+	if len(targetUserIDs) == 0 {
+		return nil
+	}
+	tds := make([]*types.ToDevice, 0, len(targetUserIDs))
+	for targetUserID := range targetUserIDs {
+		tds = append(tds, &types.ToDevice{
+			UserID:   requestUserID,
+			DeviceID: id.DeviceID("*"),
+			Sender:   targetUserID,
+			Type:     types.BabbleservLocalDeviceChange,
+		})
+	}
+	_, err := c.db.SendToDeviceEvents(ctx, tds, transient.SendToDeviceOptions{})
+	return err
 }
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keysdevice_signingupload
@@ -421,7 +581,7 @@ func (c *ClientRoutes) UploadKeys(w http.ResponseWriter, r *http.Request) {
 
 	if req.DeviceKeys == nil {
 		var err error
-		deviceKeys, err = c.db.Accounts.GetDeviceKeys(r.Context(), u.UserID, u.DeviceID, u.UserID)
+		deviceKeys, err = c.db.Accounts.GetDeviceKeys(r.Context(), u.UserID, u.DeviceID)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
