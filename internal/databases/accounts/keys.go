@@ -74,19 +74,14 @@ func (a *AccountsDatabase) ClaimOrGetPreKeys(
 }
 
 // Changed signatures of the signer's own devices allocate a device-list version, of the signer's own
-// master or self-signing key write a `*` record. Returns the other users whose keys gained changed
-// signatures: private cross-signatures, never federated.
+// master or self-signing key write a `*` record. Signatures of other users' keys are private
+// cross-signatures, never federated.
 func (a *AccountsDatabase) StoreKeySignatures(
 	ctx context.Context,
-	signerUserID id.UserID,
+	requestUserID id.UserID,
 	targets []types.KeySignatureTarget,
-) ([]id.UserID, error) {
-	type result struct {
-		recorded   bool
-		otherUsers []id.UserID
-	}
-
-	res, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (result, error) {
+) error {
+	recorded, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
 		targetKeys := make(map[id.UserID]map[id.KeyID]struct{}, len(targets))
 		for _, target := range targets {
 			if targetKeys[target.UserID] == nil {
@@ -94,21 +89,20 @@ func (a *AccountsDatabase) StoreKeySignatures(
 			}
 			targetKeys[target.UserID][target.KeyID] = struct{}{}
 		}
-		_, stored := a.users.TxnGetKeySignatures(txn, signerUserID, targetKeys)
+		_, stored := a.users.TxnGetKeySignatures(txn, requestUserID, targetKeys)
 
 		var changedDevices []id.DeviceID
 		var changedOwnKeys []id.KeyID
-		otherUsers := make(map[id.UserID]struct{})
 		for _, target := range targets {
-			uploaded := target.Signatures[signerUserID]
+			uploaded := target.Signatures[requestUserID]
 			if !types.SignaturesChanged(stored[target.UserID][target.KeyID], uploaded) {
 				continue
 			}
-			a.users.TxnStoreKeySignatures(txn, target.UserID, target.KeyID, signatures.Signatures{signerUserID: uploaded})
+			a.users.TxnStoreKeySignatures(txn, target.UserID, target.KeyID, signatures.Signatures{requestUserID: uploaded})
 
 			switch {
-			case target.UserID != signerUserID:
-				otherUsers[target.UserID] = struct{}{}
+			case target.UserID != requestUserID:
+				continue
 			case target.DeviceID != "":
 				changedDevices = append(changedDevices, target.DeviceID)
 			default:
@@ -117,35 +111,32 @@ func (a *AccountsDatabase) StoreKeySignatures(
 		}
 
 		if len(changedDevices) >= types.MaxVersionstampUserVersion {
-			return result{}, fmt.Errorf("too many device signatures in one upload: %d", len(changedDevices))
+			return false, fmt.Errorf("too many device signatures in one upload: %d", len(changedDevices))
 		}
 		for index, deviceID := range changedDevices {
-			if err := a.txnStoreDeviceListChange(txn, signerUserID, deviceID, uint16(index)); err != nil {
-				return result{}, err
+			if err := a.txnStoreDeviceListChange(txn, requestUserID, deviceID, uint16(index)); err != nil {
+				return false, err
 			}
 		}
 
-		publicKeyChanged, err := a.txnContainsPublicCrossSigningKey(txn, signerUserID, changedOwnKeys)
+		publicKeyChanged, err := a.txnContainsPublicCrossSigningKey(txn, requestUserID, changedOwnKeys)
 		if err != nil {
-			return result{}, err
+			return false, err
 		} else if publicKeyChanged {
 			version := tuple.IncompleteVersionstamp(uint16(len(changedDevices)))
-			a.devices.TxnStoreDeviceChange(txn, signerUserID, id.DeviceID("*"), version)
+			a.devices.TxnStoreDeviceChange(txn, requestUserID, id.DeviceID("*"), version)
 		}
 
-		return result{
-			recorded:   len(changedDevices) > 0 || publicKeyChanged,
-			otherUsers: slices.Sorted(maps.Keys(otherUsers)),
-		}, nil
+		return len(changedDevices) > 0 || publicKeyChanged, nil
 	})
 	if err != nil {
-		return nil, err
-	} else if res.recorded {
+		return err
+	} else if recorded {
 		a.notifier.SendChange(notifier.Change{
-			UserIDs: []id.UserID{signerUserID},
+			UserIDs: []id.UserID{requestUserID},
 		})
 	}
-	return res.otherUsers, nil
+	return nil
 }
 
 // The user-signing key is private to its owner, so signatures of it never federate
@@ -160,6 +151,18 @@ func (a *AccountsDatabase) txnContainsPublicCrossSigningKey(txn fdb.ReadTransact
 	return slices.ContainsFunc(keyIDs, func(keyID id.KeyID) bool {
 		return keyID == keys.Master.KeyID() || keyID == keys.SelfSigning.KeyID()
 	}), nil
+}
+
+// Returns target user → target key → signer key → signature
+func (a *AccountsDatabase) GetKeySignaturesBySigner(
+	ctx context.Context,
+	requestUserID id.UserID,
+	targets map[id.UserID]map[id.KeyID]struct{},
+) (map[id.UserID]map[id.KeyID]map[id.KeyID]string, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (map[id.UserID]map[id.KeyID]map[id.KeyID]string, error) {
+		_, signatures := a.users.TxnGetKeySignatures(txn, requestUserID, targets)
+		return signatures, nil
+	})
 }
 
 // The owner's signatures by target key: a device ID or a cross-signing public key
@@ -210,7 +213,6 @@ func (a *AccountsDatabase) GetDeviceKeys(
 	ctx context.Context,
 	userID id.UserID,
 	deviceID id.DeviceID,
-	requestUserID id.UserID,
 ) (*mautrix.DeviceKeys, error) {
 	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*mautrix.DeviceKeys, error) {
 		keys, err := a.devices.TxnGetDeviceKeys(txn, userID, deviceID)
@@ -227,12 +229,6 @@ func (a *AccountsDatabase) GetDeviceKeys(
 			userID: {
 				deviceKeyID: {},
 			},
-		}
-		if userID != requestUserID {
-			// If we're requesting another users keys, grab any signatures from our keys for their device
-			keysForSignatures[requestUserID] = map[id.KeyID]struct{}{
-				deviceKeyID: {},
-			}
 		}
 
 		found, signatures := a.users.TxnGetKeySignatures(txn, userID, keysForSignatures)
@@ -343,11 +339,6 @@ func (a *AccountsDatabase) GetUserCrossSigningKeys(
 			// If we're requesting our own keys, also grab signatures for our user signing key
 			keysForSignatures[userID][keys.UserSigning.KeyID()] = struct{}{}
 		} else {
-			// If we're requesting another users keys, also grab signatures from our keys
-			keysForSignatures[requestUserID] = map[id.KeyID]struct{}{
-				keys.Master.KeyID():      {},
-				keys.SelfSigning.KeyID(): {},
-			}
 			// Empty the user signing xs key as this is private to the user only
 			keys.UserSigning = types.CrossSigningKey{}
 		}
