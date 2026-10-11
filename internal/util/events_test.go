@@ -253,19 +253,27 @@ func signedRemoteMember(t *testing.T, key ed25519.PrivateKey, stateKey, content 
 	ev := &types.Event{
 		PartialEvent: types.PartialEvent{
 			RoomID: "!room:example.com", Sender: "@alice:example.com", Type: event.StateMember, StateKey: &stateKey,
-			Timestamp: time.Now().UnixMilli(), Content: json.RawMessage(content),
+			Timestamp: time.Now().UnixMilli(), Content: json.RawMessage(`{}`),
 		},
 		RoomVersion:  "11",
 		PrevEventIDs: []id.EventID{},
 		AuthEventIDs: []id.EventID{},
 	}
-	hash, err := util.GetEventContentHash(ev)
-	require.NoError(t, err)
-	ev.Hashes = map[string]string{"sha256": hash}
-	signature, eventID, err := util.GetEventSignatureAndRefrerenceHash(ev, key)
-	require.NoError(t, err)
-	ev.Signatures, ev.ID = map[string]map[string]string{"example.com": {"ed25519:test": signature}}, eventID
 	b, err := json.Marshal(ev)
+	require.NoError(t, err)
+	b, err = sjson.SetRawBytes(b, "content", []byte(content))
+	require.NoError(t, err)
+	hash, err := util.GetJSONContentHash(b)
+	require.NoError(t, err)
+	b, err = sjson.SetBytes(b, "hashes", map[string]string{"sha256": hash})
+	require.NoError(t, err)
+	redacted, err := ev.MustGetRoomSpec().RedactEventJSON(b)
+	require.NoError(t, err)
+	signature, err := util.GetJSONSignature(redacted, key)
+	require.NoError(t, err)
+	eventID, err := util.GetRefHashForRedactedBytes(redacted, ev.GetRoomVersion())
+	require.NoError(t, err)
+	b, err = sjson.SetBytes(b, "signatures", map[string]map[string]string{"example.com": {"ed25519:test": signature}})
 	require.NoError(t, err)
 	return eventID, b
 }

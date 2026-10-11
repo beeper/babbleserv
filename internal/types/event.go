@@ -2,7 +2,11 @@ package types
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/tidwall/gjson"
@@ -21,7 +25,7 @@ var _ msgpack.Marshaler = (*Event)(nil)
 type PartialEvent struct {
 	RoomID    id.RoomID       `msgpack:"rid" json:"room_id,omitempty"`
 	Sender    id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
-	StateKey  *string         `msgpack:"sky" json:"state_key,omitempty"`
+	StateKey  *string         `msgpack:"sky" json:"state_key,omitzero"`
 	Content   json.RawMessage `msgpack:"cnt" json:"content"`
 	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
 	Timestamp int64           `msgpack:"ots" json:"origin_server_ts,omitzero"`
@@ -73,10 +77,29 @@ type Event struct {
 	Hashes     map[string]string            `msgpack:"hsh" json:"hashes"`
 	Signatures map[string]map[string]string `msgpack:"sig" json:"signatures"`
 
+	// Catch-all map for any fields not specified above so they're not lost
+	Extra EventExtra `msgpack:"ext,omitempty" json:",embed"`
+
 	// Internal, in-memory only flags used for the lifetime of a request/background job
 	ClientTransactionID string `msgpack:"-" json:"-"`
 	IsForClientAPI      bool   `msgpack:"-" json:"-"`
 	IsDuplicate         bool   `msgpack:"-" json:"-"`
+}
+
+type EventExtra map[string]jsontext.Value
+
+// Members are kept as received but only their canonical form is size checked, so they're compacted
+// when stored
+func (e EventExtra) MarshalMsgpack() ([]byte, error) {
+	compacted := make(map[string]jsontext.Value, len(e))
+	for name, value := range e {
+		value = slices.Clone(value)
+		if err := value.Compact(); err != nil {
+			return nil, err
+		}
+		compacted[name] = value
+	}
+	return msgpack.Marshal(compacted)
 }
 
 func NewEventFromBytes(b []byte, id id.EventID) (*Event, error) {
@@ -221,7 +244,10 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 	domainlessCreate := ev.Type == event.StateCreate && err == nil && roomSpec.DomainlessRoomIDs()
 	if ev.IsForClientAPI {
 		// Client API removes room_id, adds event_id
-		b := exerrors.Must(json.Marshal(ev.PartialEvent))
+		b, err := jsonv2.Marshal(clientEvent{ev.PartialEvent, ev.Extra}, jsonv2.Deterministic(true))
+		if err != nil {
+			return nil, err
+		}
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
 		// Clients need the derived room ID even though v12 create PDUs omit it.
 		if domainlessCreate {
@@ -236,13 +262,10 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 		return b, nil
 	}
 
-	if ev.AuthEventIDs == nil {
-		ev.AuthEventIDs = make([]id.EventID, 0)
+	b, err := jsonv2.Marshal((marshalEvent)(ev), jsonv2.Deterministic(true))
+	if err != nil {
+		return nil, err
 	}
-	if ev.PrevEventIDs == nil {
-		ev.PrevEventIDs = make([]id.EventID, 0)
-	}
-	b := exerrors.Must(json.Marshal((marshalEvent)(ev)))
 	if domainlessCreate {
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
 	}
@@ -251,8 +274,16 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 	return b, nil
 }
 
+type clientEvent struct {
+	PartialEvent
+	Extra EventExtra `json:",embed"`
+}
+
 func (ev *Event) UnmarshalJSON(b []byte) error {
-	if err := json.Unmarshal(b, (*marshalEvent)(ev)); err != nil {
+	ev.Extra = nil
+	if err := jsonv2.Unmarshal(b, (*marshalEvent)(ev)); err != nil {
+		return err
+	} else if err := ev.checkExtra(); err != nil {
 		return err
 	}
 	if ev.Type != event.StateCreate {
@@ -278,6 +309,38 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	ev.RoomID = id.RoomID(pdu.RoomID().String())
+	return nil
+}
+
+// Members servers once added by mistake in Synapse, which also leaves them out of the content hash
+var droppedMemberNames = []string{"age_ts", "outlier", "destinations"}
+
+// The members gomatrixserverlib reads using jsonv1, which it matches regardless of case
+var caseFoldedMemberNames = []string{
+	"type", "room_id", "sender", "state_key", "content", "redacts", "unsigned", "hashes", "signatures",
+	"depth", "prev_events", "prev_state", "auth_events", "origin", "origin_server_ts", "membership",
+}
+
+// checkExtra drops the members Synapse leaves out of the content hash, and refuses those that would
+// make the event mean something other than its hashes and signatures cover:
+//   - event_id, which Synapse refuses from room version 3, and which gomatrixserverlib would take
+//     for the ID of a create event with a domainless room ID
+//   - a case variant of a member gomatrixserverlib reads, which it would take for that member
+//   - a name gomatrixserverlib's canonical JSON can't hash, as it writes names back unescaped
+func (ev *Event) checkExtra() error {
+	for name := range ev.Extra {
+		if slices.Contains(droppedMemberNames, name) {
+			delete(ev.Extra, name)
+		} else if strings.EqualFold(name, "event_id") {
+			return fmt.Errorf("event has an %q member", name)
+		} else if i := slices.IndexFunc(caseFoldedMemberNames, func(reserved string) bool {
+			return strings.EqualFold(name, reserved) && name != reserved
+		}); i >= 0 {
+			return fmt.Errorf("event member %q differs from %q only in case", name, caseFoldedMemberNames[i])
+		} else if strings.ContainsFunc(name, func(r rune) bool { return r == '"' || r == '\\' || r < ' ' }) {
+			return fmt.Errorf("event member %q has a name canonical JSON cannot hash", name)
+		}
+	}
 	return nil
 }
 
