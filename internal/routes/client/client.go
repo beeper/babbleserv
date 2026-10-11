@@ -16,6 +16,7 @@ import (
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/notifier"
+	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
@@ -28,6 +29,7 @@ type ClientRoutes struct {
 	fclient     fclient.FederationClient
 	fedClient   *federation.Client
 	mediaClient *federation.Client
+	keysClient  *federation.Client
 	keyStore    *util.KeyStore
 	datastores  *util.Datastores
 	notifiers   *notifier.Notifiers
@@ -56,6 +58,10 @@ func NewClientRoutes(
 	mediaClient.HTTP.Timeout = 0 // The media acquisition context covers network and storage work.
 	mediaClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.MaxResponseHeaderBytes = 64 * 1024
 
+	// Shares the transport and its resolution cache, with a size limit of its own
+	keysClient := *fedClient
+	keysClient.ResponseSizeLimit = types.MaxRemoteKeyQueryResponseBytes
+
 	return &ClientRoutes{
 		log:         log,
 		db:          db,
@@ -63,6 +69,7 @@ func NewClientRoutes(
 		fclient:     fclient,
 		fedClient:   fedClient,
 		mediaClient: mediaClient,
+		keysClient:  &keysClient,
 		keyStore:    keyStore,
 		datastores:  datastores,
 		notifiers:   notifiers,

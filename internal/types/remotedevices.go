@@ -16,6 +16,9 @@ const (
 	MaxRemoteDevicePrevIDs          = 10
 	MaxRemoteDeviceEDUsPerIngest    = 100
 	MaxRemoteDeviceStreamHistory    = 200
+	// A live key query answers for a batch of a server's users at once, so it has room for several
+	// full device snapshots
+	MaxRemoteKeyQueryResponseBytes = 4 * MaxRemoteDeviceSnapshotBytes
 
 	RemoteDeviceStreamHistoryRetention = 30 * time.Minute
 	RemoteDeviceCacheRetention         = 30 * 24 * time.Hour

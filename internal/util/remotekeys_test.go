@@ -21,6 +21,17 @@ const (
 	canonicalRemotePhoneKeys = `{"device_id":"PHONE","keys":{"ed25519:PHONE":"key"},"signatures":{"@alice:remote.example":{"ed25519:PHONE":"sig"}},"user_id":"@alice:remote.example"}`
 )
 
+func TestParseRemoteQueriedDevice(t *testing.T) {
+	device, valid := ParseRemoteQueriedDevice(remoteKeysUser, "PHONE", json.RawMessage(remotePhoneKeys))
+	require.True(t, valid)
+	assert.Equal(t, types.RemoteDevice{DisplayName: "Phone", Keys: json.RawMessage(canonicalRemotePhoneKeys)}, device)
+
+	for deviceID, raw := range map[id.DeviceID]string{"LAPTOP": remotePhoneKeys, "PHONE": `null`} {
+		_, valid := ParseRemoteQueriedDevice(remoteKeysUser, deviceID, json.RawMessage(raw))
+		assert.False(t, valid, deviceID)
+	}
+}
+
 func TestParseDeviceListUpdateEDU(t *testing.T) {
 	userID, update, err := ParseDeviceListUpdateEDU(json.RawMessage(
 		`{"user_id":"@alice:remote.example","device_id":"PHONE","stream_id":5,"prev_id":[4],"device_display_name":"Phone","keys":` + remotePhoneKeys + `}`,

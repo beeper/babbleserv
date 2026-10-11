@@ -1,6 +1,8 @@
 package types
 
 import (
+	"encoding/json"
+
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
@@ -22,6 +24,16 @@ type UserCrossSigningKeys struct {
 	Master      CrossSigningKey `json:"master_key"`
 	SelfSigning CrossSigningKey `json:"self_signing_key"`
 	UserSigning CrossSigningKey `json:"user_signing_key"`
+}
+
+// RespQueryKeys is mautrix.RespQueryKeys with each signed key object kept as raw JSON, since
+// decoding into the mautrix structs drops signed members they don't know and breaks the signatures
+type RespQueryKeys struct {
+	Failures        map[string]any                                `json:"failures,omitempty"`
+	DeviceKeys      map[id.UserID]map[id.DeviceID]json.RawMessage `json:"device_keys"`
+	MasterKeys      map[id.UserID]json.RawMessage                 `json:"master_keys"`
+	SelfSigningKeys map[id.UserID]json.RawMessage                 `json:"self_signing_keys"`
+	UserSigningKeys map[id.UserID]json.RawMessage                 `json:"user_signing_keys"`
 }
 
 type KeySignatureTarget struct {

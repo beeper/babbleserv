@@ -82,15 +82,11 @@ func decodeEd25519PublicKey(encoded string) (ed25519.PublicKey, error) {
 	return key, nil
 }
 
-func BoundRemoteDeviceDisplayName(name string) string {
-	if len(name) > types.MaxRemoteDeviceDisplayNameBytes {
-		return ""
-	}
-	return name
-}
-
 func parseRemoteDevice(userID id.UserID, deviceID id.DeviceID, displayName string, keys json.RawMessage) (types.RemoteDevice, error) {
-	device := types.RemoteDevice{DisplayName: BoundRemoteDeviceDisplayName(displayName)}
+	if len(displayName) > types.MaxRemoteDeviceDisplayNameBytes {
+		displayName = ""
+	}
+	device := types.RemoteDevice{DisplayName: displayName}
 	if isAbsentJSON(keys) {
 		return device, nil
 	}
@@ -140,8 +136,8 @@ func ParseSigningKeyUpdateEDU(content json.RawMessage) (id.UserID, types.RemoteS
 	if err := json.Unmarshal(content, &edu); err != nil {
 		return userID, types.RemoteSigningKeyUpdate{Invalid: true}, nil
 	}
-	masterKey, masterValid := validateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
-	selfSigningKey, selfSigningValid := validateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigning)
+	masterKey, masterValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
+	selfSigningKey, selfSigningValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigning)
 	return userID, types.RemoteSigningKeyUpdate{
 		MasterKey:      masterKey,
 		SelfSigningKey: selfSigningKey,
@@ -186,12 +182,23 @@ func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDevi
 			snapshot.Devices[device.ID] = parsed
 		}
 	}
-	snapshot.MasterKey, _ = validateOptionalCrossSigningKey(userID, id.XSUsageMaster, response.MasterKey)
-	snapshot.SelfSigningKey, _ = validateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, response.SelfSigningKey)
+	snapshot.MasterKey, _ = ValidateOptionalCrossSigningKey(userID, id.XSUsageMaster, response.MasterKey)
+	snapshot.SelfSigningKey, _ = ValidateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, response.SelfSigningKey)
 	return snapshot, nil
 }
 
-func validateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
+// A queried device is only listed with its keys, which carry its display name in their unsigned
+func ParseRemoteQueriedDevice(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (types.RemoteDevice, bool) {
+	var keys mautrix.DeviceKeys
+	if len(deviceID) > types.MaxRemoteDeviceIDBytes || json.Unmarshal(raw, &keys) != nil {
+		return types.RemoteDevice{}, false
+	}
+	displayName, _ := keys.Unsigned["device_display_name"].(string)
+	device, err := parseRemoteDevice(userID, deviceID, displayName, raw)
+	return device, err == nil && device.Keys != nil
+}
+
+func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
 	if isAbsentJSON(raw) {
 		return nil, true
 	}
