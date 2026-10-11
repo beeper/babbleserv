@@ -3,7 +3,6 @@ package types
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/vmihailenco/msgpack/v5"
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -29,24 +28,26 @@ type UserDeviceChange struct {
 	Stream *DeviceListStream
 }
 
-// One read of a local device for its device-list EDU; Device nil when deleted
+// One read of a local device for its device-list EDU; Device nil when deleted. Keys carry the
+// owner's signatures.
 type LocalDeviceListUpdate struct {
 	Version int64
 	Device  *Device
-	Keys    *mautrix.DeviceKeys
+	Keys    SignedDeviceKeys
 }
 
 type LocalSnapshotDevice struct {
 	Device Device
-	Keys   *mautrix.DeviceKeys
+	Keys   SignedDeviceKeys
 }
 
-// A local user's device list as one read: what /user/devices and join announcements serve
+// A local user's device list as one read: what /user/devices and join announcements serve. Keys
+// carry the owner's signatures.
 type LocalDeviceSnapshot struct {
 	Version        int64
 	Devices        []LocalSnapshotDevice
-	MasterKey      *mautrix.CrossSigningKeys
-	SelfSigningKey *mautrix.CrossSigningKeys
+	MasterKey      SignedCrossSigningKey
+	SelfSigningKey SignedCrossSigningKey
 }
 
 func NewDevice(id id.DeviceID, displayName string) *Device {

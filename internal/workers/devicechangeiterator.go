@@ -292,12 +292,16 @@ func (d *DeviceChangeIterator) remoteDeviceChangeEDU(change types.UserDeviceChan
 		d.log.Warn().Msg("Got empty cross signing keys for device change, ignoring")
 		return event.Type{}, nil, nil
 	}
-	content := types.SigningKeyUpdateEDUContent{
-		UserID:      change.UserID,
-		MasterKey:   keys.Master.CrossSigningKeys,
-		SelfSigning: keys.SelfSigning.CrossSigningKeys,
-	}
+	content := signingKeyUpdateContent(change.UserID, keys)
 	return types.BabbleservRemoteSigningKeyUpdate, exerrors.Must(json.Marshal(content)), nil
+}
+
+func signingKeyUpdateContent(userID id.UserID, keys *types.UserCrossSigningKeys) types.SigningKeyUpdateEDUContent {
+	return types.SigningKeyUpdateEDUContent{
+		UserID:      userID,
+		MasterKey:   keys.Master,
+		SelfSigning: keys.SelfSigning,
+	}
 }
 
 func deviceListUpdateContent(

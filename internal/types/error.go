@@ -28,4 +28,6 @@ var (
 	ErrProfileDisplayNameTooLong = errors.New("profile display name exceeds search index limit")
 
 	ErrInvalidPaginationToken = errors.New("invalid pagination token")
+
+	ErrMasterKeyChanged = errors.New("master key changed since the upload was verified")
 )

@@ -24,6 +24,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 // This test uses the test vectors defined in the Matrix spec:
@@ -82,7 +83,7 @@ func TestEventHashAndSign(t *testing.T) {
 		assert.Equal(t, expectedSignature, signature)
 
 		// And verifying works
-		err = util.VerifyJSON(signedEvent, "domain", "ed25519:1", key.Public().(ed25519.PublicKey))
+		err = signedjson.Verify(signedEvent, "domain", "ed25519:1", key.Public().(ed25519.PublicKey))
 		require.NoError(t, err)
 	})
 
@@ -103,11 +104,11 @@ func TestEventHashAndSign(t *testing.T) {
 		assert.Equal(t, expectedSignature, gjson.GetBytes(signedEvent, "signatures.domain\\.com.ed25519:2").String())
 		assert.Equal(t, expectedSignature, gjson.GetBytes(signedEvent, "signatures.anotherdomain.ed25519:1").String())
 
-		err = util.VerifyJSON(signedEvent, "domain.com", "ed25519:1", key.Public().(ed25519.PublicKey))
+		err = signedjson.Verify(signedEvent, "domain.com", "ed25519:1", key.Public().(ed25519.PublicKey))
 		require.NoError(t, err)
-		err = util.VerifyJSON(signedEvent, "domain.com", "ed25519:2", key.Public().(ed25519.PublicKey))
+		err = signedjson.Verify(signedEvent, "domain.com", "ed25519:2", key.Public().(ed25519.PublicKey))
 		require.NoError(t, err)
-		err = util.VerifyJSON(signedEvent, "anotherdomain", "ed25519:1", key.Public().(ed25519.PublicKey))
+		err = signedjson.Verify(signedEvent, "anotherdomain", "ed25519:1", key.Public().(ed25519.PublicKey))
 		require.NoError(t, err)
 	})
 }
@@ -149,7 +150,7 @@ func TestVerifyEventJSON(t *testing.T) {
 	pubKey, err := util.Base64Decode("l8Hft5qXKn1vfHrg3p4+W8gELQVo8N13JkluMfmn2sQ")
 	require.NoError(t, err)
 
-	err = util.VerifyJSON(b, "matrix.org", "ed25519:a_RXGa", pubKey)
+	err = signedjson.Verify(b, "matrix.org", "ed25519:a_RXGa", pubKey)
 	require.NoError(t, err)
 }
 

@@ -48,8 +48,8 @@ func (r *RemoteDevicesDirectory) TxnPublishSnapshot(
 		r.txnStoreDevice(txn, userID, deviceID, device)
 	}
 	r.txnStoreSigningKeys(txn, userID, storedSigningKeys{
-		MasterKey:      snapshot.MasterKey,
-		SelfSigningKey: snapshot.SelfSigningKey,
+		MasterKey:      snapshot.MasterKey.Raw,
+		SelfSigningKey: snapshot.SelfSigningKey.Raw,
 	})
 	r.txnStoreStreamID(txn, userID, &m, snapshot.StreamID, now)
 	r.txnCancelJob(txn, decodeJob(userID, jobFuture.MustGet()))
@@ -122,7 +122,9 @@ func (r *RemoteDevicesDirectory) TxnIngest(
 		signingKeys: signingKeysFuture.mustGet(),
 	}
 	for deviceID, future := range deviceFutures {
-		state.devices[deviceID] = decodeDevice(future.MustGet())
+		if state.devices[deviceID], err = decodeDevice(future.MustGet()); err != nil {
+			state.corrupt = true
+		}
 	}
 
 	plan := planIngest(state, edus, now)
@@ -175,6 +177,8 @@ type ingestState struct {
 	// Stored device per ID the batch names, nil when absent
 	devices     map[id.DeviceID]*types.RemoteDevice
 	signingKeys storedSigningKeys
+	// A stored device's keys no longer parse, though they were validated before they were stored
+	corrupt bool
 }
 
 type ingestPlan struct {
@@ -202,7 +206,7 @@ func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) 
 		return ingestPlan{notify: reported}
 	case !state.meta.hasSnapshot():
 		return ingestPlan{refetch: true, notify: reported}
-	case len(edus) > types.MaxRemoteDeviceEDUsPerIngest:
+	case len(edus) > types.MaxRemoteDeviceEDUsPerIngest, state.corrupt:
 		return wipeAndRefetch
 	}
 
@@ -227,12 +231,12 @@ func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) 
 				return wipeAndRefetch
 			}
 			// Only the supplied keys are replaced: an omitted key is never a deletion
-			if keys.MasterKey != nil && !bytes.Equal(keys.MasterKey, signingKeys.MasterKey) {
-				signingKeys.MasterKey = keys.MasterKey
+			if !keys.MasterKey.IsZero() && !bytes.Equal(keys.MasterKey.Raw, signingKeys.MasterKey) {
+				signingKeys.MasterKey = keys.MasterKey.Raw
 				plan.signingKeys = &signingKeys
 			}
-			if keys.SelfSigningKey != nil && !bytes.Equal(keys.SelfSigningKey, signingKeys.SelfSigningKey) {
-				signingKeys.SelfSigningKey = keys.SelfSigningKey
+			if !keys.SelfSigningKey.IsZero() && !bytes.Equal(keys.SelfSigningKey.Raw, signingKeys.SelfSigningKey) {
+				signingKeys.SelfSigningKey = keys.SelfSigningKey.Raw
 				plan.signingKeys = &signingKeys
 			}
 			continue
@@ -272,7 +276,7 @@ func planIngest(state ingestState, edus []types.RemoteDeviceEDU, now time.Time) 
 			plan.deviceCount--
 		case current == nil && plan.deviceCount >= types.MaxRemoteDevicesPerUser:
 			return wipeAndRefetch
-		case current != nil && current.DisplayName == update.Device.DisplayName && bytes.Equal(current.Keys, update.Device.Keys):
+		case current != nil && current.DisplayName == update.Device.DisplayName && bytes.Equal(current.Keys.Raw, update.Device.Keys.Raw):
 		default:
 			if current == nil {
 				plan.deviceCount++

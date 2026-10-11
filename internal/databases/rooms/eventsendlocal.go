@@ -19,6 +19,7 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 	"github.com/beeper/babbleserv/internal/util/lock"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 var (
@@ -288,7 +289,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			// them, and repeated leaves or kicks are authorized afresh.
 			if prevStateEventID != "" && partialEv.Type != event.StateMember {
 				currentEv := eventsProvider.MustGet(prevStateEventID)
-				if currentEv != nil && util.CompareSignedJSON(partialEv.Content, currentEv.Content) {
+				if currentEv != nil && signedjson.Matches(partialEv.Content, currentEv.Content) {
 					zerolog.Ctx(ctx).Warn().
 						Stringer("event_id", currentEv.ID).
 						Stringer("type", currentEv.Type).

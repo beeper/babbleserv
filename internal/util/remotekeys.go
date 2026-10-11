@@ -1,75 +1,50 @@
 package util
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
-	"encoding/json/jsontext"
-	"errors"
 	"fmt"
 	"slices"
 
-	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// Ingest compares stored keys byte for byte, so they are kept as canonical JSON without unsigned.
-// Duplicate names are rejected because gjson and encoding/json would resolve them differently.
-func canonicalRemoteKeyObject(raw json.RawMessage) (json.RawMessage, error) {
-	if len(raw) > types.MaxRemoteKeyObjectBytes {
-		return nil, fmt.Errorf("key object exceeds %d bytes", types.MaxRemoteKeyObjectBytes)
-	} else if !jsontext.Value(raw).IsValid() {
-		return nil, errors.New("key object is not valid JSON or has duplicate names")
+// Ingest compares stored keys byte for byte, so they are kept as canonical JSON without unsigned
+func canonicalRemoteKeyObject[T any](key types.SignedJSON[T]) (types.SignedJSON[T], error) {
+	if len(key.Raw) > types.MaxRemoteKeyObjectBytes {
+		return types.SignedJSON[T]{}, fmt.Errorf("key object exceeds %d bytes", types.MaxRemoteKeyObjectBytes)
 	}
-	withoutUnsigned, err := sjson.DeleteBytes(raw, "unsigned")
-	if err != nil {
-		return nil, err
-	}
-	return gomatrixserverlib.CanonicalJSON(withoutUnsigned)
+	return key.Canonical()
 }
 
-func validateRemoteDeviceKeys(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (json.RawMessage, error) {
-	canonical, err := canonicalRemoteKeyObject(raw)
-	if err != nil {
-		return nil, err
+func validateRemoteDeviceKeys(userID id.UserID, deviceID id.DeviceID, keys types.SignedDeviceKeys) (types.SignedDeviceKeys, error) {
+	if keys.View.UserID != userID || keys.View.DeviceID != deviceID {
+		return types.SignedDeviceKeys{}, fmt.Errorf("device keys for %s %s listed under %s %s", keys.View.UserID, keys.View.DeviceID, userID, deviceID)
 	}
-	var keys mautrix.DeviceKeys
-	if err := json.Unmarshal(canonical, &keys); err != nil {
-		return nil, err
-	} else if keys.UserID != userID || keys.DeviceID != deviceID {
-		return nil, fmt.Errorf("device keys for %s %s listed under %s %s", keys.UserID, keys.DeviceID, userID, deviceID)
-	}
-	return canonical, nil
+	return canonicalRemoteKeyObject(keys)
 }
 
-func validateRemoteCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, error) {
-	canonical, err := canonicalRemoteKeyObject(raw)
-	if err != nil {
-		return nil, err
+// CheckCrossSigningKey checks a cross-signing key belongs to the user, has the usage and holds one
+// ed25519 key, named by itself
+func CheckCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, key types.SignedCrossSigningKey) error {
+	if key.View.UserID != userID {
+		return fmt.Errorf("cross-signing key user ID %q does not match %q", key.View.UserID, userID)
+	} else if !slices.Contains(key.View.Usage, usage) {
+		return fmt.Errorf("cross-signing key usage %v does not include %q", key.View.Usage, usage)
+	} else if len(key.View.Keys) != 1 {
+		return fmt.Errorf("cross-signing key has %d keys, expected 1", len(key.View.Keys))
 	}
-	var key mautrix.CrossSigningKeys
-	if err := json.Unmarshal(canonical, &key); err != nil {
-		return nil, err
-	} else if key.UserID != userID {
-		return nil, fmt.Errorf("cross-signing key user ID %q does not match %q", key.UserID, userID)
-	} else if !slices.Contains(key.Usage, usage) {
-		return nil, fmt.Errorf("cross-signing key usage %v does not include %q", key.Usage, usage)
-	} else if len(key.Keys) != 1 {
-		return nil, fmt.Errorf("cross-signing key has %d keys, expected 1", len(key.Keys))
-	}
-
-	for keyID, publicKey := range key.Keys {
+	for keyID, publicKey := range key.View.Keys {
 		if keyID != id.NewKeyID(id.KeyAlgorithmEd25519, publicKey.String()) {
-			return nil, fmt.Errorf("cross-signing key ID %q does not match its key", keyID)
+			return fmt.Errorf("cross-signing key ID %q does not match its key", keyID)
 		} else if _, err := decodeEd25519PublicKey(publicKey.String()); err != nil {
-			return nil, fmt.Errorf("cross-signing key %q: %w", keyID, err)
+			return fmt.Errorf("cross-signing key %q: %w", keyID, err)
 		}
 	}
-	return canonical, nil
+	return nil
 }
 
 func decodeEd25519PublicKey(encoded string) (ed25519.PublicKey, error) {
@@ -82,12 +57,12 @@ func decodeEd25519PublicKey(encoded string) (ed25519.PublicKey, error) {
 	return key, nil
 }
 
-func parseRemoteDevice(userID id.UserID, deviceID id.DeviceID, displayName string, keys json.RawMessage) (types.RemoteDevice, error) {
+func parseRemoteDevice(userID id.UserID, deviceID id.DeviceID, displayName string, keys types.SignedDeviceKeys) (types.RemoteDevice, error) {
 	if len(displayName) > types.MaxRemoteDeviceDisplayNameBytes {
 		displayName = ""
 	}
 	device := types.RemoteDevice{DisplayName: displayName}
-	if isAbsentJSON(keys) {
+	if keys.IsZero() {
 		return device, nil
 	}
 	var err error
@@ -102,13 +77,13 @@ func ParseDeviceListUpdateEDU(content json.RawMessage) (id.UserID, types.RemoteD
 		return "", types.RemoteDeviceListUpdate{}, err
 	}
 
-	var edu struct {
-		types.DeviceListUpdateEDUContent
-		// Raw, as mautrix.DeviceKeys drops signed members it doesn't know
-		DeviceKeys json.RawMessage `json:"keys"`
-	}
+	var edu types.DeviceListUpdateEDUContent
 	if err := json.Unmarshal(content, &edu); err != nil {
 		return userID, types.RemoteDeviceListUpdate{Invalid: true}, nil
+	}
+	// Stream IDs start at 1. Without prev IDs a missing one resets the cache and notifies no one.
+	if edu.StreamID == 0 {
+		return userID, types.RemoteDeviceListUpdate{DeviceID: edu.DeviceID, Invalid: true}, nil
 	}
 	update := types.RemoteDeviceListUpdate{
 		DeviceID: edu.DeviceID,
@@ -129,15 +104,12 @@ func ParseSigningKeyUpdateEDU(content json.RawMessage) (id.UserID, types.RemoteS
 		return "", types.RemoteSigningKeyUpdate{}, err
 	}
 
-	var edu struct {
-		MasterKey   json.RawMessage `json:"master_key"`
-		SelfSigning json.RawMessage `json:"self_signing_key"`
-	}
+	var edu types.SigningKeyUpdateEDUContent
 	if err := json.Unmarshal(content, &edu); err != nil {
 		return userID, types.RemoteSigningKeyUpdate{Invalid: true}, nil
 	}
-	masterKey, masterValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
-	selfSigningKey, selfSigningValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigning)
+	masterKey, masterValid := validateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
+	selfSigningKey, selfSigningValid := validateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigning)
 	return userID, types.RemoteSigningKeyUpdate{
 		MasterKey:      masterKey,
 		SelfSigningKey: selfSigningKey,
@@ -145,21 +117,17 @@ func ParseSigningKeyUpdateEDU(content json.RawMessage) (id.UserID, types.RemoteS
 	}, nil
 }
 
-// An error is a failed fetch, never an empty device list. Devices with invalid keys are dropped.
+// An error is a failed fetch, never an empty device list. Invalid devices and keys are dropped.
 func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDeviceSnapshot, error) {
 	if len(body) > types.MaxRemoteDeviceSnapshotBytes {
 		return nil, fmt.Errorf("device snapshot exceeds %d bytes", types.MaxRemoteDeviceSnapshotBytes)
 	}
+	// Raw so one bad device or key is dropped on its own rather than failing the fetch
 	var response struct {
-		Devices []struct {
-			Keys        json.RawMessage `json:"keys"`
-			ID          id.DeviceID     `json:"device_id"`
-			DisplayName string          `json:"device_display_name"`
-		} `json:"devices"`
-		MasterKey      json.RawMessage `json:"master_key"`
-		SelfSigningKey json.RawMessage `json:"self_signing_key"`
-		StreamID       int64           `json:"stream_id"`
-		UserID         id.UserID       `json:"user_id"`
+		types.RespUserDevices
+		Devices        []json.RawMessage `json:"devices"`
+		MasterKey      json.RawMessage   `json:"master_key"`
+		SelfSigningKey json.RawMessage   `json:"self_signing_key"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("invalid device snapshot: %w", err)
@@ -173,9 +141,10 @@ func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDevi
 		StreamID: response.StreamID,
 		Devices:  make(map[id.DeviceID]types.RemoteDevice, len(response.Devices)),
 	}
-	for _, device := range response.Devices {
+	for _, raw := range response.Devices {
+		var device types.RespUserDevice
 		// The ID is part of the device's storage key
-		if len(device.ID) > types.MaxRemoteDeviceIDBytes {
+		if json.Unmarshal(raw, &device) != nil || len(device.ID) > types.MaxRemoteDeviceIDBytes {
 			continue
 		}
 		if parsed, err := parseRemoteDevice(userID, device.ID, device.DisplayName, device.Keys); err == nil {
@@ -189,25 +158,31 @@ func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDevi
 
 // A queried device is only listed with its keys, which carry its display name in their unsigned
 func ParseRemoteQueriedDevice(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (types.RemoteDevice, bool) {
-	var keys mautrix.DeviceKeys
-	if len(deviceID) > types.MaxRemoteDeviceIDBytes || json.Unmarshal(raw, &keys) != nil {
+	keys, err := types.ParseSignedJSON[mautrix.DeviceKeys](raw)
+	if len(deviceID) > types.MaxRemoteDeviceIDBytes || err != nil {
 		return types.RemoteDevice{}, false
 	}
-	displayName, _ := keys.Unsigned["device_display_name"].(string)
-	device, err := parseRemoteDevice(userID, deviceID, displayName, raw)
-	return device, err == nil && device.Keys != nil
+	displayName, _ := keys.View.Unsigned["device_display_name"].(string)
+	device, err := parseRemoteDevice(userID, deviceID, displayName, keys)
+	return device, err == nil && !device.Keys.IsZero()
 }
 
-func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
-	if isAbsentJSON(raw) {
-		return nil, true
+func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (types.SignedCrossSigningKey, bool) {
+	key, err := types.ParseSignedJSON[mautrix.CrossSigningKeys](raw)
+	if err != nil {
+		return types.SignedCrossSigningKey{}, false
 	}
-	key, err := validateRemoteCrossSigningKey(userID, usage, raw)
-	return key, err == nil
+	return validateOptionalCrossSigningKey(userID, usage, key)
 }
 
-func isAbsentJSON(raw json.RawMessage) bool {
-	return len(raw) == 0 || bytes.Equal(raw, []byte("null"))
+func validateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, key types.SignedCrossSigningKey) (types.SignedCrossSigningKey, bool) {
+	if key.IsZero() {
+		return key, true
+	} else if CheckCrossSigningKey(userID, usage, key) != nil {
+		return types.SignedCrossSigningKey{}, false
+	}
+	key, err := canonicalRemoteKeyObject(key)
+	return key, err == nil
 }
 
 func parseRemoteEDUUserID(content json.RawMessage) (id.UserID, error) {

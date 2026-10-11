@@ -1,7 +1,6 @@
 package types
 
 import (
-	"encoding/json"
 	"time"
 
 	"maunium.net/go/mautrix/id"
@@ -25,10 +24,10 @@ const (
 )
 
 // RemoteDevice is a remote user's device as the cache stores it. Keys is canonical JSON without
-// unsigned, nil for a device without E2E keys.
+// unsigned, absent for a device without E2E keys.
 type RemoteDevice struct {
 	DisplayName string
-	Keys        json.RawMessage
+	Keys        SignedDeviceKeys
 }
 
 type RemoteDeviceListUpdate struct {
@@ -41,10 +40,10 @@ type RemoteDeviceListUpdate struct {
 	Invalid bool
 }
 
-// Nil keys were omitted, or dropped as invalid with Invalid set
+// Absent keys were omitted, or dropped as invalid with Invalid set
 type RemoteSigningKeyUpdate struct {
-	MasterKey      json.RawMessage
-	SelfSigningKey json.RawMessage
+	MasterKey      SignedCrossSigningKey
+	SelfSigningKey SignedCrossSigningKey
 	Invalid        bool
 }
 
@@ -57,8 +56,8 @@ type RemoteDeviceEDU struct {
 type RemoteDeviceSnapshot struct {
 	StreamID       int64
 	Devices        map[id.DeviceID]RemoteDevice
-	MasterKey      json.RawMessage
-	SelfSigningKey json.RawMessage
+	MasterKey      SignedCrossSigningKey
+	SelfSigningKey SignedCrossSigningKey
 }
 
 // RemoteDeviceCache is a cached user's valid snapshot with every accepted delta applied

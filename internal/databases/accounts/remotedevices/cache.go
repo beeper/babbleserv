@@ -1,13 +1,14 @@
 package remotedevices
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -41,22 +42,49 @@ func (r *RemoteDevicesDirectory) TxnGetCache(txn fdb.ReadTransaction, userID id.
 		return nil, nil
 	}
 
-	signingKeys := signingKeysFuture.mustGet()
+	cache, err := decodeCache(userID, *m.StreamID, userDevices, kvs, signingKeysFuture.mustGet())
+	if err != nil {
+		// Keys were validated before they were stored, so this cache is corrupt: the user is queried live
+		r.log.Warn().
+			Err(err).
+			Str("user_id", userID.String()).
+			Msg("Remote device cache keys do not parse, treating as a miss")
+		return nil, nil
+	}
+	return cache, nil
+}
+
+func decodeCache(
+	userID id.UserID,
+	streamID int64,
+	userDevices subspace.Subspace,
+	kvs []fdb.KeyValue,
+	signingKeys storedSigningKeys,
+) (*types.RemoteDeviceCache, error) {
 	cache := &types.RemoteDeviceCache{
 		UserID: userID,
 		RemoteDeviceSnapshot: types.RemoteDeviceSnapshot{
-			StreamID:       *m.StreamID,
-			Devices:        make(map[id.DeviceID]types.RemoteDevice, len(kvs)),
-			MasterKey:      json.RawMessage(signingKeys.MasterKey),
-			SelfSigningKey: json.RawMessage(signingKeys.SelfSigningKey),
+			StreamID: streamID,
+			Devices:  make(map[id.DeviceID]types.RemoteDevice, len(kvs)),
 		},
+	}
+	var err error
+	if cache.MasterKey, err = types.ParseSignedJSON[mautrix.CrossSigningKeys](signingKeys.MasterKey); err != nil {
+		return nil, err
+	}
+	if cache.SelfSigningKey, err = types.ParseSignedJSON[mautrix.CrossSigningKeys](signingKeys.SelfSigningKey); err != nil {
+		return nil, err
 	}
 	for _, kv := range kvs {
 		key, err := userDevices.Unpack(kv.Key)
 		if err != nil {
 			return nil, err
 		}
-		cache.Devices[id.DeviceID(key[0].(string))] = *decodeDevice(kv.Value)
+		device, err := decodeDevice(kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		cache.Devices[id.DeviceID(key[0].(string))] = *device
 	}
 	return cache, nil
 }

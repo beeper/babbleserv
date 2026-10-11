@@ -7,8 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -69,12 +73,20 @@ func applyPlan(t *testing.T, state ingestState, plan ingestPlan, now time.Time) 
 	return next
 }
 
+func mustSigned[T any](raw json.RawMessage) types.SignedJSON[T] {
+	signed, err := types.ParseSignedJSON[T](raw)
+	if err != nil {
+		panic(err)
+	}
+	return signed
+}
+
 func deviceEDU(deviceID id.DeviceID, streamID int64, prevIDs []int64, keys json.RawMessage) types.RemoteDeviceEDU {
 	return types.RemoteDeviceEDU{DeviceList: &types.RemoteDeviceListUpdate{
 		DeviceID: deviceID,
 		StreamID: streamID,
 		PrevIDs:  prevIDs,
-		Device:   types.RemoteDevice{DisplayName: "device", Keys: keys},
+		Device:   types.RemoteDevice{DisplayName: "device", Keys: mustSigned[mautrix.DeviceKeys](keys)},
 	}}
 }
 
@@ -85,11 +97,14 @@ func deletionEDU(deviceID id.DeviceID, streamID int64, prevIDs []int64) types.Re
 }
 
 func signingKeysEDU(master, selfSigning json.RawMessage) types.RemoteDeviceEDU {
-	return types.RemoteDeviceEDU{SigningKeys: &types.RemoteSigningKeyUpdate{MasterKey: master, SelfSigningKey: selfSigning}}
+	return types.RemoteDeviceEDU{SigningKeys: &types.RemoteSigningKeyUpdate{
+		MasterKey:      mustSigned[mautrix.CrossSigningKeys](master),
+		SelfSigningKey: mustSigned[mautrix.CrossSigningKeys](selfSigning),
+	}}
 }
 
 func storedDeviceOf(keys json.RawMessage) *types.RemoteDevice {
-	return &types.RemoteDevice{DisplayName: "device", Keys: keys}
+	return &types.RemoteDevice{DisplayName: "device", Keys: mustSigned[mautrix.DeviceKeys](keys)}
 }
 
 // assertWipe checks the batch is discarded for a refetch and the change it reports is notified
@@ -515,4 +530,33 @@ func TestSigningKeyUpdates(t *testing.T) {
 	invalid := signingKeysEDU(master2, nil)
 	invalid.SigningKeys.Invalid = true
 	assertWipe(t, planIngest(state, []types.RemoteDeviceEDU{invalid}, testNow))
+}
+
+func TestPlanIngestWipesCorruptCache(t *testing.T) {
+	state := validState(5, map[id.DeviceID]*types.RemoteDevice{"A": storedDeviceOf(keysA1)})
+	state.corrupt = true
+	assertWipe(t, planIngest(state, []types.RemoteDeviceEDU{deviceEDU("A", 6, []int64{5}, keysA2)}, testNow))
+}
+
+func TestDecodeStoredDevice(t *testing.T) {
+	device, err := decodeDevice(mustMarshal(storedDevice{DisplayName: "device", Keys: keysA1}))
+	require.NoError(t, err)
+	assert.Equal(t, storedDeviceOf(keysA1), device)
+
+	_, err = decodeDevice(mustMarshal(storedDevice{DisplayName: "device", Keys: []byte(`{"device_id":5}`)}))
+	assert.Error(t, err)
+
+	userDevices := subspace.Sub("devices")
+	_, err = decodeCache("@u:remote", 5, userDevices, []fdb.KeyValue{
+		{Key: userDevices.Pack(tuple.Tuple{"A"}), Value: mustMarshal(storedDevice{Keys: keysA1})},
+		{Key: userDevices.Pack(tuple.Tuple{"B"}), Value: mustMarshal(storedDevice{Keys: []byte(`{"keys":[]}`)})},
+	}, storedSigningKeys{})
+	assert.Error(t, err, "one unparseable device fails the whole cache")
+
+	cache, err := decodeCache("@u:remote", 5, userDevices, []fdb.KeyValue{
+		{Key: userDevices.Pack(tuple.Tuple{"A"}), Value: mustMarshal(storedDevice{DisplayName: "device", Keys: keysA1})},
+	}, storedSigningKeys{MasterKey: master1})
+	require.NoError(t, err)
+	assert.Equal(t, map[id.DeviceID]types.RemoteDevice{"A": *storedDeviceOf(keysA1)}, cache.Devices)
+	assert.Equal(t, string(master1), string(cache.MasterKey.Raw))
 }

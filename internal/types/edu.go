@@ -3,7 +3,6 @@ package types
 import (
 	"encoding/json"
 
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -45,9 +44,9 @@ type ToDeviceEDUContent struct {
 
 // TODO: move to mautrix
 type SigningKeyUpdateEDUContent struct {
-	UserID      id.UserID                `json:"user_id"`
-	MasterKey   mautrix.CrossSigningKeys `json:"master_key"`
-	SelfSigning mautrix.CrossSigningKeys `json:"self_signing_key"`
+	UserID      id.UserID             `json:"user_id"`
+	MasterKey   SignedCrossSigningKey `json:"master_key,omitzero"`
+	SelfSigning SignedCrossSigningKey `json:"self_signing_key,omitzero"`
 }
 
 // TODO: move to mautrix
@@ -56,10 +55,10 @@ type DeviceListUpdateEDUContent struct {
 	UserID   id.UserID   `json:"user_id"`
 	StreamID int64       `json:"stream_id"`
 
-	PrevID            []int64             `json:"prev_id,omitzero"`
-	DeviceKeys        *mautrix.DeviceKeys `json:"keys,omitempty"`
-	Deleted           bool                `json:"deleted,omitzero"`
-	DeviceDisplayName string              `json:"device_display_name,omitzero"`
+	PrevID            []int64          `json:"prev_id,omitzero"`
+	DeviceKeys        SignedDeviceKeys `json:"keys,omitzero"`
+	Deleted           bool             `json:"deleted,omitzero"`
+	DeviceDisplayName string           `json:"device_display_name,omitzero"`
 }
 
 type PresenceEDUItem struct {

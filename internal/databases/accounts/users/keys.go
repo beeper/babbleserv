@@ -5,7 +5,6 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
 
@@ -25,23 +24,22 @@ func (u *UsersDirectory) TxnGetUserCrossSigningKeys(txn fdb.ReadTransaction, use
 	if err := json.Unmarshal(b, &keys); err != nil {
 		return nil, err
 	}
-
 	return &keys, nil
 }
 
-func (u *UsersDirectory) TxnStoreUserCrossSigningKeys(txn fdb.Transaction, userID id.UserID, keys types.UserCrossSigningKeys) {
+func (u *UsersDirectory) TxnStoreUserCrossSigningKeys(txn fdb.Transaction, userID id.UserID, keys types.UserCrossSigningKeys) error {
+	for _, key := range []*types.SignedCrossSigningKey{&keys.Master, &keys.SelfSigning, &keys.UserSigning} {
+		var err error
+		if *key, err = key.WithoutSignatures(); err != nil {
+			return err
+		}
+	}
 	b, err := json.Marshal(keys)
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-	// Signures are stored separately
-	b, _ = sjson.DeleteBytes(b, "master_key.signatures")
-	b, _ = sjson.DeleteBytes(b, "self_signing_key.signatures")
-	b, _ = sjson.DeleteBytes(b, "user_signing_key.signatures")
-
-	key := u.userCrossSigningKeys.Pack(tuple.Tuple{userID.String()})
-	txn.Set(key, b)
+	txn.Set(u.userCrossSigningKeys.Pack(tuple.Tuple{userID.String()}), b)
+	return nil
 }
 
 func (u *UsersDirectory) TxnStoreKeySignatures(txn fdb.Transaction, userID id.UserID, keyID id.KeyID, signatures signatures.Signatures) {

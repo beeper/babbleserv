@@ -17,6 +17,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 const (
@@ -39,6 +40,13 @@ func setTestField(t *testing.T, object json.RawMessage, path string, value any) 
 	out, err := sjson.SetBytes(object, path, value)
 	require.NoError(t, err)
 	return out
+}
+
+func mustSigned[T any](t *testing.T, raw json.RawMessage) types.SignedJSON[T] {
+	t.Helper()
+	signed, err := types.ParseSignedJSON[T](raw)
+	require.NoError(t, err)
+	return signed
 }
 
 func signaturesOf(t *testing.T, object json.RawMessage) signatures.Signatures {
@@ -191,14 +199,14 @@ func liveTestRemoteUserKeys(t *testing.T, keys testRemoteKeys) UserKeys {
 
 // Unvalidated, as local keys reach AddUserKeys, so other users' signatures and unsigned data are
 // still there to filter
-func testUnvalidatedKeys(keys testRemoteKeys, res types.RespQueryKeys) UserKeys {
+func testUnvalidatedKeys(t *testing.T, keys testRemoteKeys, res types.RespQueryKeys) UserKeys {
 	return UserKeys{
 		Devices: map[id.DeviceID]UserDeviceKeys{
-			"PHONE":  {Keys: res.DeviceKeys[keys.userID]["PHONE"]},
-			"LAPTOP": {Keys: res.DeviceKeys[keys.userID]["LAPTOP"]},
+			"PHONE":  {Keys: mustSigned[mautrix.DeviceKeys](t, res.DeviceKeys[keys.userID]["PHONE"])},
+			"LAPTOP": {Keys: mustSigned[mautrix.DeviceKeys](t, res.DeviceKeys[keys.userID]["LAPTOP"])},
 		},
-		Master:      res.MasterKeys[keys.userID],
-		SelfSigning: res.SelfSigningKeys[keys.userID],
+		Master:      mustSigned[mautrix.CrossSigningKeys](t, res.MasterKeys[keys.userID]),
+		SelfSigning: mustSigned[mautrix.CrossSigningKeys](t, res.SelfSigningKeys[keys.userID]),
 	}
 }
 
@@ -221,7 +229,7 @@ func TestCachedAndLiveKeysFilterIdentically(t *testing.T) {
 	cached := UserKeysFromRemoteCache(testRemoteCache(t, keys))
 	live := liveTestRemoteUserKeys(t, keys)
 	assert.ElementsMatch(t, []id.DeviceID{"PHONE", "LAPTOP"}, slices.Collect(maps.Keys(live.Devices)))
-	assert.Nil(t, live.UserSigning)
+	assert.True(t, live.UserSigning.IsZero())
 
 	for _, deviceIDs := range []mautrix.DeviceIDList{nil, {"PHONE"}, {"LAPTOP", "KEYLESS", "UNKNOWN"}} {
 		cachedResp := addTestUserKeys(t, cached, deviceIDs, testRequester, testOverlay(keys))
@@ -240,11 +248,11 @@ func TestKeysQueryKeepsUnknownSignedMembers(t *testing.T) {
 
 		laptop := resp.DeviceKeys[testRemoteUser]["LAPTOP"]
 		assert.True(t, gjson.GetBytes(laptop, "dehydrated").Bool(), source)
-		assert.NoError(t, util.VerifyJSON(laptop, testRemoteUser.String(), "ed25519:LAPTOP", keys.laptopKey.verifyKey()), source)
+		assert.NoError(t, signedjson.Verify(laptop, testRemoteUser.String(), "ed25519:LAPTOP", keys.laptopKey.verifyKey()), source)
 		assert.False(t, gjson.GetBytes(laptop, "unsigned").Exists(), source)
 
 		phone := resp.DeviceKeys[testRemoteUser]["PHONE"]
-		assert.NoError(t, util.VerifyJSON(phone, testRemoteUser.String(), "ed25519:PHONE", keys.phoneKey.verifyKey()), source)
+		assert.NoError(t, signedjson.Verify(phone, testRemoteUser.String(), "ed25519:PHONE", keys.phoneKey.verifyKey()), source)
 		assert.JSONEq(t, `{"device_display_name":"Phone"}`, gjson.GetBytes(phone, "unsigned").Raw, source)
 		assert.Equal(t, signatures.Signatures{
 			testRemoteUser: signaturesOf(t, keys.phone)[testRemoteUser],
@@ -253,20 +261,55 @@ func TestKeysQueryKeepsUnknownSignedMembers(t *testing.T) {
 
 		master := resp.MasterKeys[testRemoteUser]
 		assert.Equal(t, "signed", gjson.GetBytes(master, gjson.Escape(testExtraMasterMember)).String(), source)
-		assert.NoError(t, util.VerifyJSON(master, testRemoteUser.String(), "ed25519:PHONE", keys.phoneKey.verifyKey()), source)
+		assert.NoError(t, signedjson.Verify(master, testRemoteUser.String(), "ed25519:PHONE", keys.phoneKey.verifyKey()), source)
 		assert.Equal(t, signatures.Signatures{
 			testRemoteUser: signaturesOf(t, keys.master)[testRemoteUser],
 			testRequester:  {"ed25519:aliceUSK": "alice-master-signature"},
 		}, signaturesOf(t, master), source)
 
 		selfSigning := resp.SelfSigningKeys[testRemoteUser]
-		assert.NoError(t, util.VerifyJSON(selfSigning, testRemoteUser.String(), keys.masterKey.keyID().String(), keys.masterKey.verifyKey()), source)
+		assert.NoError(t, signedjson.Verify(selfSigning, testRemoteUser.String(), keys.masterKey.keyID().String(), keys.masterKey.verifyKey()), source)
 
 		// What decoding into the mautrix structs served instead
 		var decoded mautrix.DeviceKeys
 		require.NoError(t, json.Unmarshal(laptop, &decoded), source)
-		assert.Error(t, util.VerifyJSON(mustMarshal(t, decoded), testRemoteUser.String(), "ed25519:LAPTOP", keys.laptopKey.verifyKey()), source)
+		assert.Error(t, signedjson.Verify(mustMarshal(t, decoded), testRemoteUser.String(), "ed25519:LAPTOP", keys.laptopKey.verifyKey()), source)
 	}
+}
+
+// Local keys come from storage with the owner's signatures read back apart from them
+func TestLocalKeysKeepUnknownSignedMembers(t *testing.T) {
+	keys := newTestRemoteKeys(t, testRemoteUser)
+	stored := func(raw json.RawMessage) types.SignedJSON[mautrix.DeviceKeys] {
+		uploaded := mustSigned[mautrix.DeviceKeys](t, raw)
+		withoutSignatures, err := uploaded.WithoutSignatures()
+		require.NoError(t, err)
+		read, err := withoutSignatures.WithOwnerSignatures(testRemoteUser, uploaded.View.Signatures[testRemoteUser])
+		require.NoError(t, err)
+		return read
+	}
+	userKeys := userKeysFromLocalSnapshot(&types.LocalDeviceSnapshot{
+		Devices: []types.LocalSnapshotDevice{
+			{Device: types.Device{ID: "LAPTOP", DisplayName: "Laptop"}, Keys: stored(keys.laptop)},
+			{Device: types.Device{ID: "KEYLESS"}},
+		},
+		MasterKey: mustSigned[mautrix.CrossSigningKeys](t, keys.master),
+	})
+	assert.Equal(t, []id.DeviceID{"LAPTOP"}, slices.Collect(maps.Keys(userKeys.Devices)))
+
+	resp := addTestUserKeys(t, userKeys, nil, testRequester, testOverlay(keys))
+	laptop := resp.DeviceKeys[testRemoteUser]["LAPTOP"]
+	assert.True(t, gjson.GetBytes(laptop, "dehydrated").Bool())
+	assert.JSONEq(t, `{"device_display_name":"Laptop"}`, gjson.GetBytes(laptop, "unsigned").Raw)
+	assert.NoError(t, signedjson.Verify(laptop, testRemoteUser.String(), "ed25519:LAPTOP", keys.laptopKey.verifyKey()))
+
+	master := resp.MasterKeys[testRemoteUser]
+	assert.Equal(t, "signed", gjson.GetBytes(master, gjson.Escape(testExtraMasterMember)).String())
+	assert.NoError(t, signedjson.Verify(master, testRemoteUser.String(), "ed25519:PHONE", keys.phoneKey.verifyKey()))
+	assert.Equal(t, signatures.Signatures{
+		testRemoteUser: signaturesOf(t, keys.master)[testRemoteUser],
+		testRequester:  {"ed25519:aliceUSK": "alice-master-signature"},
+	}, signaturesOf(t, master))
 }
 
 func TestKeysQueryUserIDWithPathSyntax(t *testing.T) {
@@ -292,18 +335,18 @@ func TestKeysQueryUserIDWithPathSyntax(t *testing.T) {
 
 func TestAddUserKeysUserSigningOnlyForRequester(t *testing.T) {
 	remote := newTestRemoteKeys(t, testRemoteUser)
-	keys := UserKeys{UserSigning: remote.userSigning}
+	keys := UserKeys{UserSigning: mustSigned[mautrix.CrossSigningKeys](t, remote.userSigning)}
 
 	assert.Empty(t, addTestUserKeys(t, keys, nil, testRequester, nil).UserSigningKeys)
 	assert.Empty(t, addTestUserKeys(t, keys, nil, "", nil).UserSigningKeys)
 
 	own := addTestUserKeys(t, keys, nil, testRemoteUser, nil).UserSigningKeys[testRemoteUser]
-	assert.Equal(t, remote.userSigningKey.public, crossSigningPublicKey(own))
+	assert.Equal(t, remote.userSigningKey.public, types.CrossSigningPublicKey(mustSigned[mautrix.CrossSigningKeys](t, own)))
 }
 
 func TestAddUserKeysKeepsOwnerSignaturesAndOverlay(t *testing.T) {
 	keys := newTestRemoteKeys(t, testRemoteUser)
-	resp := addTestUserKeys(t, testUnvalidatedKeys(keys, testLiveResponse(t, keys)), nil, testRequester, testOverlay(keys))
+	resp := addTestUserKeys(t, testUnvalidatedKeys(t, keys, testLiveResponse(t, keys)), nil, testRequester, testOverlay(keys))
 
 	phone := resp.DeviceKeys[testRemoteUser]["PHONE"]
 	assert.Equal(t, signatures.Signatures{
@@ -334,20 +377,20 @@ func TestAddUserKeysOverlayNeverReplacesOwnerSignatures(t *testing.T) {
 
 func TestAddUserKeysDoesNotMutateKeys(t *testing.T) {
 	keys := newTestRemoteKeys(t, testRemoteUser)
-	userKeys := testUnvalidatedKeys(keys, testLiveResponse(t, keys))
-	phone := slices.Clone(userKeys.Devices["PHONE"].Keys)
-	master := slices.Clone(userKeys.Master)
+	userKeys := testUnvalidatedKeys(t, keys, testLiveResponse(t, keys))
+	phone := slices.Clone(userKeys.Devices["PHONE"].Keys.Raw)
+	master := slices.Clone(userKeys.Master.Raw)
 	addTestUserKeys(t, userKeys, nil, testRequester, testOverlay(keys))
 
-	assert.Equal(t, phone, userKeys.Devices["PHONE"].Keys)
-	assert.Equal(t, master, userKeys.Master)
+	assert.Equal(t, phone, userKeys.Devices["PHONE"].Keys.Raw)
+	assert.Equal(t, master, userKeys.Master.Raw)
 }
 
 func TestAddUserKeysSkipsUnservableObjects(t *testing.T) {
 	keys := newTestRemoteKeys(t, testRemoteUser)
 	userKeys := UserKeysFromRemoteCache(testRemoteCache(t, keys))
-	userKeys.Devices["BROKEN"] = UserDeviceKeys{Keys: json.RawMessage(`{"device_id":"BROKEN","device_id":"OTHER"}`)}
-	userKeys.SelfSigning = json.RawMessage(`[]`)
+	userKeys.Devices["BROKEN"] = UserDeviceKeys{Keys: types.SignedDeviceKeys{Raw: json.RawMessage(`{"device_id":"BROKEN","device_id":"OTHER"}`)}}
+	userKeys.SelfSigning = types.SignedCrossSigningKey{Raw: json.RawMessage(`[]`)}
 
 	resp := newQueryKeysResponse(1)
 	err := AddUserKeys(&resp, testRemoteUser, nil, userKeys, testRequester, nil)
@@ -384,9 +427,9 @@ func TestUserKeysFromQueryResponseDropsInvalidObjects(t *testing.T) {
 	assert.Len(t, all, 1)
 	userKeys := all[testRemoteUser]
 	assert.ElementsMatch(t, []id.DeviceID{"PHONE", "LAPTOP"}, slices.Collect(maps.Keys(userKeys.Devices)))
-	assert.Nil(t, userKeys.Master)
-	assert.NotNil(t, userKeys.SelfSigning)
-	assert.Nil(t, userKeys.UserSigning)
+	assert.True(t, userKeys.Master.IsZero())
+	assert.False(t, userKeys.SelfSigning.IsZero())
+	assert.True(t, userKeys.UserSigning.IsZero())
 }
 
 func TestUserKeysFromQueryResponseOnlyValidatesRequestedDevices(t *testing.T) {
@@ -395,7 +438,7 @@ func TestUserKeysFromQueryResponseOnlyValidatesRequestedDevices(t *testing.T) {
 
 	userKeys := liveTestUserKeys(t, body, map[id.UserID]mautrix.DeviceIDList{testRemoteUser: {"PHONE", "UNKNOWN", "PHONE"}})[testRemoteUser]
 	assert.Equal(t, []id.DeviceID{"PHONE"}, slices.Collect(maps.Keys(userKeys.Devices)))
-	assert.NotNil(t, userKeys.Master)
+	assert.False(t, userKeys.Master.IsZero())
 }
 
 func TestUserKeysFromQueryResponseDropsOnlyMalformedUsers(t *testing.T) {
@@ -473,11 +516,14 @@ func TestRemoteSignatureTargetFailure(t *testing.T) {
 		UserID: testRemoteUser,
 		RemoteDeviceSnapshot: types.RemoteDeviceSnapshot{
 			Devices:        map[id.DeviceID]types.RemoteDevice{},
-			MasterKey:      mustMarshal(t, cachedMaster),
-			SelfSigningKey: mustMarshal(t, remoteSelfSigning.crossSigningKey(testRemoteUser, id.XSUsageSelfSigning)),
+			MasterKey:      mustSigned[mautrix.CrossSigningKeys](t, mustMarshal(t, cachedMaster)),
+			SelfSigningKey: mustSigned[mautrix.CrossSigningKeys](t, mustMarshal(t, remoteSelfSigning.crossSigningKey(testRemoteUser, id.XSUsageSelfSigning))),
 		},
 	}
-	userSigningKey := requesterUserSigning.crossSigningKey(testRequester, id.XSUsageUserSigning)
+	userSigningKey := mustSigned[mautrix.CrossSigningKeys](t, mustMarshal(t, requesterUserSigning.crossSigningKey(testRequester, id.XSUsageUserSigning)))
+	target := func(raw json.RawMessage) types.SignatureUploadTarget {
+		return mustSigned[mautrix.ReqKeysSignatures](t, raw)
+	}
 
 	unsignedTarget := mustMarshal(t, mautrix.ReqKeysSignatures{
 		UserID: testRemoteUser,
@@ -491,33 +537,32 @@ func TestRemoteSignatureTargetFailure(t *testing.T) {
 	deviceTarget := setTestField(t, signedTarget, "device_id", "PHONE")
 
 	noMaster := *cache
-	noMaster.MasterKey = nil
+	noMaster.MasterKey = types.SignedCrossSigningKey{}
 
 	masterKey := remoteMaster.public.String()
 
 	for _, tc := range []struct {
 		name           string
-		userSigningKey *mautrix.CrossSigningKeys
+		userSigningKey types.SignedCrossSigningKey
 		cache          *types.RemoteDeviceCache
 		targetKey      string
 		target         json.RawMessage
 		errCode        string
 	}{
-		{"accepted", &userSigningKey, cache, masterKey, signedTarget, ""},
-		{"owner signatures ignored", &userSigningKey, cache, masterKey, withOwnerSignature, ""},
-		{"not an object", &userSigningKey, cache, masterKey, json.RawMessage(`[]`), mautrix.MBadJSON.ErrCode},
-		{"device target", &userSigningKey, cache, "PHONE", deviceTarget, mautrix.MInvalidParam.ErrCode},
-		{"uncached or no valid snapshot", &userSigningKey, nil, masterKey, signedTarget, mautrix.MNotFound.ErrCode},
-		{"no cached master key", &userSigningKey, &noMaster, masterKey, signedTarget, mautrix.MNotFound.ErrCode},
-		{"not the master key", &userSigningKey, cache, remoteSelfSigning.public.String(), signedTarget, mautrix.MNotFound.ErrCode},
-		{"content mismatch", &userSigningKey, cache, masterKey, mismatched, mautrix.MInvalidParam.ErrCode},
-		{"requester has no user-signing key", nil, cache, masterKey, signedTarget, errCodeInvalidSignature},
-		{"no requester signature", &userSigningKey, cache, masterKey, unsignedTarget, errCodeInvalidSignature},
-		{"signed by another requester key", &userSigningKey, cache, masterKey, requesterMaster.sign(t, unsignedTarget, testRequester), errCodeInvalidSignature},
-		{"signature does not verify", &userSigningKey, cache, masterKey, tampered, errCodeInvalidSignature},
+		{"accepted", userSigningKey, cache, masterKey, signedTarget, ""},
+		{"owner signatures ignored", userSigningKey, cache, masterKey, withOwnerSignature, ""},
+		{"device target", userSigningKey, cache, "PHONE", deviceTarget, mautrix.MInvalidParam.ErrCode},
+		{"uncached or no valid snapshot", userSigningKey, nil, masterKey, signedTarget, mautrix.MNotFound.ErrCode},
+		{"no cached master key", userSigningKey, &noMaster, masterKey, signedTarget, mautrix.MNotFound.ErrCode},
+		{"not the master key", userSigningKey, cache, remoteSelfSigning.public.String(), signedTarget, mautrix.MNotFound.ErrCode},
+		{"content mismatch", userSigningKey, cache, masterKey, mismatched, mautrix.MInvalidParam.ErrCode},
+		{"requester has no user-signing key", types.SignedCrossSigningKey{}, cache, masterKey, signedTarget, errCodeInvalidSignature},
+		{"no requester signature", userSigningKey, cache, masterKey, unsignedTarget, errCodeInvalidSignature},
+		{"signed by another requester key", userSigningKey, cache, masterKey, requesterMaster.sign(t, unsignedTarget, testRequester), errCodeInvalidSignature},
+		{"signature does not verify", userSigningKey, cache, masterKey, tampered, errCodeInvalidSignature},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			failure := RemoteSignatureTargetFailure(testRequester, tc.userSigningKey, tc.cache, tc.targetKey, tc.target)
+			failure := RemoteSignatureTargetFailure(testRequester, tc.userSigningKey, tc.cache, tc.targetKey, target(tc.target))
 			if tc.errCode == "" {
 				assert.Nil(t, failure)
 				return
@@ -535,15 +580,18 @@ func TestRemoteSignatureTargetOverServedMasterKey(t *testing.T) {
 	keys := newTestRemoteKeys(t, testRemoteUser)
 	cache := testRemoteCache(t, keys)
 	requesterUserSigning := newTestSigningKey(t)
-	userSigningKey := requesterUserSigning.crossSigningKey(testRequester, id.XSUsageUserSigning)
+	userSigningKey := mustSigned[mautrix.CrossSigningKeys](t, mustMarshal(t, requesterUserSigning.crossSigningKey(testRequester, id.XSUsageUserSigning)))
 	masterKey := keys.masterKey.public.String()
+	signedTarget := func(raw json.RawMessage) types.SignatureUploadTarget {
+		return mustSigned[mautrix.ReqKeysSignatures](t, requesterUserSigning.sign(t, raw, testRequester))
+	}
 
 	served := addTestUserKeys(t, UserKeysFromRemoteCache(cache), nil, testRequester, nil).MasterKeys[testRemoteUser]
-	assert.Nil(t, RemoteSignatureTargetFailure(testRequester, &userSigningKey, cache, masterKey, requesterUserSigning.sign(t, served, testRequester)))
+	assert.Nil(t, RemoteSignatureTargetFailure(testRequester, userSigningKey, cache, masterKey, signedTarget(served)))
 
 	tampered := setTestField(t, served, gjson.Escape(testExtraMasterMember), "tampered")
 	require.Equal(t, "tampered", gjson.GetBytes(tampered, gjson.Escape(testExtraMasterMember)).String())
-	failure := RemoteSignatureTargetFailure(testRequester, &userSigningKey, cache, masterKey, requesterUserSigning.sign(t, tampered, testRequester))
+	failure := RemoteSignatureTargetFailure(testRequester, userSigningKey, cache, masterKey, signedTarget(tampered))
 	require.NotNil(t, failure)
 	assert.Equal(t, mautrix.MInvalidParam.ErrCode, failure.ErrCode)
 }

@@ -70,15 +70,14 @@ func (a *AccountsDatabase) GetDeviceListUpdate(
 
 		update.Version = user.DeviceListVersion
 		update.Device = device
-		update.Keys = keys
-		if keys == nil {
+		if keys.IsZero() {
 			return update, nil
 		}
 
 		deviceKeyID := id.KeyID(deviceID)
 		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, []id.KeyID{deviceKeyID})
-		update.Keys.Signatures = withOwnerSignatures(update.Keys.Signatures, userID, ownerSignatures[deviceKeyID])
-		return update, nil
+		update.Keys, err = keys.WithOwnerSignatures(userID, ownerSignatures[deviceKeyID])
+		return update, err
 	})
 }
 
@@ -100,18 +99,21 @@ func (a *AccountsDatabase) GetLocalUserDevicesSnapshot(ctx context.Context, user
 
 		keyIDs := make([]id.KeyID, 0, len(devices)+2)
 		for _, device := range devices {
-			if device.Keys != nil {
+			if !device.Keys.IsZero() {
 				keyIDs = append(keyIDs, id.KeyID(device.Device.ID))
 			}
 		}
 		if crossSigningKeys != nil {
-			keyIDs = append(keyIDs, crossSigningKeys.Master.KeyID(), crossSigningKeys.SelfSigning.KeyID())
+			keyIDs = append(keyIDs,
+				id.KeyID(types.CrossSigningPublicKey(crossSigningKeys.Master)),
+				id.KeyID(types.CrossSigningPublicKey(crossSigningKeys.SelfSigning)),
+			)
 		}
 		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, keyIDs)
 
-		for _, device := range devices {
-			if device.Keys != nil {
-				device.Keys.Signatures = withOwnerSignatures(device.Keys.Signatures, userID, ownerSignatures[id.KeyID(device.Device.ID)])
+		for i, device := range devices {
+			if devices[i].Keys, err = device.Keys.WithOwnerSignatures(userID, ownerSignatures[id.KeyID(device.Device.ID)]); err != nil {
+				return nil, err
 			}
 		}
 
@@ -120,8 +122,12 @@ func (a *AccountsDatabase) GetLocalUserDevicesSnapshot(ctx context.Context, user
 			Devices: devices,
 		}
 		if crossSigningKeys != nil {
-			snapshot.MasterKey = ownerSignedCrossSigningKey(crossSigningKeys.Master, userID, ownerSignatures)
-			snapshot.SelfSigningKey = ownerSignedCrossSigningKey(crossSigningKeys.SelfSigning, userID, ownerSignatures)
+			if snapshot.MasterKey, err = ownerSignedCrossSigningKey(crossSigningKeys.Master, userID, ownerSignatures); err != nil {
+				return nil, err
+			}
+			if snapshot.SelfSigningKey, err = ownerSignedCrossSigningKey(crossSigningKeys.SelfSigning, userID, ownerSignatures); err != nil {
+				return nil, err
+			}
 		}
 		return snapshot, nil
 	})

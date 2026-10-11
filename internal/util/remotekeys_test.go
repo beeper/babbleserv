@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -21,10 +22,17 @@ const (
 	canonicalRemotePhoneKeys = `{"device_id":"PHONE","keys":{"ed25519:PHONE":"key"},"signatures":{"@alice:remote.example":{"ed25519:PHONE":"sig"}},"user_id":"@alice:remote.example"}`
 )
 
+func mustParseSigned[T any](t *testing.T, raw string) types.SignedJSON[T] {
+	t.Helper()
+	signed, err := types.ParseSignedJSON[T](json.RawMessage(raw))
+	require.NoError(t, err)
+	return signed
+}
+
 func TestParseRemoteQueriedDevice(t *testing.T) {
 	device, valid := ParseRemoteQueriedDevice(remoteKeysUser, "PHONE", json.RawMessage(remotePhoneKeys))
 	require.True(t, valid)
-	assert.Equal(t, types.RemoteDevice{DisplayName: "Phone", Keys: json.RawMessage(canonicalRemotePhoneKeys)}, device)
+	assert.Equal(t, types.RemoteDevice{DisplayName: "Phone", Keys: mustParseSigned[mautrix.DeviceKeys](t, canonicalRemotePhoneKeys)}, device)
 
 	for deviceID, raw := range map[id.DeviceID]string{"LAPTOP": remotePhoneKeys, "PHONE": `null`} {
 		_, valid := ParseRemoteQueriedDevice(remoteKeysUser, deviceID, json.RawMessage(raw))
@@ -42,7 +50,7 @@ func TestParseDeviceListUpdateEDU(t *testing.T) {
 		DeviceID: "PHONE",
 		StreamID: 5,
 		PrevIDs:  []int64{4},
-		Device:   types.RemoteDevice{DisplayName: "Phone", Keys: json.RawMessage(canonicalRemotePhoneKeys)},
+		Device:   types.RemoteDevice{DisplayName: "Phone", Keys: mustParseSigned[mautrix.DeviceKeys](t, canonicalRemotePhoneKeys)},
 	}, update)
 
 	bobKeys := strings.Replace(remotePhoneKeys, `"user_id": "@alice:remote.example"`, `"user_id": "@bob:remote.example"`, 1)
@@ -56,6 +64,10 @@ func TestParseDeviceListUpdateEDU(t *testing.T) {
 		assert.True(t, update.Invalid, name)
 	}
 
+	_, update, err = ParseDeviceListUpdateEDU(json.RawMessage(`{"user_id":"@alice:remote.example","device_id":"PHONE","prev_id":[4]}`))
+	require.NoError(t, err)
+	assert.Equal(t, types.RemoteDeviceListUpdate{DeviceID: "PHONE", Invalid: true}, update)
+
 	_, _, err = ParseDeviceListUpdateEDU(json.RawMessage(`{"user_id":"alice","device_id":"PHONE","stream_id":5}`))
 	assert.Error(t, err)
 }
@@ -66,7 +78,7 @@ func TestParseSigningKeyUpdateEDU(t *testing.T) {
 
 	_, update, err := ParseSigningKeyUpdateEDU(json.RawMessage(`{"user_id":"@alice:remote.example","master_key":` + master + `,"self_signing_key":` + master + `}`))
 	require.NoError(t, err)
-	assert.Equal(t, types.RemoteSigningKeyUpdate{MasterKey: json.RawMessage(master), Invalid: true}, update)
+	assert.Equal(t, types.RemoteSigningKeyUpdate{MasterKey: mustParseSigned[mautrix.CrossSigningKeys](t, master), Invalid: true}, update)
 }
 
 func TestParseRemoteDeviceSnapshot(t *testing.T) {
@@ -79,15 +91,21 @@ func TestParseRemoteDeviceSnapshot(t *testing.T) {
 		`{"device_id":"PHONE","device_display_name":"Phone","keys":`+remotePhoneKeys+`}`,
 		`{"device_id":"LAPTOP","device_display_name":"Laptop","keys":`+remotePhoneKeys+`}`,
 		`{"device_id":"KEYLESS","device_display_name":"`+longName+`"}`,
+		`{"device_id":"MISTYPED","keys":"key"}`,
+		`{"device_id":"DUPLICATE","keys":{"user_id":"@alice:remote.example","user_id":"@alice:remote.example","device_id":"DUPLICATE"}}`,
 	))
 	require.NoError(t, err)
 	assert.Equal(t, &types.RemoteDeviceSnapshot{
 		StreamID: 7,
 		Devices: map[id.DeviceID]types.RemoteDevice{
-			"PHONE":   {DisplayName: "Phone", Keys: json.RawMessage(canonicalRemotePhoneKeys)},
+			"PHONE":   {DisplayName: "Phone", Keys: mustParseSigned[mautrix.DeviceKeys](t, canonicalRemotePhoneKeys)},
 			"KEYLESS": {},
 		},
 	}, parsed)
+
+	parsed, err = ParseRemoteDeviceSnapshot(remoteKeysUser, json.RawMessage(`{"user_id":"@alice:remote.example","stream_id":7,"devices":[],"master_key":"key"}`))
+	require.NoError(t, err)
+	assert.True(t, parsed.MasterKey.IsZero())
 
 	tooMany := make([]string, types.MaxRemoteDevicesPerUser+1)
 	for i := range tooMany {
