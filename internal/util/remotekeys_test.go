@@ -239,7 +239,57 @@ func TestBoundRemoteDeviceDisplayName(t *testing.T) {
 		strings.Repeat("a", 257): "",
 		"invalid \xff utf-8":     "",
 	} {
-		assert.Equal(t, expected, BoundRemoteDeviceDisplayName(name), name)
+		assert.Equal(t, expected, boundRemoteDeviceDisplayName(name), name)
+	}
+}
+
+func TestParseRemoteQueriedDevice(t *testing.T) {
+	device := newRemoteTestKey(t)
+	keys := signedDeviceKeys(t, "DEVICE", device, map[string]any{"dehydrated": true})
+	longName := `"` + strings.Repeat("a", types.MaxRemoteDeviceDisplayNameBytes+1) + `"`
+
+	// The display name as a queried device's unsigned carries it, and as a snapshot entry does
+	for name, tc := range map[string]struct {
+		unsigned    string
+		displayName string
+		expected    string
+	}{
+		"display name":            {`{"device_display_name":"Phone"}`, `"Phone"`, "Phone"},
+		"no unsigned":             {"", "", ""},
+		"display name bounded":    {`{"device_display_name":` + longName + `}`, longName, ""},
+		"not a string":            {`{"device_display_name":5}`, `5`, ""},
+		"invalid UTF-8":           {"{\"device_display_name\":\"Ph\xffone\"}", "\"Ph\xffone\"", ""},
+		"lone surrogate":          {`{"device_display_name":"\ud800"}`, `"\ud800"`, ""},
+		"duplicate names":         {`{"device_display_name":"Phone","other":1,"other":2}`, `"Phone"`, "Phone"},
+		"invalid UTF-8 elsewhere": {"{\"device_display_name\":\"Phone\",\"other\":\"\xff\"}", `"Phone"`, "Phone"},
+	} {
+		raw, entry := keys, `{"device_id":"DEVICE","keys":`+string(keys)+`}`
+		if tc.unsigned != "" {
+			raw = replaceTestJSON(t, keys, "{", `{"unsigned":`+tc.unsigned+`,`)
+			entry = `{"device_id":"DEVICE","device_display_name":` + tc.displayName + `,"keys":` + string(keys) + `}`
+		}
+		queried, valid := ParseRemoteQueriedDevice(remoteKeysUser, "DEVICE", raw)
+		require.True(t, valid, name)
+		assert.Equal(t, types.RemoteDevice{DisplayName: tc.expected, Keys: mustCanonical(t, keys)}, queried, name)
+
+		snapshot, err := ParseRemoteDeviceSnapshot(remoteKeysUser, json.RawMessage(`{"user_id":"`+remoteKeysUser.String()+`","stream_id":1,"devices":[`+entry+`]}`))
+		require.NoError(t, err, name)
+		assert.Equal(t, snapshot.Devices["DEVICE"], queried, name)
+	}
+
+	longDeviceID := id.DeviceID(strings.Repeat("D", types.MaxRemoteDeviceIDBytes+1))
+	for name, tc := range map[string]struct {
+		deviceID id.DeviceID
+		raw      json.RawMessage
+	}{
+		"mismatched device ID": {"OTHER", keys},
+		"over-long device ID":  {longDeviceID, signedDeviceKeys(t, longDeviceID, device, nil)},
+		"invalid keys":         {"DEVICE", setTestField(t, keys, "dehydrated", false)},
+		"oversize unsigned":    {"DEVICE", setTestField(t, keys, "unsigned", map[string]any{"padding": strings.Repeat("x", types.MaxRemoteKeyObjectBytes)})},
+	} {
+		parsed, valid := ParseRemoteQueriedDevice(remoteKeysUser, tc.deviceID, tc.raw)
+		assert.False(t, valid, name)
+		assert.Zero(t, parsed, name)
 	}
 }
 

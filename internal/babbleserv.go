@@ -58,6 +58,7 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 		Pub:  id.SigningKey(key.Public().(ed25519.PublicKey)),
 		Priv: key,
 	}, fedCache)
+	fedClient.UserAgent = cfg.UserAgent
 
 	fedClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: true,

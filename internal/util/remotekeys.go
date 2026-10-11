@@ -142,7 +142,7 @@ func decodeEd25519PublicKey(encoded string) (ed25519.PublicKey, error) {
 	return key, nil
 }
 
-func BoundRemoteDeviceDisplayName(name string) string {
+func boundRemoteDeviceDisplayName(name string) string {
 	if len(name) > types.MaxRemoteDeviceDisplayNameBytes || !utf8.ValidString(name) {
 		return ""
 	}
@@ -156,7 +156,7 @@ func remoteDeviceDisplayName(raw json.RawMessage) string {
 	if !jsontext.Value(raw).IsValid() || json.Unmarshal(raw, &name) != nil {
 		return ""
 	}
-	return BoundRemoteDeviceDisplayName(name)
+	return boundRemoteDeviceDisplayName(name)
 }
 
 // An over-long device ID exceeds the storage key limit even when only read
@@ -226,8 +226,8 @@ func ParseSigningKeyUpdateEDU(content json.RawMessage) (id.UserID, types.RemoteS
 		return userID, types.RemoteSigningKeyUpdate{Invalid: true}, nil
 	}
 
-	masterKey, masterValid := validateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
-	selfSigningKey, selfSigningValid := validateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigningKey)
+	masterKey, masterValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageMaster, edu.MasterKey)
+	selfSigningKey, selfSigningValid := ValidateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, edu.SelfSigningKey)
 	return userID, types.RemoteSigningKeyUpdate{
 		MasterKey:      masterKey,
 		SelfSigningKey: selfSigningKey,
@@ -298,12 +298,31 @@ func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDevi
 		}
 	}
 
-	snapshot.MasterKey, _ = validateOptionalCrossSigningKey(userID, id.XSUsageMaster, response.MasterKey)
-	snapshot.SelfSigningKey, _ = validateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, response.SelfSigningKey)
+	snapshot.MasterKey, _ = ValidateOptionalCrossSigningKey(userID, id.XSUsageMaster, response.MasterKey)
+	snapshot.SelfSigningKey, _ = ValidateOptionalCrossSigningKey(userID, id.XSUsageSelfSigning, response.SelfSigningKey)
 	return snapshot, nil
 }
 
-func validateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
+// A queried device is only listed with its keys, which carry its display name in their unsigned.
+// Unsigned is dropped before validation, so a malformed one only costs the display name, as a
+// malformed name does in a snapshot.
+func ParseRemoteQueriedDevice(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (types.RemoteDevice, bool) {
+	if _, valid := boundRemoteDeviceID(deviceID); !valid || len(raw) > types.MaxRemoteKeyObjectBytes {
+		return types.RemoteDevice{}, false
+	}
+	displayName := remoteDeviceDisplayName(json.RawMessage(gjson.GetBytes(raw, "unsigned.device_display_name").Raw))
+	signed, err := sjson.DeleteBytes(raw, "unsigned")
+	if err != nil {
+		return types.RemoteDevice{}, false
+	}
+	keys, err := validateRemoteDeviceKeys(userID, deviceID, signed)
+	if err != nil {
+		return types.RemoteDevice{}, false
+	}
+	return types.RemoteDevice{DisplayName: displayName, Keys: keys}, true
+}
+
+func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
 	if isAbsentJSON(raw) {
 		return nil, true
 	}

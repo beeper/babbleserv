@@ -7,14 +7,17 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -113,6 +116,22 @@ func VerifyJSON(b []byte, signingName, keyID string, pubKey ed25519.PublicKey) e
 	}
 
 	return nil
+}
+
+// OverlaySignedJSON returns a copy of a signed object with its signatures replaced and its unsigned
+// set, or removed when nil. Every other member is kept byte for byte so signatures over members we
+// don't know still verify.
+func OverlaySignedJSON(object json.RawMessage, sigs signatures.Signatures, unsigned map[string]any) (json.RawMessage, error) {
+	if !jsontext.Value(object).IsValid() || !gjson.ParseBytes(object).IsObject() {
+		return nil, errors.New("signed object is not a valid JSON object")
+	}
+	out, err := sjson.SetBytes(object, "signatures", sigs)
+	if err != nil {
+		return nil, err
+	} else if unsigned == nil {
+		return sjson.DeleteBytes(out, "unsigned")
+	}
+	return sjson.SetBytes(out, "unsigned", unsigned)
 }
 
 func VerifyObjectWithKeyMap(userID id.UserID, keys mautrix.KeyMap, object any) error {

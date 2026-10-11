@@ -1,6 +1,7 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,9 +14,9 @@ import (
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -178,7 +179,8 @@ func (c *ClientRoutes) ensureRemoteDeviceCaches(r *http.Request, requester id.Us
 }
 
 const (
-	maxRemoteKeyQueryServers       = 10
+	maxRemoteKeyQueryRequests      = 10
+	maxRemoteKeyQueryBatchUsers    = 100
 	minRemoteKeyQueryTimeoutMillis = 1000
 	maxRemoteKeyQueryTimeoutMillis = 10_000
 )
@@ -199,63 +201,86 @@ func (c *ClientRoutes) queryRemoteUserKeys(
 		mu       sync.Mutex
 		keys     = make(map[id.UserID]shared.UserKeys)
 		failures = make(map[string]any)
-		running  = make(chan struct{}, maxRemoteKeyQueryServers)
+		running  = make(chan struct{}, maxRemoteKeyQueryRequests)
 	)
-	for server, userDeviceIDs := range missing {
+	for _, batch := range remoteKeyQueryBatches(missing) {
 		running <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-running }()
-			res, err := c.queryServerUserKeys(ctx, server, userDeviceIDs)
+			batchKeys, err := c.queryServerUserKeys(ctx, batch.server, batch.users)
 
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				zerolog.Ctx(ctx).Warn().
 					Err(err).
-					Str("server", server).
+					Str("server", batch.server).
+					Int("users", len(batch.users)).
 					Msg("Failed to fetch user keys from server")
-				failures[server] = remoteKeyQueryFailure(err)
+				failures[batch.server] = remoteKeyQueryFailure(err)
 				return
 			}
-			for userID := range userDeviceIDs {
-				keys[userID] = shared.UserKeysFromQueryResponse(userID, res)
-			}
+			maps.Copy(keys, batchKeys)
 		})
 	}
 	wg.Wait()
 	return keys, failures
 }
 
+type remoteKeyQueryBatch struct {
+	server string
+	round  int
+	users  map[id.UserID]mautrix.DeviceIDList
+}
+
+// Each server's users are split so a response fits the size limit, and the batches are ordered
+// round by round so one large server can't hold every request slot
+func remoteKeyQueryBatches(missing shared.MissingUserKeysByServer) []remoteKeyQueryBatch {
+	var batches []remoteKeyQueryBatch
+	for server, users := range missing {
+		round := 0
+		for userIDs := range slices.Chunk(slices.Sorted(maps.Keys(users)), maxRemoteKeyQueryBatchUsers) {
+			batch := remoteKeyQueryBatch{server: server, round: round, users: make(map[id.UserID]mautrix.DeviceIDList, len(userIDs))}
+			for _, userID := range userIDs {
+				batch.users[userID] = users[userID]
+			}
+			batches = append(batches, batch)
+			round++
+		}
+	}
+	slices.SortStableFunc(batches, func(a, b remoteKeyQueryBatch) int { return cmp.Compare(a.round, b.round) })
+	return batches
+}
+
 func (c *ClientRoutes) queryServerUserKeys(
 	ctx context.Context,
 	server string,
 	userDeviceIDs map[id.UserID]mautrix.DeviceIDList,
-) (mautrix.RespQueryKeys, error) {
+) (map[id.UserID]shared.UserKeys, error) {
 	query := make(map[string][]string, len(userDeviceIDs))
 	for userID, deviceIDs := range userDeviceIDs {
 		query[userID.String()] = util.StringersToStrs(deviceIDs)
 	}
 
-	res, err := c.fclient.QueryKeys(ctx, spec.ServerName(c.config.ServerName), spec.ServerName(server), query)
+	body, _, err := c.keysClient.MakeFullRequest(ctx, federation.RequestParams{
+		ServerName:   server,
+		Method:       http.MethodPost,
+		Path:         federation.URLPath{"v1", "user", "keys", "query"},
+		Authenticate: true,
+		RequestJSON:  map[string]any{"device_keys": query},
+	})
 	if err != nil {
-		return mautrix.RespQueryKeys{}, err
+		return nil, err
 	}
-
-	// Gross: convert fclient.RespQueryKeys -> mautrix.RespQueryKeys
-	b, err := json.Marshal(res)
-	if err != nil {
-		return mautrix.RespQueryKeys{}, err
-	}
-	var converted mautrix.RespQueryKeys
-	err = json.Unmarshal(b, &converted)
-	return converted, err
+	return shared.UserKeysFromQueryResponse(body, userDeviceIDs)
 }
 
+// Only an error response has a status to report: a success whose body is unusable is unavailable
 func remoteKeyQueryFailure(err error) map[string]any {
 	status := http.StatusServiceUnavailable
-	var httpErr gomatrix.HTTPError
-	if errors.As(err, &httpErr) {
-		status = httpErr.Code
+	var httpErr mautrix.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Response != nil && httpErr.Response.StatusCode >= http.StatusMultipleChoices {
+		status = httpErr.Response.StatusCode
 	}
 	return map[string]any{"status": status, "message": err.Error()}
 }
@@ -264,9 +289,21 @@ type respUploadSignatures struct {
 	Failures map[id.UserID]map[string]*mautrix.RespError `json:"failures,omitempty"`
 }
 
+// A remote target is checked as the raw JSON the client signed, which may carry members the struct
+// drops. Both come from the same bytes, so the stored signatures are the ones verified.
+type signatureUploadTarget struct {
+	object mautrix.ReqKeysSignatures
+	raw    json.RawMessage
+}
+
+func (t *signatureUploadTarget) UnmarshalJSON(data []byte) error {
+	t.raw = slices.Clone(data)
+	return json.Unmarshal(data, &t.object)
+}
+
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keyssignaturesupload
 func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) {
-	req, respErr := util.ParseRequestJSON[mautrix.ReqUploadSignatures](r)
+	req, respErr := util.ParseRequestJSON[map[id.UserID]map[string]signatureUploadTarget](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -309,9 +346,9 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 	// First pass: loop through the target objects to sign and validate they exist and match. Remote
 	// targets are fully checked here and fail individually.
 	for targetUserID, targetObjects := range req {
-		for targetKey, targetObject := range targetObjects {
+		for targetKey, target := range targetObjects {
 			if targetUserID.Homeserver() != c.config.ServerName {
-				failure := shared.RemoteSignatureTargetFailure(u.UserID, userSigningKey, remoteCaches[targetUserID], targetKey, targetObject)
+				failure := shared.RemoteSignatureTargetFailure(u.UserID, userSigningKey, remoteCaches[targetUserID], targetKey, target.raw)
 				if failure != nil {
 					if failures[targetUserID] == nil {
 						failures[targetUserID] = make(map[string]*mautrix.RespError, 1)
@@ -322,10 +359,12 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 				targets = append(targets, types.KeySignatureTarget{
 					UserID:     targetUserID,
 					KeyID:      id.KeyID(targetKey),
-					Signatures: targetObject.Signatures,
+					Signatures: target.object.Signatures,
 				})
 				continue
 			}
+
+			targetObject := target.object
 
 			if targetObject.DeviceID == "" {
 				// Target is one of the users cross signing keys
