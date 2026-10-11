@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
@@ -202,7 +203,7 @@ func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) (*Event, error) {
 
 type marshalEvent Event
 
-// Wrapper around msgpack marshalling to set .TypeStr + .UnsignedRaw
+// Wrapper around msgpack marshalling to set .TypeStr + .UnsignedRaw and compact .Content
 func (ev Event) MarshalMsgpack() ([]byte, error) {
 	ev.TypeStr = ev.Type.Type
 
@@ -210,6 +211,14 @@ func (ev Event) MarshalMsgpack() ([]byte, error) {
 		return nil, err
 	} else {
 		ev.UnsignedRaw = b
+	}
+
+	if len(ev.Content) > 0 {
+		var content bytes.Buffer
+		if err := json.Compact(&content, ev.Content); err != nil {
+			return nil, err
+		}
+		ev.Content = content.Bytes()
 	}
 
 	return msgpack.Marshal((marshalEvent)(ev))

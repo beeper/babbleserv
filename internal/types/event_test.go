@@ -116,6 +116,14 @@ func TestAuthDependencyIDsFollowRoomVersionCapabilities(t *testing.T) {
 	}))
 }
 
+func TestStoredEventContentIsCompacted(t *testing.T) {
+	received := `{ "body" : "hi",  "list": [1, 2] }`
+	ev := &types.Event{PartialEvent: types.PartialEvent{Type: event.EventMessage, Content: json.RawMessage(received)}}
+	stored := types.MustNewEventFromBytes(ev.ToMsgpack(), ev.ID)
+	assert.Equal(t, `{"body":"hi","list":[1,2]}`, string(stored.Content))
+	assert.Equal(t, received, string(ev.Content))
+}
+
 func TestMembershipRowRoundTrips(t *testing.T) {
 	for _, row := range []types.MembershipRow{
 		{MembershipTup: types.MembershipTup{EventID: "$join", RoomID: "!room", Membership: event.MembershipJoin}},
