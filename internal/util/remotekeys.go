@@ -14,117 +14,114 @@ import (
 	"github.com/tidwall/sjson"
 	"go.mau.fi/util/exerrors"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
-
-// The cache stores and compares signed objects as canonical JSON without unsigned, so the owner's
-// signatures are part of the content. Duplicate names are rejected because gjson and encoding/json
-// would resolve them differently.
-func canonicalSignedJSON(raw json.RawMessage) (json.RawMessage, error) {
-	if !jsontext.Value(raw).IsValid() {
-		return nil, errors.New("signed object is not valid JSON or has duplicate names")
-	} else if !gjson.ParseBytes(raw).IsObject() {
-		return nil, errors.New("signed object is not a JSON object")
-	}
-	return canonicalJSONWithout(raw, "unsigned")
-}
 
 // The self-signature is verified over the canonical bytes as received rather than a re-marshalled
 // struct, so unknown signed members stay covered and a malformed foreign signature cannot reject
 // the device. Unsigned keys are accepted as local uploads accept them: the spec asks clients, not
 // servers, to verify them and Synapse never does.
-func validateRemoteDeviceKeys(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (json.RawMessage, error) {
-	canonical, err := canonicalRemoteKeyObject(userID, raw)
+func validateRemoteDeviceKeys(userID id.UserID, deviceID id.DeviceID, raw json.RawMessage) (types.SignedDeviceKeys, error) {
+	keys, err := canonicalRemoteKeyObject[mautrix.DeviceKeys](userID, raw)
 	if err != nil {
-		return nil, err
-	}
-	var keys mautrix.DeviceKeys
-	if err := json.Unmarshal(canonical, &keys); err != nil {
-		return nil, err
-	} else if keys.UserID != userID {
-		return nil, fmt.Errorf("device keys user ID %q does not match %q", keys.UserID, userID)
-	} else if keys.DeviceID != deviceID {
-		return nil, fmt.Errorf("device keys device ID %q does not match %q", keys.DeviceID, deviceID)
-	} else if err := checkOnlyOwnerSignatures(userID, keys.Signatures); err != nil {
-		return nil, err
+		return types.SignedDeviceKeys{}, err
+	} else if keys.View.UserID != userID {
+		return types.SignedDeviceKeys{}, fmt.Errorf("device keys user ID %q does not match %q", keys.View.UserID, userID)
+	} else if keys.View.DeviceID != deviceID {
+		return types.SignedDeviceKeys{}, fmt.Errorf("device keys device ID %q does not match %q", keys.View.DeviceID, deviceID)
 	}
 
 	keyID := id.NewDeviceKeyID(id.KeyAlgorithmEd25519, deviceID)
-	publicKey, err := decodeEd25519PublicKey(keys.Keys[keyID])
+	publicKey, err := decodeEd25519PublicKey(keys.View.Keys[keyID])
 	if err != nil {
-		return nil, fmt.Errorf("device key %q: %w", keyID, err)
-	} else if len(keys.Signatures) == 0 {
-		return canonical, nil
-	} else if err := VerifyJSON(canonical, userID.String(), keyID.String(), publicKey); err != nil {
-		return nil, err
+		return types.SignedDeviceKeys{}, fmt.Errorf("device key %q: %w", keyID, err)
+	} else if len(keys.View.Signatures) == 0 {
+		return keys, nil
+	} else if err := signedjson.Verify(keys.Raw, userID.String(), keyID.String(), publicKey); err != nil {
+		return types.SignedDeviceKeys{}, err
 	}
-	return canonical, nil
+	return keys, nil
 }
 
 // No signature is required or verified on cross-signing keys
-func validateRemoteCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, error) {
-	canonical, err := canonicalRemoteKeyObject(userID, raw)
+func validateRemoteCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (types.SignedCrossSigningKey, error) {
+	key, err := canonicalRemoteKeyObject[mautrix.CrossSigningKeys](userID, raw)
 	if err != nil {
-		return nil, err
+		return types.SignedCrossSigningKey{}, err
+	} else if err := CheckCrossSigningKey(userID, usage, key); err != nil {
+		return types.SignedCrossSigningKey{}, err
 	}
-	var key mautrix.CrossSigningKeys
-	if err := json.Unmarshal(canonical, &key); err != nil {
-		return nil, err
-	} else if key.UserID != userID {
-		return nil, fmt.Errorf("cross-signing key user ID %q does not match %q", key.UserID, userID)
-	} else if !slices.Contains(key.Usage, usage) {
-		return nil, fmt.Errorf("cross-signing key usage %v does not include %q", key.Usage, usage)
-	} else if len(key.Keys) != 1 {
-		return nil, fmt.Errorf("cross-signing key has %d keys, expected 1", len(key.Keys))
-	} else if err := checkOnlyOwnerSignatures(userID, key.Signatures); err != nil {
-		return nil, err
-	}
+	return key, nil
+}
 
-	for keyID, publicKey := range key.Keys {
+// CheckCrossSigningKey checks a cross-signing key belongs to the user, has the usage and holds one
+// ed25519 key, named by itself
+func CheckCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, key types.SignedCrossSigningKey) error {
+	if key.View.UserID != userID {
+		return fmt.Errorf("cross-signing key user ID %q does not match %q", key.View.UserID, userID)
+	} else if !slices.Contains(key.View.Usage, usage) {
+		return fmt.Errorf("cross-signing key usage %v does not include %q", key.View.Usage, usage)
+	} else if len(key.View.Keys) != 1 {
+		return fmt.Errorf("cross-signing key has %d keys, expected 1", len(key.View.Keys))
+	}
+	for keyID, publicKey := range key.View.Keys {
 		if keyID != id.NewKeyID(id.KeyAlgorithmEd25519, publicKey.String()) {
-			return nil, fmt.Errorf("cross-signing key ID %q does not match its key", keyID)
+			return fmt.Errorf("cross-signing key ID %q does not match its key", keyID)
 		} else if _, err := decodeEd25519PublicKey(publicKey.String()); err != nil {
-			return nil, fmt.Errorf("cross-signing key %q: %w", keyID, err)
+			return fmt.Errorf("cross-signing key %q: %w", keyID, err)
 		}
 	}
-	return canonical, nil
+	return nil
 }
 
 // Keeps the owner's signatures and drops everyone else's; the result is canonical
-func canonicalRemoteKeyObject(userID id.UserID, raw json.RawMessage) (json.RawMessage, error) {
+func canonicalRemoteKeyObject[T any](userID id.UserID, raw json.RawMessage) (types.SignedJSON[T], error) {
 	if len(raw) > types.MaxRemoteKeyObjectBytes {
-		return nil, fmt.Errorf("key object exceeds %d bytes", types.MaxRemoteKeyObjectBytes)
+		return types.SignedJSON[T]{}, fmt.Errorf("key object exceeds %d bytes", types.MaxRemoteKeyObjectBytes)
 	}
-	canonical, err := canonicalSignedJSON(raw)
+	canonical, err := signedjson.Canonical(raw)
 	if err != nil {
-		return nil, err
+		return types.SignedJSON[T]{}, err
 	}
 
-	signatures := gjson.GetBytes(canonical, "signatures")
-	if !signatures.Exists() {
-		return canonical, nil
+	if sigs := gjson.GetBytes(canonical, "signatures"); sigs.Exists() {
+		var signers map[id.UserID]json.RawMessage
+		if err := json.Unmarshal([]byte(sigs.Raw), &signers); err != nil {
+			return types.SignedJSON[T]{}, fmt.Errorf("key object signatures: %w", err)
+		}
+		if owner, signed := signers[userID]; signed {
+			canonical, err = sjson.SetRawBytes(canonical, "signatures", exerrors.Must(json.Marshal(map[id.UserID]json.RawMessage{userID: owner})))
+		} else {
+			canonical, err = sjson.DeleteBytes(canonical, "signatures")
+		}
+		if err != nil {
+			return types.SignedJSON[T]{}, err
+		}
+		if canonical, err = signedjson.Canonical(canonical); err != nil {
+			return types.SignedJSON[T]{}, err
+		}
 	}
-	var signers map[id.UserID]json.RawMessage
-	if err := json.Unmarshal([]byte(signatures.Raw), &signers); err != nil {
-		return nil, fmt.Errorf("key object signatures: %w", err)
+
+	if err := checkOnlyOwnerSignatures(userID, canonical); err != nil {
+		return types.SignedJSON[T]{}, err
 	}
-	if owner, signed := signers[userID]; signed {
-		canonical, err = sjson.SetRawBytes(canonical, "signatures", exerrors.Must(json.Marshal(map[id.UserID]json.RawMessage{userID: owner})))
-	} else {
-		canonical, err = sjson.DeleteBytes(canonical, "signatures")
-	}
-	if err != nil {
-		return nil, err
-	}
-	return canonicalSignedJSON(canonical)
+	return types.ParseSignedJSON[T](canonical)
 }
 
-// A case-variant Signatures member survives the filtering above but encoding/json merges it into
-// the decoded map, which is what clients would be served
-func checkOnlyOwnerSignatures(userID id.UserID, signatures map[id.UserID]map[id.KeyID]string) error {
-	for signer := range signatures {
+// A case-variant Signatures member survives the filtering above and is served with the object, so
+// it is decoded case-insensitively here, as encoding/json merges it, and may only carry the owner's
+func checkOnlyOwnerSignatures(userID id.UserID, canonical json.RawMessage) error {
+	var object struct {
+		Signatures signatures.Signatures `json:"signatures"`
+	}
+	if err := json.Unmarshal(canonical, &object); err != nil {
+		return err
+	}
+	for signer := range object.Signatures {
 		if signer != userID {
 			return fmt.Errorf("key object carries signatures from %q", signer)
 		}
@@ -285,7 +282,7 @@ func ParseRemoteDeviceSnapshot(userID id.UserID, body []byte) (*types.RemoteDevi
 			continue
 		}
 
-		var keys json.RawMessage
+		var keys types.SignedDeviceKeys
 		if !isAbsentJSON(device.Keys) {
 			var err error
 			if keys, err = validateRemoteDeviceKeys(userID, device.DeviceID, device.Keys); err != nil {
@@ -322,9 +319,9 @@ func ParseRemoteQueriedDevice(userID id.UserID, deviceID id.DeviceID, raw json.R
 	return types.RemoteDevice{DisplayName: displayName, Keys: keys}, true
 }
 
-func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (json.RawMessage, bool) {
+func ValidateOptionalCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, raw json.RawMessage) (types.SignedCrossSigningKey, bool) {
 	if isAbsentJSON(raw) {
-		return nil, true
+		return types.SignedCrossSigningKey{}, true
 	}
 	key, err := validateRemoteCrossSigningKey(userID, usage, raw)
 	return key, err == nil

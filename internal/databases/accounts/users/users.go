@@ -50,10 +50,10 @@ type UsersDirectory struct {
 
 	// Cross signing signing keys
 	// https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3keysdevice_signingupload
-	// user -> CrossSigningKey JSON (CSAPI)
+	// user -> cross-signing keys JSON (CSAPI), each without signatures
 	//
 	// key: id.UserID
-	// value: types.userCrossSigningKeys
+	// value: types.UserCrossSigningKeys
 	userCrossSigningKeys subspace.Subspace
 
 	// Key signatures

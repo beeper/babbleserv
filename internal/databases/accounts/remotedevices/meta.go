@@ -1,12 +1,12 @@
 package remotedevices
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/vmihailenco/msgpack/v5"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -81,13 +81,17 @@ func decodeMeta(b []byte) meta {
 	return m
 }
 
-func decodeDevice(b []byte) *types.RemoteDevice {
+func decodeDevice(b []byte) (*types.RemoteDevice, error) {
 	if b == nil {
-		return nil
+		return nil, nil
 	}
 	var stored storedDevice
 	mustUnmarshal(b, &stored)
-	return &types.RemoteDevice{DisplayName: stored.DisplayName, Keys: json.RawMessage(stored.Keys)}
+	keys, err := types.ParseSignedJSON[mautrix.DeviceKeys](stored.Keys)
+	if err != nil {
+		return nil, err
+	}
+	return &types.RemoteDevice{DisplayName: stored.DisplayName, Keys: keys}, nil
 }
 
 func (r *RemoteDevicesDirectory) txnWriteMeta(txn fdb.Transaction, userID id.UserID, m meta) {
@@ -95,7 +99,7 @@ func (r *RemoteDevicesDirectory) txnWriteMeta(txn fdb.Transaction, userID id.Use
 }
 
 func (r *RemoteDevicesDirectory) txnStoreDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, device types.RemoteDevice) {
-	txn.Set(r.keyForDevice(userID, deviceID), mustMarshal(storedDevice{DisplayName: device.DisplayName, Keys: device.Keys}))
+	txn.Set(r.keyForDevice(userID, deviceID), mustMarshal(storedDevice{DisplayName: device.DisplayName, Keys: device.Keys.Raw}))
 }
 
 func (r *RemoteDevicesDirectory) getSigningKeys(txn fdb.ReadTransaction, userID id.UserID) signingKeysFuture {

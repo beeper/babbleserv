@@ -13,9 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 const (
@@ -100,9 +102,21 @@ func crossSigningKeyJSON(t *testing.T, key remoteTestKey, usage id.CrossSigningU
 }
 
 func mustCanonical(t *testing.T, raw json.RawMessage) json.RawMessage {
-	canonical, err := canonicalSignedJSON(raw)
+	canonical, err := signedjson.Canonical(raw)
 	require.NoError(t, err)
 	return canonical
+}
+
+func canonicalDeviceKeys(t *testing.T, raw json.RawMessage) types.SignedDeviceKeys {
+	keys, err := types.ParseSignedJSON[mautrix.DeviceKeys](mustCanonical(t, raw))
+	require.NoError(t, err)
+	return keys
+}
+
+func canonicalCrossSigningKey(t *testing.T, raw json.RawMessage) types.SignedCrossSigningKey {
+	key, err := types.ParseSignedJSON[mautrix.CrossSigningKeys](mustCanonical(t, raw))
+	require.NoError(t, err)
+	return key
 }
 
 func signers(t *testing.T, raw json.RawMessage) map[id.UserID]map[id.KeyID]string {
@@ -117,22 +131,6 @@ func mustDecodeKey(t *testing.T, encoded string) ed25519.PublicKey {
 	key, err := Base64Decode(encoded)
 	require.NoError(t, err)
 	return key
-}
-
-func TestCanonicalSignedJSON(t *testing.T) {
-	canonical, err := canonicalSignedJSON(json.RawMessage(`{
-		"b": 1,
-		"unsigned": {"device_display_name": "Phone"},
-		"signatures": {"@a:b": {"ed25519:K": "sig"}},
-		"a": "A"
-	}`))
-	require.NoError(t, err)
-	assert.Equal(t, `{"a":"A","b":1,"signatures":{"@a:b":{"ed25519:K":"sig"}}}`, string(canonical))
-
-	for _, raw := range []string{``, `null`, `[]`, `{"a":`, `{"a":1,"a":2}`, "{\"a\":\"\xff\"}"} {
-		_, err := canonicalSignedJSON(json.RawMessage(raw))
-		assert.Error(t, err, raw)
-	}
 }
 
 func TestValidateRemoteDeviceKeys(t *testing.T) {
@@ -174,23 +172,24 @@ func TestValidateRemoteDeviceKeys(t *testing.T) {
 		keys, err := validateRemoteDeviceKeys(remoteKeysUser, tc.deviceID, tc.raw)
 		if !tc.valid {
 			assert.Error(t, err, name)
-			assert.Nil(t, keys, name)
+			assert.Zero(t, keys, name)
 			continue
 		}
 		require.NoError(t, err, name)
-		assert.Equal(t, keys, mustCanonical(t, keys), name)
-		assert.False(t, gjson.GetBytes(keys, "unsigned").Exists(), name)
+		assert.Equal(t, keys.Raw, mustCanonical(t, keys.Raw), name)
+		assert.False(t, gjson.GetBytes(keys.Raw, "unsigned").Exists(), name)
 		if tc.unsigned {
-			assert.False(t, gjson.GetBytes(keys, "signatures").Exists(), name)
+			assert.False(t, gjson.GetBytes(keys.Raw, "signatures").Exists(), name)
 			continue
 		}
-		assert.Equal(t, []id.UserID{remoteKeysUser}, slices.Collect(maps.Keys(signers(t, keys))), name)
-		assert.NoError(t, VerifyJSON(keys, remoteKeysUser.String(), "ed25519:DEVICE", mustDecodeKey(t, device.public)), name)
+		assert.Equal(t, []id.UserID{remoteKeysUser}, slices.Collect(maps.Keys(signers(t, keys.Raw))), name)
+		assert.Equal(t, signers(t, keys.Raw), map[id.UserID]map[id.KeyID]string(keys.View.Signatures), name)
+		assert.NoError(t, signedjson.Verify(keys.Raw, remoteKeysUser.String(), "ed25519:DEVICE", mustDecodeKey(t, device.public)), name)
 	}
 
 	keys, err := validateRemoteDeviceKeys(remoteKeysUser, "DEVICE", crossSigned)
 	require.NoError(t, err)
-	assert.Len(t, signers(t, keys)[remoteKeysUser], 2)
+	assert.Len(t, signers(t, keys.Raw)[remoteKeysUser], 2)
 }
 
 func TestValidateRemoteCrossSigningKey(t *testing.T) {
@@ -221,12 +220,12 @@ func TestValidateRemoteCrossSigningKey(t *testing.T) {
 		key, err := validateRemoteCrossSigningKey(remoteKeysUser, tc.usage, tc.raw)
 		if !tc.valid {
 			assert.Error(t, err, name)
-			assert.Nil(t, key, name)
+			assert.Zero(t, key, name)
 			continue
 		}
 		require.NoError(t, err, name)
-		assert.Equal(t, key, mustCanonical(t, key), name)
-		for signer := range signers(t, key) {
+		assert.Equal(t, key.Raw, mustCanonical(t, key.Raw), name)
+		for signer := range signers(t, key.Raw) {
 			assert.Equal(t, remoteKeysUser, signer, name)
 		}
 	}
@@ -270,7 +269,7 @@ func TestParseRemoteQueriedDevice(t *testing.T) {
 		}
 		queried, valid := ParseRemoteQueriedDevice(remoteKeysUser, "DEVICE", raw)
 		require.True(t, valid, name)
-		assert.Equal(t, types.RemoteDevice{DisplayName: tc.expected, Keys: mustCanonical(t, keys)}, queried, name)
+		assert.Equal(t, types.RemoteDevice{DisplayName: tc.expected, Keys: canonicalDeviceKeys(t, keys)}, queried, name)
 
 		snapshot, err := ParseRemoteDeviceSnapshot(remoteKeysUser, json.RawMessage(`{"user_id":"`+remoteKeysUser.String()+`","stream_id":1,"devices":[`+entry+`]}`))
 		require.NoError(t, err, name)
@@ -315,7 +314,7 @@ func TestParseDeviceListUpdateEDU(t *testing.T) {
 		expected types.RemoteDeviceListUpdate
 	}{
 		"with keys": {deviceListEDU(t, map[string]any{"keys": keys}), types.RemoteDeviceListUpdate{
-			DeviceID: "DEVICE", StreamID: 5, PrevIDs: []int64{4}, Device: types.RemoteDevice{DisplayName: "Phone", Keys: mustCanonical(t, keys)},
+			DeviceID: "DEVICE", StreamID: 5, PrevIDs: []int64{4}, Device: types.RemoteDevice{DisplayName: "Phone", Keys: canonicalDeviceKeys(t, keys)},
 		}},
 		"without keys": {deviceListEDU(t, nil), types.RemoteDeviceListUpdate{DeviceID: "DEVICE", StreamID: 5, PrevIDs: []int64{4}, Device: phone}},
 		"invalid keys keep the stream ID": {deviceListEDU(t, map[string]any{"device_id": "OTHER", "keys": keys}), types.RemoteDeviceListUpdate{
@@ -368,12 +367,12 @@ func TestParseSigningKeyUpdateEDU(t *testing.T) {
 		expected types.RemoteSigningKeyUpdate
 	}{
 		"both keys": {edu(map[string]any{"master_key": masterKey, "self_signing_key": selfSigningKey}), types.RemoteSigningKeyUpdate{
-			MasterKey: mustCanonical(t, masterKey), SelfSigningKey: mustCanonical(t, selfSigningKey),
+			MasterKey: canonicalCrossSigningKey(t, masterKey), SelfSigningKey: canonicalCrossSigningKey(t, selfSigningKey),
 		}},
-		"master only": {edu(map[string]any{"master_key": masterKey}), types.RemoteSigningKeyUpdate{MasterKey: mustCanonical(t, masterKey)}},
+		"master only": {edu(map[string]any{"master_key": masterKey}), types.RemoteSigningKeyUpdate{MasterKey: canonicalCrossSigningKey(t, masterKey)}},
 		"neither":     {edu(nil), types.RemoteSigningKeyUpdate{}},
 		"invalid master dropped": {edu(map[string]any{"master_key": selfSigningKey, "self_signing_key": selfSigningKey}), types.RemoteSigningKeyUpdate{
-			SelfSigningKey: mustCanonical(t, selfSigningKey), Invalid: true,
+			SelfSigningKey: canonicalCrossSigningKey(t, selfSigningKey), Invalid: true,
 		}},
 	} {
 		userID, update, err := ParseSigningKeyUpdateEDU(tc.content)
@@ -414,10 +413,10 @@ func TestParseRemoteDeviceSnapshot(t *testing.T) {
 	assert.Equal(t, &types.RemoteDeviceSnapshot{
 		StreamID: 7,
 		Devices: map[id.DeviceID]types.RemoteDevice{
-			"PHONE":   {DisplayName: "Phone", Keys: mustCanonical(t, phoneKeys)},
+			"PHONE":   {DisplayName: "Phone", Keys: canonicalDeviceKeys(t, phoneKeys)},
 			"KEYLESS": {},
 		},
-		MasterKey: mustCanonical(t, masterKey),
+		MasterKey: canonicalCrossSigningKey(t, masterKey),
 	}, parsed)
 
 	for name, tc := range map[string]struct {
@@ -442,7 +441,7 @@ func TestParseRemoteDeviceSnapshot(t *testing.T) {
 
 	parsed, err = ParseRemoteDeviceSnapshot(remoteKeysUser, snapshot(map[string]any{"master_key": "key"}))
 	require.NoError(t, err)
-	assert.Nil(t, parsed.MasterKey)
+	assert.True(t, parsed.MasterKey.IsZero())
 
 	for name, body := range map[string]json.RawMessage{
 		"missing stream ID":    snapshot(nil, "stream_id"),

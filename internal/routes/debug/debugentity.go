@@ -52,7 +52,7 @@ func (d *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
-	deviceKeys := make(map[id.DeviceID]mautrix.DeviceKeys, len(devices))
+	deviceKeys := make(map[id.DeviceID]types.SignedDeviceKeys, len(devices))
 	deviceOTKCounts := make(map[id.DeviceID]mautrix.OTKCount, len(devices))
 	deviceFallbackKeys := make(map[id.DeviceID]map[id.KeyAlgorithm]types.FallbackKey, len(devices))
 	for _, device := range devices {
@@ -60,8 +60,8 @@ func (d *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
-		} else if keys != nil {
-			deviceKeys[device.ID] = *keys
+		} else if !keys.IsZero() {
+			deviceKeys[device.ID] = keys
 		}
 		counts, err := d.db.Accounts.CountOneTimeKeys(r.Context(), userID, device.ID)
 		if err != nil {
@@ -81,7 +81,7 @@ func (d *DebugRoutes) DebugGetUser(w http.ResponseWriter, r *http.Request) {
 		User *types.User `json:"accounts_user"`
 
 		Devices                []*types.Device                                       `json:"devices"`
-		DeviceKeys             map[id.DeviceID]mautrix.DeviceKeys                    `json:"device_keys"`
+		DeviceKeys             map[id.DeviceID]types.SignedDeviceKeys                `json:"device_keys"`
 		DeviceOneTimeKeyCounts map[id.DeviceID]mautrix.OTKCount                      `json:"device_otk_counts"`
 		DeviceFallbackKeys     map[id.DeviceID]map[id.KeyAlgorithm]types.FallbackKey `json:"device_fallback_keys"`
 

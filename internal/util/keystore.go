@@ -12,6 +12,8 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
+
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 type serverKeys struct {
@@ -101,7 +103,7 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 
 	for keyID, key := range serverKeys.verifyKeys {
 		for _, sName := range serverNames {
-			if err = VerifyJSON(b, sName, keyID, key); err == nil {
+			if err = signedjson.Verify(b, sName, keyID, key); err == nil {
 				return nil
 			} else {
 				errs = append(errs, err)
@@ -134,7 +136,7 @@ func (k *KeyStore) VerifyJSONs(ctx context.Context, requests []gomatrixserverlib
 		}
 		results[i].Error = errors.New("no valid signature from " + serverName)
 		for keyID, key := range keys.verifyKeys {
-			if VerifyJSON(request.Message, serverName, keyID, key) == nil {
+			if signedjson.Verify(request.Message, serverName, keyID, key) == nil {
 				results[i].Error = nil
 				break
 			}

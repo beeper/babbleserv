@@ -17,6 +17,7 @@ import (
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -26,6 +27,7 @@ import (
 	"github.com/beeper/babbleserv/internal/routes/shared"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keysclaim
@@ -46,7 +48,7 @@ func (c *ClientRoutes) ClaimKeys(w http.ResponseWriter, r *http.Request) {
 	type result struct {
 		server string
 		err    error
-		res    mautrix.RespClaimKeys
+		keys   map[id.UserID]map[id.DeviceID]map[id.KeyID]json.RawMessage
 	}
 	resultsCh := make(chan result, len(serverToUserDevices))
 	for server, userDevices := range serverToUserDevices {
@@ -69,13 +71,7 @@ func (c *ClientRoutes) ClaimKeys(w http.ResponseWriter, r *http.Request) {
 				spec.ServerName(server),
 				req,
 			)
-
-			// Gross: convert fclient.RespClaimKeys -> mautrix.RespClaimKeys
-			b, _ := json.Marshal(res)
-			var mres mautrix.RespClaimKeys
-			json.Unmarshal(b, &mres)
-
-			resultsCh <- result{server, err, mres}
+			resultsCh <- result{server, err, remoteClaimedKeys(res)}
 		}()
 	}
 
@@ -91,7 +87,7 @@ func (c *ClientRoutes) ClaimKeys(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		for userID, keys := range res.res.OneTimeKeys {
+		for userID, keys := range res.keys {
 			if _, found := serverToUserDevices[res.server][userID]; !found {
 				hlog.FromRequest(r).Warn().
 					Str("server", res.server).
@@ -104,6 +100,24 @@ func (c *ClientRoutes) ClaimKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, resp)
+}
+
+// Claimed keys pass through as received, so signatures over members we don't know still verify for
+// the client
+func remoteClaimedKeys(res fclient.RespClaimKeys) map[id.UserID]map[id.DeviceID]map[id.KeyID]json.RawMessage {
+	claimed := make(map[id.UserID]map[id.DeviceID]map[id.KeyID]json.RawMessage, len(res.OneTimeKeys))
+	for userID, devices := range res.OneTimeKeys {
+		userKeys := make(map[id.DeviceID]map[id.KeyID]json.RawMessage, len(devices))
+		for deviceID, keys := range devices {
+			deviceKeys := make(map[id.KeyID]json.RawMessage, len(keys))
+			for keyID, key := range keys {
+				deviceKeys[id.KeyID(keyID)] = key
+			}
+			userKeys[id.DeviceID(deviceID)] = deviceKeys
+		}
+		claimed[id.UserID(userID)] = userKeys
+	}
+	return claimed
 }
 
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keysquery
@@ -289,21 +303,9 @@ type respUploadSignatures struct {
 	Failures map[id.UserID]map[string]*mautrix.RespError `json:"failures,omitempty"`
 }
 
-// A remote target is checked as the raw JSON the client signed, which may carry members the struct
-// drops. Both come from the same bytes, so the stored signatures are the ones verified.
-type signatureUploadTarget struct {
-	object mautrix.ReqKeysSignatures
-	raw    json.RawMessage
-}
-
-func (t *signatureUploadTarget) UnmarshalJSON(data []byte) error {
-	t.raw = slices.Clone(data)
-	return json.Unmarshal(data, &t.object)
-}
-
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keyssignaturesupload
 func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) {
-	req, respErr := util.ParseRequestJSON[map[id.UserID]map[string]signatureUploadTarget](r)
+	req, respErr := util.ParseRequestJSON[map[id.UserID]map[string]types.SignatureUploadTarget](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -322,9 +324,9 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
-	var userSigningKey *mautrix.CrossSigningKeys
-	if userXSKeys != nil && userXSKeys.UserSigning.KeyID() != "" {
-		userSigningKey = &userXSKeys.UserSigning.CrossSigningKeys
+	var userSigningKey types.SignedCrossSigningKey
+	if userXSKeys != nil {
+		userSigningKey = userXSKeys.UserSigning
 	}
 
 	remoteUserIDs := make([]id.UserID, 0, len(req))
@@ -340,7 +342,7 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 	}
 
 	targets := make([]types.KeySignatureTarget, 0, len(req))
-	localObjects := make([]mautrix.ReqKeysSignatures, 0, len(req))
+	localTargets := make([]types.SignatureUploadTarget, 0, len(req))
 	failures := make(map[id.UserID]map[string]*mautrix.RespError)
 
 	// First pass: loop through the target objects to sign and validate they exist and match. Remote
@@ -348,7 +350,7 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 	for targetUserID, targetObjects := range req {
 		for targetKey, target := range targetObjects {
 			if targetUserID.Homeserver() != c.config.ServerName {
-				failure := shared.RemoteSignatureTargetFailure(u.UserID, userSigningKey, remoteCaches[targetUserID], targetKey, target.raw)
+				failure := shared.RemoteSignatureTargetFailure(u.UserID, userSigningKey, remoteCaches[targetUserID], targetKey, target)
 				if failure != nil {
 					if failures[targetUserID] == nil {
 						failures[targetUserID] = make(map[string]*mautrix.RespError, 1)
@@ -359,14 +361,12 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 				targets = append(targets, types.KeySignatureTarget{
 					UserID:     targetUserID,
 					KeyID:      id.KeyID(targetKey),
-					Signatures: target.object.Signatures,
+					Signatures: target.View.Signatures,
 				})
 				continue
 			}
 
-			targetObject := target.object
-
-			if targetObject.DeviceID == "" {
+			if target.View.DeviceID == "" {
 				// Target is one of the users cross signing keys
 				targetXSKeys, err := getCrossSigningKeys(targetUserID)
 				if err != nil {
@@ -375,45 +375,45 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 				}
 
 				// Find and validate the relevant cross signing key matches the input
-				var targetXSKey *types.CrossSigningKey
+				var targetXSKey types.SignedCrossSigningKey
 				if targetXSKeys != nil {
-					switch targetKey {
-					case targetXSKeys.Master.FirstKey().String():
-						targetXSKey = &targetXSKeys.Master
-					case targetXSKeys.SelfSigning.FirstKey().String():
-						targetXSKey = &targetXSKeys.SelfSigning
-					case targetXSKeys.UserSigning.FirstKey().String():
+					switch id.Ed25519(targetKey) {
+					case types.CrossSigningPublicKey(targetXSKeys.Master):
+						targetXSKey = targetXSKeys.Master
+					case types.CrossSigningPublicKey(targetXSKeys.SelfSigning):
+						targetXSKey = targetXSKeys.SelfSigning
+					case types.CrossSigningPublicKey(targetXSKeys.UserSigning):
 						if u.UserID != targetUserID {
 							// This should be impossible, if the client has access to the actual user
 							// signing key of another user we screwed up big time.
 							util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Cannot access another users user signing key")
 							return
 						}
-						targetXSKey = &targetXSKeys.UserSigning
+						targetXSKey = targetXSKeys.UserSigning
 					}
 				}
-				if targetXSKey == nil {
+				if targetXSKey.IsZero() {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Target cross signing key does not exist")
 					return
-				} else if !util.CompareSignedObjectsJSON(targetObject, targetXSKey) {
+				} else if !target.Matches(targetXSKey.Raw) {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Input cross signing key does not match stored")
 					return
 				}
 			} else {
 				// Target is one of the users device keys. Synapse keys the target by the map key, so
 				// a different device_id would sign one device and announce another.
-				if targetObject.DeviceID.String() != targetKey {
+				if target.View.DeviceID.String() != targetKey {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Target device ID does not match its key")
 					return
 				}
-				targetDeviceKeys, err := c.db.Accounts.GetDeviceKeys(ctx, targetUserID, targetObject.DeviceID)
+				targetDeviceKeys, err := c.db.Accounts.GetDeviceKeys(ctx, targetUserID, target.View.DeviceID)
 				if err != nil {
 					util.ResponseErrorUnknownJSON(w, r, err)
 					return
-				} else if targetDeviceKeys == nil {
+				} else if targetDeviceKeys.IsZero() {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Target device keys does not exist")
 					return
-				} else if !util.CompareSignedObjectsJSON(targetObject, targetDeviceKeys) {
+				} else if !target.Matches(targetDeviceKeys.Raw) {
 					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Input device key does not match stored")
 					return
 				}
@@ -422,47 +422,27 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 			targets = append(targets, types.KeySignatureTarget{
 				UserID:     targetUserID,
 				KeyID:      id.KeyID(targetKey),
-				DeviceID:   targetObject.DeviceID,
-				Signatures: targetObject.Signatures,
+				DeviceID:   target.View.DeviceID,
+				Signatures: target.View.Signatures,
 			})
-			localObjects = append(localObjects, targetObject)
+			localTargets = append(localTargets, target)
 		}
 	}
 
 	// Second pass: now we're happy with the local objects, pull all the users keys (ie all the
 	// possible signing keys), loop the target objects to sign and validate the signatures from those
 	// keys.
-	if len(localObjects) > 0 {
+	if len(localTargets) > 0 {
 		userKeys, err := c.getSignerPublicKeys(ctx, u.UserID, userXSKeys)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
 		}
 
-		for _, targetObject := range localObjects {
-			// Now we need to, for each signature we need to grab the relevant device or xs key
-			for signingUserID, keyToSig := range targetObject.Signatures {
-				if signingUserID != u.UserID {
-					util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Invalid signing user ID")
-					return
-				}
-				// For each signature check the relevant key has signed the object. Only ed25519
-				// keys are verified, so any other key ID would pass unchecked.
-				for keyID := range keyToSig {
-					key, ok := userKeys[keyID]
-					algorithm, _ := keyID.Parse()
-					if !ok || algorithm != id.KeyAlgorithmEd25519 {
-						util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf("Unknown signing key: %s", keyID))
-						return
-					}
-					keys := map[id.KeyID]id.Ed25519{
-						keyID: key,
-					}
-					if verifyErr := util.VerifyObjectWithEd25519Keys(u.UserID, keys, targetObject); verifyErr != nil {
-						util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Errorf("unable to verify object: %w", verifyErr).Error())
-						return
-					}
-				}
+		for _, target := range localTargets {
+			if err := verifyLocalTargetSignatures(u.UserID, target, userKeys); err != nil {
+				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, err.Error())
+				return
 			}
 		}
 	}
@@ -483,31 +463,53 @@ func (c *ClientRoutes) UploadSignatures(w http.ResponseWriter, r *http.Request) 
 	util.ResponseJSON(w, r, http.StatusOK, respUploadSignatures{Failures: failures})
 }
 
+// Every signature on a local target must be the requester's, by one of their ed25519 keys, by key ID
+// to unpadded base64 public key. Only ed25519 keys are verified, so any other key ID would pass
+// unchecked.
+func verifyLocalTargetSignatures(requestUserID id.UserID, target types.SignatureUploadTarget, signerKeys map[id.KeyID]string) error {
+	for signingUserID, keyToSig := range target.View.Signatures {
+		if signingUserID != requestUserID {
+			return errors.New("Invalid signing user ID")
+		}
+		for keyID := range keyToSig {
+			key, ok := signerKeys[keyID]
+			algorithm, _ := keyID.Parse()
+			if !ok || algorithm != id.KeyAlgorithmEd25519 {
+				return fmt.Errorf("Unknown signing key: %s", keyID)
+			} else if err := target.Verify(requestUserID, keyID.String(), key); err != nil {
+				return fmt.Errorf("unable to verify object: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// Public keys by key ID, unpadded base64
 func (c *ClientRoutes) getSignerPublicKeys(
 	ctx context.Context,
 	userID id.UserID,
 	xsKeys *types.UserCrossSigningKeys,
-) (map[id.KeyID]id.Ed25519, error) {
+) (map[id.KeyID]string, error) {
 	devices, err := c.db.Accounts.GetUserDevices(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	keys := make(map[id.KeyID]id.Ed25519, 3+len(devices))
+	keys := make(map[id.KeyID]string, 3+len(devices))
 	for _, device := range devices {
 		deviceKeys, err := c.db.Accounts.GetDeviceKeys(ctx, userID, device.ID)
 		if err != nil {
 			return nil, err
-		} else if deviceKeys == nil {
-			continue
 		}
-		for keyID, key := range deviceKeys.Keys {
-			keys[id.KeyID(keyID)] = id.Ed25519(key)
+		for keyID, key := range deviceKeys.View.Keys {
+			keys[id.KeyID(keyID)] = key
 		}
 	}
 	if xsKeys != nil {
-		maps.Copy(keys, xsKeys.Master.Keys)
-		maps.Copy(keys, xsKeys.SelfSigning.Keys)
-		maps.Copy(keys, xsKeys.UserSigning.Keys)
+		for _, xsKey := range []types.SignedCrossSigningKey{xsKeys.Master, xsKeys.SelfSigning, xsKeys.UserSigning} {
+			for keyID, key := range xsKey.View.Keys {
+				keys[keyID] = key.String()
+			}
+		}
 	}
 	return keys, nil
 }
@@ -538,9 +540,15 @@ func (c *ClientRoutes) notifyCrossSignatures(ctx context.Context, requestUserID 
 	return err
 }
 
+type reqUploadCrossSigningKeys struct {
+	Master      types.SignedCrossSigningKey `json:"master_key"`
+	SelfSigning types.SignedCrossSigningKey `json:"self_signing_key"`
+	UserSigning types.SignedCrossSigningKey `json:"user_signing_key"`
+}
+
 // https://spec.matrix.org/v1.16/client-server-api/#post_matrixclientv3keysdevice_signingupload
 func (c *ClientRoutes) UploadCrossSigningKeys(w http.ResponseWriter, r *http.Request) {
-	req, respErr := util.ParseRequestJSON[mautrix.UploadCrossSigningKeysReq](r)
+	req, respErr := util.ParseRequestJSON[reqUploadCrossSigningKeys](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -548,54 +556,28 @@ func (c *ClientRoutes) UploadCrossSigningKeys(w http.ResponseWriter, r *http.Req
 
 	u := middleware.GetRequestUserDevice(r)
 
-	// Find the master key (in request or stored previously)
-	var masterKey *mautrix.CrossSigningKeys
-	if len(req.Master.Keys) > 0 {
-		masterKey = &req.Master
-	} else {
+	var storedMaster types.SignedCrossSigningKey
+	if len(req.Master.View.Keys) == 0 {
 		existingKeys, err := c.db.Accounts.GetUserCrossSigningKeys(r.Context(), u.UserID, u.UserID)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
-		} else if existingKeys != nil && len(existingKeys.Master.Keys) > 0 {
-			masterKey = &existingKeys.Master.CrossSigningKeys
+		} else if existingKeys != nil {
+			storedMaster = existingKeys.Master
 		}
 	}
-	if masterKey == nil {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "No master key available")
+
+	upload, master, respErr := parseUploadedCrossSigningKeys(u.UserID, req, storedMaster)
+	if respErr != nil {
+		util.ResponseErrorMessageJSON(w, r, *respErr, respErr.Err)
 		return
 	}
 
-	keys := types.UserCrossSigningKeys{}
-
-	if len(req.Master.Keys) > 0 {
-		if len(req.Master.Signatures) > 0 {
-			// Only verify the master key if it has signatures included as these are optional
-			if verifyErr := util.VerifyObjectWithEd25519Keys(u.UserID, masterKey.Keys, req.Master); verifyErr != nil {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Errorf("unable to verify master key: %w", verifyErr).Error())
-				return
-			}
-		}
-		keys.Master = types.CrossSigningKey{CrossSigningKeys: req.Master}
-	}
-
-	// Both user and self signing keys *must* be signed by the master key
-	if len(req.SelfSigning.Keys) > 0 {
-		if verifyErr := util.VerifyObjectWithEd25519Keys(u.UserID, masterKey.Keys, req.SelfSigning); verifyErr != nil {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
-			return
-		}
-		keys.SelfSigning = types.CrossSigningKey{CrossSigningKeys: req.SelfSigning}
-	}
-	if len(req.UserSigning.Keys) > 0 {
-		if verifyErr := util.VerifyObjectWithEd25519Keys(u.UserID, masterKey.Keys, req.UserSigning); verifyErr != nil {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
-			return
-		}
-		keys.UserSigning = types.CrossSigningKey{CrossSigningKeys: req.UserSigning}
-	}
-
-	if err := c.db.Accounts.StoreUserCrossSigningKeys(r.Context(), u.UserID, u.DeviceID, keys); err != nil {
+	err := c.db.Accounts.StoreUserCrossSigningKeys(r.Context(), u.UserID, u.DeviceID, upload, master)
+	if errors.Is(err, types.ErrMasterKeyChanged) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Master key changed during the upload")
+		return
+	} else if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	}
@@ -603,9 +585,104 @@ func (c *ClientRoutes) UploadCrossSigningKeys(w http.ResponseWriter, r *http.Req
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
 
+func canonicalUploadedKey[T any](uploaded types.SignedJSON[T]) (types.SignedJSON[T], *mautrix.RespError) {
+	key, err := uploaded.Canonical()
+	if err == nil {
+		err = signedjson.CheckReservedNames(key.Raw)
+	}
+	if err != nil {
+		return types.SignedJSON[T]{}, shared.KeyFailure(mautrix.MBadJSON.ErrCode, err.Error())
+	}
+	return key, nil
+}
+
+// Others sign through /keys/signatures/upload, which verifies them, so an upload keeps only the
+// owner's signatures
+func ownerSigned[T any](userID id.UserID, key types.SignedJSON[T], owner map[id.KeyID]string) (types.SignedJSON[T], *mautrix.RespError) {
+	signed, err := key.WithOwnerSignatures(userID, owner)
+	if err != nil {
+		return types.SignedJSON[T]{}, shared.KeyFailure(mautrix.MBadJSON.ErrCode, err.Error())
+	}
+	return signed, nil
+}
+
+// A key without public keys counts as omitted. Self-signing and user-signing keys must be signed by
+// the master key, uploaded or stored, whose public key is returned. A master key's signatures are not
+// required, but a signature by its own key must verify. Signatures are checked over the keys as
+// uploaded, which are returned canonical with only the owner's signatures.
+func parseUploadedCrossSigningKeys(
+	userID id.UserID,
+	req reqUploadCrossSigningKeys,
+	storedMaster types.SignedCrossSigningKey,
+) (types.UserCrossSigningKeys, id.Ed25519, *mautrix.RespError) {
+	var upload types.UserCrossSigningKeys
+	for _, key := range []struct {
+		uploaded types.SignedCrossSigningKey
+		usage    id.CrossSigningUsage
+		parsed   *types.SignedCrossSigningKey
+	}{
+		{req.Master, id.XSUsageMaster, &upload.Master},
+		{req.SelfSigning, id.XSUsageSelfSigning, &upload.SelfSigning},
+		{req.UserSigning, id.XSUsageUserSigning, &upload.UserSigning},
+	} {
+		if len(key.uploaded.View.Keys) == 0 {
+			continue
+		}
+		parsed, respErr := canonicalUploadedKey(key.uploaded)
+		if respErr != nil {
+			return types.UserCrossSigningKeys{}, "", respErr
+		} else if err := util.CheckCrossSigningKey(userID, key.usage, parsed); err != nil {
+			return types.UserCrossSigningKeys{}, "", shared.KeyFailure(mautrix.MInvalidParam.ErrCode, err.Error())
+		}
+		*key.parsed = parsed
+	}
+
+	master := upload.Master
+	if master.IsZero() {
+		master = storedMaster
+	}
+	if len(master.View.Keys) == 0 {
+		return types.UserCrossSigningKeys{}, "", shared.KeyFailure(mautrix.MInvalidParam.ErrCode, "No master key available")
+	}
+
+	if !upload.Master.IsZero() {
+		publicKey := types.CrossSigningPublicKey(upload.Master).String()
+		selfKeyID := id.NewKeyID(id.KeyAlgorithmEd25519, publicKey)
+		if _, selfSigned := upload.Master.View.Signatures[userID][selfKeyID]; selfSigned {
+			if err := upload.Master.Verify(userID, selfKeyID.String(), publicKey); err != nil {
+				return types.UserCrossSigningKeys{}, "", shared.KeyFailure(mautrix.MInvalidParam.ErrCode, fmt.Sprintf("unable to verify master key: %s", err))
+			}
+		}
+	}
+	for _, key := range []types.SignedCrossSigningKey{upload.SelfSigning, upload.UserSigning} {
+		if key.IsZero() {
+			continue
+		} else if err := types.VerifyKeys(key, userID, master.View.Keys); err != nil {
+			return types.UserCrossSigningKeys{}, "", shared.KeyFailure(mautrix.MInvalidParam.ErrCode, err.Error())
+		}
+	}
+
+	for _, key := range []*types.SignedCrossSigningKey{&upload.Master, &upload.SelfSigning, &upload.UserSigning} {
+		if key.IsZero() {
+			continue
+		}
+		var respErr *mautrix.RespError
+		if *key, respErr = ownerSigned(userID, *key, key.View.Signatures[userID]); respErr != nil {
+			return types.UserCrossSigningKeys{}, "", respErr
+		}
+	}
+	return upload, types.CrossSigningPublicKey(master), nil
+}
+
+type reqUploadKeys struct {
+	DeviceKeys   types.SignedDeviceKeys              `json:"device_keys"`
+	OneTimeKeys  map[id.KeyID]types.SignedOneTimeKey `json:"one_time_keys"`
+	FallbackKeys map[id.KeyID]types.SignedOneTimeKey `json:"fallback_keys"`
+}
+
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3keysupload
 func (c *ClientRoutes) UploadKeys(w http.ResponseWriter, r *http.Request) {
-	req, respErr := util.ParseRequestJSON[types.ReqUploadKeys](r)
+	req, respErr := util.ParseRequestJSON[reqUploadKeys](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -613,90 +690,58 @@ func (c *ClientRoutes) UploadKeys(w http.ResponseWriter, r *http.Request) {
 
 	u := middleware.GetRequestUserDevice(r)
 
-	var storeDeviceKeys bool
-	var deviceKeys *mautrix.DeviceKeys
-	var oneTimeKeys map[id.KeyID]mautrix.OneTimeKey
-	var fallbackKeys map[id.KeyAlgorithm]types.FallbackKey
-
-	if req.DeviceKeys == nil {
+	// One-time and fallback keys are verified against these keys, which are only stored when uploaded
+	var deviceKeys types.SignedDeviceKeys
+	storeDeviceKeys := !req.DeviceKeys.IsZero()
+	if !storeDeviceKeys {
 		var err error
 		deviceKeys, err = c.db.Accounts.GetDeviceKeys(r.Context(), u.UserID, u.DeviceID)
 		if err != nil {
 			util.ResponseErrorUnknownJSON(w, r, err)
 			return
-		} else if deviceKeys == nil {
+		} else if deviceKeys.IsZero() {
 			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing device keys")
 			return
 		}
 	} else {
-		if len(req.DeviceKeys.Keys) == 0 || len(req.DeviceKeys.Algorithms) == 0 {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MBadJSON, "Missing keys or algorithms")
+		if deviceKeys, respErr = parseUploadedDeviceKeys(u.UserID, u.DeviceID, req.DeviceKeys); respErr != nil {
+			util.ResponseErrorMessageJSON(w, r, *respErr, respErr.Err)
 			return
-		} else if req.DeviceKeys.UserID != middleware.GetRequestUserID(r) {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "UserID does not match")
-			return
-		} else if req.DeviceKeys.DeviceID != middleware.GetRequestDeviceID(r) {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "DeviceID does not match")
-			return
-		}
-
-		// Check that the device keys object is signed by one of the keys it contains
-		if len(req.DeviceKeys.Signatures) == 0 {
+		} else if len(deviceKeys.View.Signatures) == 0 {
 			hlog.FromRequest(r).Warn().Msg("Storing device key with no signatures")
-		} else {
-			if verifyErr := util.VerifyObjectWithKeyMap(u.UserID, req.DeviceKeys.Keys, req.DeviceKeys); verifyErr != nil {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
-				return
-			}
 		}
-
-		deviceKeys = req.DeviceKeys
-		storeDeviceKeys = true
 	}
 
-	if len(req.OneTimeKeys) > 0 {
-		for _, otk := range req.OneTimeKeys {
-			if otk.Fallback {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "One time keys cannot have fallback set")
-				return
-			}
-			// One time keys must be signed by the device they belong to
-			if verifyErr := util.VerifyObjectWithKeyMap(u.UserID, deviceKeys.Keys, otk); verifyErr != nil {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
-				return
-			}
+	oneTimeKeys := make(map[id.KeyID]types.SignedOneTimeKey, len(req.OneTimeKeys))
+	for keyID, uploaded := range req.OneTimeKeys {
+		if oneTimeKeys[keyID], respErr = parseUploadedOneTimeKey(u.UserID, deviceKeys, uploaded, false); respErr != nil {
+			util.ResponseErrorMessageJSON(w, r, *respErr, respErr.Err)
+			return
 		}
-		oneTimeKeys = req.OneTimeKeys
 	}
 
-	if len(req.FallbackKeys) > 0 {
-		fallbackKeys = make(map[id.KeyAlgorithm]types.FallbackKey, len(req.FallbackKeys))
-		for keyID, fbkey := range req.FallbackKeys {
-			if !fbkey.Fallback {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Fallback keys must have fallback set")
-				return
-			}
-			// Fallback keys must be signed by the device they belong to
-			if verifyErr := util.VerifyObjectWithKeyMap(u.UserID, deviceKeys.Keys, fbkey); verifyErr != nil {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
-				return
-			}
-			algorithm, _ := keyID.Parse()
-			if _, ok := fallbackKeys[algorithm]; ok {
-				util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "One fallback key allowed per algorithm")
-				return
-			}
-			// Note: this does mean if a device re-uploads the same fallback key it'll be unused
-			// until the next claim.
-			fallbackKeys[algorithm] = types.FallbackKey{
-				Key:   fbkey,
-				KeyID: keyID,
-			}
+	fallbackKeys := make(map[id.KeyAlgorithm]types.FallbackKey, len(req.FallbackKeys))
+	for keyID, uploaded := range req.FallbackKeys {
+		key, respErr := parseUploadedOneTimeKey(u.UserID, deviceKeys, uploaded, true)
+		if respErr != nil {
+			util.ResponseErrorMessageJSON(w, r, *respErr, respErr.Err)
+			return
+		}
+		algorithm, _ := keyID.Parse()
+		if _, ok := fallbackKeys[algorithm]; ok {
+			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "One fallback key allowed per algorithm")
+			return
+		}
+		// Note: this does mean if a device re-uploads the same fallback key it'll be unused
+		// until the next claim.
+		fallbackKeys[algorithm] = types.FallbackKey{
+			Key:   key,
+			KeyID: keyID,
 		}
 	}
 
 	if !storeDeviceKeys {
-		deviceKeys = nil
+		deviceKeys = types.SignedDeviceKeys{}
 	}
 
 	otkCounts, err := c.db.Accounts.StoreKeysForDevice(
@@ -715,6 +760,49 @@ func (c *ClientRoutes) UploadKeys(w http.ResponseWriter, r *http.Request) {
 	util.ResponseJSON(w, r, http.StatusOK, mautrix.RespUploadKeys{
 		OneTimeKeyCounts: otkCounts,
 	})
+}
+
+// Device keys must belong to the uploading device and be signed by every ed25519 key they hold, when
+// signed at all. Signatures are checked over the keys as uploaded, which are returned canonical with
+// only the owner's signatures.
+func parseUploadedDeviceKeys(userID id.UserID, deviceID id.DeviceID, uploaded types.SignedDeviceKeys) (types.SignedDeviceKeys, *mautrix.RespError) {
+	keys, respErr := canonicalUploadedKey(uploaded)
+	if respErr != nil {
+		return types.SignedDeviceKeys{}, respErr
+	} else if len(keys.View.Keys) == 0 || len(keys.View.Algorithms) == 0 {
+		return types.SignedDeviceKeys{}, shared.KeyFailure(mautrix.MBadJSON.ErrCode, "Missing keys or algorithms")
+	} else if keys.View.UserID != userID {
+		return types.SignedDeviceKeys{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, "UserID does not match")
+	} else if keys.View.DeviceID != deviceID {
+		return types.SignedDeviceKeys{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, "DeviceID does not match")
+	} else if len(keys.View.Signatures) == 0 {
+		return keys, nil
+	} else if err := types.VerifyKeys(keys, userID, keys.View.Keys); err != nil {
+		return types.SignedDeviceKeys{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, err.Error())
+	}
+	return ownerSigned(userID, keys, keys.View.Signatures[userID])
+}
+
+// One-time and fallback keys must be signed by the device they belong to, and carry the fallback flag
+// exactly when they are fallback keys. Signatures are checked over the key as uploaded, which is
+// returned canonical.
+func parseUploadedOneTimeKey(
+	userID id.UserID,
+	deviceKeys types.SignedDeviceKeys,
+	uploaded types.SignedOneTimeKey,
+	fallback bool,
+) (types.SignedOneTimeKey, *mautrix.RespError) {
+	key, respErr := canonicalUploadedKey(uploaded)
+	if respErr != nil {
+		return types.SignedOneTimeKey{}, respErr
+	} else if fallback && !key.View.Fallback {
+		return types.SignedOneTimeKey{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, "Fallback keys must have fallback set")
+	} else if !fallback && key.View.Fallback {
+		return types.SignedOneTimeKey{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, "One time keys cannot have fallback set")
+	} else if err := types.VerifyKeys(key, userID, deviceKeys.View.Keys); err != nil {
+		return types.SignedOneTimeKey{}, shared.KeyFailure(mautrix.MInvalidParam.ErrCode, err.Error())
+	}
+	return key, nil
 }
 
 // Key changes API is expensive to calculate since we need to paginate all user device changes

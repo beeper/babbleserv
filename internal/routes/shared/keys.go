@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/rs/zerolog"
-	"github.com/tidwall/gjson"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/signatures"
 	"maunium.net/go/mautrix/id"
@@ -25,9 +24,9 @@ func ClaimUserKeys(
 	config config.BabbleConfig,
 	db *databases.Databases,
 	req mautrix.OneTimeKeysRequest,
-) (mautrix.RespClaimKeys, MissingUserKeyClaimsByServer, error) {
-	resp := mautrix.RespClaimKeys{
-		OneTimeKeys: make(map[id.UserID]map[id.DeviceID]map[id.KeyID]mautrix.OneTimeKey),
+) (types.RespClaimKeys, MissingUserKeyClaimsByServer, error) {
+	resp := types.RespClaimKeys{
+		OneTimeKeys: make(map[id.UserID]map[id.DeviceID]map[id.KeyID]json.RawMessage),
 	}
 
 	serverToUserDevices := make(MissingUserKeyClaimsByServer, len(req))
@@ -54,7 +53,7 @@ func ClaimUserKeys(
 				continue
 			}
 			if _, ok := resp.OneTimeKeys[userID]; !ok {
-				resp.OneTimeKeys[userID] = make(map[id.DeviceID]map[id.KeyID]mautrix.OneTimeKey, 1)
+				resp.OneTimeKeys[userID] = make(map[id.DeviceID]map[id.KeyID]json.RawMessage, 1)
 			}
 			resp.OneTimeKeys[userID][deviceID] = keys
 		}
@@ -65,19 +64,18 @@ func ClaimUserKeys(
 
 type MissingUserKeysByServer map[string]map[id.UserID]mautrix.DeviceIDList
 
-// UserKeys is one user's keys before filtering to a request, each a signed object as raw JSON, nil
-// when absent. Signatures other than the owner's are dropped and unsigned replaced when added to a
-// response.
+// UserKeys is one user's keys before filtering to a request. Signatures other than the owner's are
+// dropped and unsigned replaced when added to a response.
 type UserKeys struct {
 	Devices     map[id.DeviceID]UserDeviceKeys
-	Master      json.RawMessage
-	SelfSigning json.RawMessage
+	Master      types.SignedCrossSigningKey
+	SelfSigning types.SignedCrossSigningKey
 	// Only ever set for the requester's own local keys
-	UserSigning json.RawMessage
+	UserSigning types.SignedCrossSigningKey
 }
 
 type UserDeviceKeys struct {
-	Keys        json.RawMessage
+	Keys        types.SignedDeviceKeys
 	DisplayName string
 }
 
@@ -152,43 +150,30 @@ func getLocalUserKeys(
 		return UserKeys{}, err
 	}
 
-	keys := UserKeys{Devices: make(map[id.DeviceID]UserDeviceKeys, len(snapshot.Devices))}
-	for _, device := range snapshot.Devices {
-		if device.Keys == nil {
-			continue
-		}
-		deviceKeys, err := marshalLocalKey(device.Keys)
-		if err != nil {
-			return UserKeys{}, err
-		}
-		keys.Devices[device.Device.ID] = UserDeviceKeys{Keys: deviceKeys, DisplayName: device.Device.DisplayName}
-	}
-	if keys.Master, err = marshalLocalKey(snapshot.MasterKey); err != nil {
-		return UserKeys{}, err
-	}
-	if keys.SelfSigning, err = marshalLocalKey(snapshot.SelfSigningKey); err != nil {
-		return UserKeys{}, err
-	}
-
+	keys := userKeysFromLocalSnapshot(snapshot)
 	if userID == requestUserID {
 		crossSigningKeys, err := db.Accounts.GetUserCrossSigningKeys(ctx, userID, requestUserID)
 		if err != nil {
 			return UserKeys{}, err
-		} else if crossSigningKeys != nil && crossSigningKeys.UserSigning.KeyID() != "" {
-			if keys.UserSigning, err = marshalLocalKey(&crossSigningKeys.UserSigning.CrossSigningKeys); err != nil {
-				return UserKeys{}, err
-			}
+		} else if crossSigningKeys != nil {
+			keys.UserSigning = crossSigningKeys.UserSigning
 		}
 	}
-
 	return keys, nil
 }
 
-func marshalLocalKey[T any](key *T) (json.RawMessage, error) {
-	if key == nil {
-		return nil, nil
+func userKeysFromLocalSnapshot(snapshot *types.LocalDeviceSnapshot) UserKeys {
+	keys := UserKeys{
+		Devices:     make(map[id.DeviceID]UserDeviceKeys, len(snapshot.Devices)),
+		Master:      snapshot.MasterKey,
+		SelfSigning: snapshot.SelfSigningKey,
 	}
-	return json.Marshal(key)
+	for _, device := range snapshot.Devices {
+		if !device.Keys.IsZero() {
+			keys.Devices[device.Device.ID] = UserDeviceKeys{Keys: device.Keys, DisplayName: device.Device.DisplayName}
+		}
+	}
+	return keys
 }
 
 func UserKeysFromRemoteCache(cache *types.RemoteDeviceCache) UserKeys {
@@ -199,7 +184,7 @@ func UserKeysFromRemoteCache(cache *types.RemoteDeviceCache) UserKeys {
 	}
 	for deviceID, device := range cache.Devices {
 		// A device without E2E keys is valid device-list data but has nothing to return
-		if len(device.Keys) > 0 {
+		if !device.Keys.IsZero() {
 			keys.Devices[deviceID] = UserDeviceKeys{Keys: device.Keys, DisplayName: device.DisplayName}
 		}
 	}
@@ -296,8 +281,8 @@ func signatureOverlayTargets(
 		for deviceID := range requestedDevices(userKeys.Devices, req[userID]) {
 			keyIDs[id.KeyID(deviceID)] = struct{}{}
 		}
-		for _, key := range []json.RawMessage{userKeys.Master, userKeys.SelfSigning} {
-			if publicKey := crossSigningPublicKey(key); publicKey != "" {
+		for _, key := range []types.SignedCrossSigningKey{userKeys.Master, userKeys.SelfSigning} {
+			if publicKey := types.CrossSigningPublicKey(key); publicKey != "" {
 				keyIDs[id.KeyID(publicKey)] = struct{}{}
 			}
 		}
@@ -330,8 +315,8 @@ func AddUserKeys(
 		if device.DisplayName != "" {
 			unsigned = map[string]any{"device_display_name": device.DisplayName}
 		}
-		sigs := permittedSignatures(device.Keys, userID, requestUserID, overlay[id.KeyID(deviceID)])
-		deviceKeys, err := util.OverlaySignedJSON(device.Keys, sigs, unsigned)
+		sigs := permittedSignatures(device.Keys.View.Signatures[userID], userID, requestUserID, overlay[id.KeyID(deviceID)])
+		deviceKeys, err := device.Keys.Overlay(sigs, unsigned)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("device keys for %s: %w", deviceID, err))
 			continue
@@ -339,8 +324,8 @@ func AddUserKeys(
 		devices[deviceID] = deviceKeys
 	}
 
-	addCrossSigningKey := func(name string, key json.RawMessage, served map[id.UserID]json.RawMessage) {
-		if len(key) == 0 {
+	addCrossSigningKey := func(name string, key types.SignedCrossSigningKey, served map[id.UserID]json.RawMessage) {
+		if key.IsZero() {
 			return
 		}
 		permitted, err := permittedCrossSigningKey(key, userID, requestUserID, overlay)
@@ -372,37 +357,25 @@ func requestedDevices[T any](devices map[id.DeviceID]T, deviceIDs mautrix.Device
 }
 
 func permittedCrossSigningKey(
-	key json.RawMessage,
+	key types.SignedCrossSigningKey,
 	userID id.UserID,
 	requestUserID id.UserID,
 	overlay map[id.KeyID]map[id.KeyID]string,
 ) (json.RawMessage, error) {
-	sigs := permittedSignatures(key, userID, requestUserID, overlay[id.KeyID(crossSigningPublicKey(key))])
-	return util.OverlaySignedJSON(key, sigs, nil)
-}
-
-// Cross-signatures of a cross-signing key are indexed by its public key
-func crossSigningPublicKey(key json.RawMessage) id.Ed25519 {
-	var publicKey id.Ed25519
-	gjson.GetBytes(key, "keys").ForEach(func(_, value gjson.Result) bool {
-		publicKey = id.Ed25519(value.String())
-		return false
-	})
-	return publicKey
+	sigs := permittedSignatures(key.View.Signatures[userID], userID, requestUserID, overlay[id.KeyID(types.CrossSigningPublicKey(key))])
+	return key.Overlay(sigs, nil)
 }
 
 // Only the owner's signatures are public. Others' signatures are private to their signer, so the
 // requester only sees their own, from the overlay.
 func permittedSignatures(
-	object json.RawMessage,
+	owner map[id.KeyID]string,
 	userID id.UserID,
 	requestUserID id.UserID,
 	overlay map[id.KeyID]string,
 ) signatures.Signatures {
 	permitted := make(signatures.Signatures, 2)
-	var owner map[id.KeyID]string
-	ownerJSON := gjson.GetBytes(object, "signatures."+gjson.Escape(userID.String())).Raw
-	if json.Unmarshal([]byte(ownerJSON), &owner) == nil && len(owner) > 0 {
+	if len(owner) > 0 {
 		permitted[userID] = owner
 	}
 	if requestUserID != userID && len(overlay) > 0 {
@@ -413,7 +386,7 @@ func permittedSignatures(
 
 const errCodeInvalidSignature = "M_INVALID_SIGNATURE"
 
-func signatureUploadFailure(errCode string, message string) *mautrix.RespError {
+func KeyFailure(errCode string, message string) *mautrix.RespError {
 	return &mautrix.RespError{ErrCode: errCode, Err: message}
 }
 
@@ -424,45 +397,34 @@ func signatureUploadFailure(errCode string, message string) *mautrix.RespError {
 // structs drop.
 func RemoteSignatureTargetFailure(
 	requestUserID id.UserID,
-	userSigningKey *mautrix.CrossSigningKeys,
+	userSigningKey types.SignedCrossSigningKey,
 	cache *types.RemoteDeviceCache,
 	targetKey string,
-	target json.RawMessage,
+	target types.SignatureUploadTarget,
 ) *mautrix.RespError {
-	var targetObject struct {
-		DeviceID   id.DeviceID           `json:"device_id"`
-		Signatures signatures.Signatures `json:"signatures"`
-	}
-	if err := json.Unmarshal(target, &targetObject); err != nil {
-		return signatureUploadFailure(mautrix.MBadJSON.ErrCode, "Invalid signature target")
-	} else if targetObject.DeviceID != "" {
-		return signatureUploadFailure(mautrix.MInvalidParam.ErrCode, "Cannot sign another server's user's device")
-	}
-
-	if cache == nil || len(cache.MasterKey) == 0 {
-		return signatureUploadFailure(mautrix.MNotFound.ErrCode, "Target user's master key is not known")
-	} else if targetKey != crossSigningPublicKey(cache.MasterKey).String() {
-		return signatureUploadFailure(mautrix.MNotFound.ErrCode, "Target key is not the user's master key")
-	} else if !util.CompareSignedJSON(target, cache.MasterKey) {
-		return signatureUploadFailure(mautrix.MInvalidParam.ErrCode, "Input master key does not match stored")
+	if target.View.DeviceID != "" {
+		return KeyFailure(mautrix.MInvalidParam.ErrCode, "Cannot sign another server's user's device")
+	} else if cache == nil || cache.MasterKey.IsZero() {
+		return KeyFailure(mautrix.MNotFound.ErrCode, "Target user's master key is not known")
+	} else if targetKey != types.CrossSigningPublicKey(cache.MasterKey).String() {
+		return KeyFailure(mautrix.MNotFound.ErrCode, "Target key is not the user's master key")
+	} else if !target.Matches(cache.MasterKey.Raw) {
+		return KeyFailure(mautrix.MInvalidParam.ErrCode, "Input master key does not match stored")
 	}
 
-	requesterSignatures := targetObject.Signatures[requestUserID]
-	if userSigningKey == nil || len(requesterSignatures) == 0 {
-		return signatureUploadFailure(errCodeInvalidSignature, "Missing signature by the user-signing key")
+	requesterSignatures := target.View.Signatures[requestUserID]
+	if userSigningKey.IsZero() || len(requesterSignatures) == 0 {
+		return KeyFailure(errCodeInvalidSignature, "Missing signature by the user-signing key")
 	}
-	userSigningKeyID := id.NewKeyID(id.KeyAlgorithmEd25519, userSigningKey.FirstKey().String())
+	userSigningPublicKey := types.CrossSigningPublicKey(userSigningKey).String()
+	userSigningKeyID := id.NewKeyID(id.KeyAlgorithmEd25519, userSigningPublicKey)
 	for keyID := range requesterSignatures {
 		if keyID != userSigningKeyID {
-			return signatureUploadFailure(errCodeInvalidSignature, "Signature is not by the user-signing key")
+			return KeyFailure(errCodeInvalidSignature, "Signature is not by the user-signing key")
 		}
 	}
-	publicKey, err := util.Base64Decode(userSigningKey.FirstKey().String())
-	if err == nil {
-		err = util.VerifyJSON(target, requestUserID.String(), userSigningKeyID.String(), publicKey)
-	}
-	if err != nil {
-		return signatureUploadFailure(errCodeInvalidSignature, fmt.Sprintf("Unable to verify signature: %s", err))
+	if err := target.Verify(requestUserID, userSigningKeyID.String(), userSigningPublicKey); err != nil {
+		return KeyFailure(errCodeInvalidSignature, fmt.Sprintf("Unable to verify signature: %s", err))
 	}
 	return nil
 }
