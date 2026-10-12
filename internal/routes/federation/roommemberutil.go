@@ -49,8 +49,9 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	} else if room == nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found")
 		return
-	} else if membership == event.MembershipJoin && room.LocalMembers == 0 {
-		// As Synapse, a join to the stale state of a room this server left could not be sent
+	} else if room.LocalMembers == 0 {
+		// The matching send_ would be refused, as a room this server left takes no remote user's
+		// membership. A rejected invite falls back to the invitee's server recording it locally.
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Not an active room on this server")
 		return
 	} else if checkRequestVersions {

@@ -186,9 +186,9 @@ func (r *RoomsDatabase) sendOutlierMemberships(ctx context.Context, roomID id.Ro
 }
 
 // isOutlierMembership reports whether a member event of a room this server is not in reaches a local
-// user who sees it outside the room: an invite of a local user, or a leave answering a local user's
-// invite, sent by the inviter rescinding it or by the invitee rejecting a local user's invite. A
-// remote user's membership is never an outlier, as only local users have membership rows.
+// user who sees it outside the room: an invite of a local user, or the inviter's leave rescinding it.
+// A remote user's membership is never an outlier, as only local users have membership rows, so a
+// remote invitee's rejection is not taken: the invitee's server records it locally.
 func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomID, ev *types.Event) (bool, error) {
 	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID {
 		return false, nil
@@ -210,8 +210,7 @@ func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomI
 			} else if invite := r.events.TxnGetEvent(txn, membership.EventID); invite == nil {
 				return false, nil
 			} else {
-				rejects := ev.Sender == target && r.isLocalUser(invite.Sender)
-				return ev.Sender == invite.Sender || rejects, nil
+				return ev.Sender == invite.Sender, nil
 			}
 		})
 	}

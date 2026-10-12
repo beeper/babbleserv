@@ -277,11 +277,12 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	content := makeMembershipContent(event.MembershipLeave, reason)
 	partialEv := types.NewPartialEvent(roomID, event.StateMember, &sKey, sendingUserID, content)
 
-	// We're in the room - send the event locally and then, if it replaces an invite or knock whose
-	// other HS isn't in the room, send it over to them.
+	// We're in the room - send the event locally and then, if it rescinds an invite or knock whose
+	// target HS isn't in the room, send it over to them. A rejection is not sent to an inviting HS
+	// outside the room, which has no membership to update.
 	if serverInRoom {
 		var outlierServer string
-		if membership != event.MembershipJoin && otherHomeserver != "" {
+		if !isLeave && membership != event.MembershipJoin && otherHomeserver != "" {
 			otherServerInRoom, err := c.db.Rooms.IsServerJoined(r.Context(), roomID, otherHomeserver)
 			if err != nil {
 				util.ResponseErrorUnknownJSON(w, r, err)
