@@ -125,9 +125,8 @@ func (e *DeviceJoinEventIterator) handleNewEvents(lock lock.Lock) {
 
 // When a user joins or leaves an encrypted room we need to populate the device_lists part of sync:
 // if joining - we send a change to all other members in the room
-// if leaving - for every other member check if they share a room with the leaving member, if not
-//
-//	generate a leave for both the leaving and other member
+// if leaving or banned - for every other member check if they share a room with the leaving member,
+// if not generate a leave for both the leaving and other member
 func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []types.EventTupWithVersion) error {
 	allTds := make([]*types.ToDevice, 0, len(tups))
 
@@ -155,10 +154,8 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 		switch ev.Membership() {
 		case event.MembershipJoin:
 			tds, err = e.deviceChangesForJoin(ev, tup.Version)
-		case event.MembershipLeave:
+		case event.MembershipLeave, event.MembershipBan:
 			tds, err = e.localDeviceChangesForLeaveEvent(ev)
-			e.evictUnsharedRemoteCaches(ev)
-		case event.MembershipBan:
 			e.evictUnsharedRemoteCaches(ev)
 		default:
 		}
@@ -325,8 +322,9 @@ func serversNewToUser(joinedRoomID id.RoomID, userEncryptedRooms types.Membershi
 	return servers
 }
 
-// Leave events tell each local user, the leaver or another member of the room, of the other side
-// once they no longer share an encrypted room (device_lists.left). Only local users are told, so
+// Leave and ban events tell each local user, the leaver or another member of the room, of the other
+// side once they no longer share an encrypted room (device_lists.left). The leaver is the state key,
+// so a kick or ban is about the member removed, not its sender. Only local users are told, so
 // every check is whether a local user still shares an encrypted room with another user, read from
 // the local user's rows: a local leaver's for every member, otherwise each local member's for the
 // leaver. A remote user's rooms are never read.
@@ -335,7 +333,7 @@ func (e *DeviceJoinEventIterator) localDeviceChangesForLeaveEvent(ev *types.Even
 	if err != nil {
 		return nil, err
 	}
-	leaver := ev.Sender
+	leaver := id.UserID(*ev.StateKey)
 	var others []id.UserID
 	for memberID := range roomMembers {
 		if memberID != leaver && (e.isLocal(leaver) || e.isLocal(memberID)) {
