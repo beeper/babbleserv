@@ -140,7 +140,7 @@ func (p *PresenceChangeIterator) handlePresenceChanges(lock lock.Lock) {
 		p.ctx,
 		presenceChangeIteratorPositionsKey,
 		currentVersion,
-		lock.TxnRefresh,
+		lock,
 	)
 	if err != nil {
 		p.log.Err(err).Msg("Failed to update current position")
@@ -189,8 +189,8 @@ func (p *PresenceChangeIterator) processRemotePresenceChange(lock lock.Lock, cha
 
 	if len(tds) > 0 {
 		_, err = p.db.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
-			// Ensure we hold the lock when comitting the events
-			LockTxnRefresh: lock.TxnRefresh,
+			// Lock lives in the system database, confirm it's still held just before the events commit
+			BeforeCommit: lock.Refresh,
 		})
 		return err
 	}
@@ -264,8 +264,8 @@ func (p *PresenceChangeIterator) processLocalPresenceChange(lock lock.Lock, chan
 
 	if len(tds) > 0 {
 		_, err = p.db.SendToDeviceEvents(p.ctx, tds, transient.SendToDeviceOptions{
-			// Ensure we hold the lock when comitting the events
-			LockTxnRefresh: lock.TxnRefresh,
+			// Lock lives in the system database, confirm it's still held just before the events commit
+			BeforeCommit: lock.Refresh,
 		})
 		return err
 	}

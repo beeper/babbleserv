@@ -130,7 +130,7 @@ func (w *RemoteUserDirectoryIterator) processEventBatch(workerLock lock.Lock) bo
 	}
 	position = eventTups[len(eventTups)-1].Version
 	if err = w.db.System.UpdateIteratorPositions(
-		w.ctx, remoteUserDirectoryPositionsKey, position, workerLock.TxnRefresh,
+		w.ctx, remoteUserDirectoryPositionsKey, position, workerLock,
 	); err != nil {
 		w.log.Err(err).Msg("Failed to update remote user-directory event position")
 		return false

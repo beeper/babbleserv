@@ -8,6 +8,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
 func (s *SystemDatabase) KeyForIteratorPositions(iterator string) fdb.Key {
@@ -45,15 +46,10 @@ func (s *SystemDatabase) UpdateIteratorPositions(
 	ctx context.Context,
 	key string,
 	version tuple.Versionstamp,
-	checkUpdateLock func(fdb.Transaction),
+	lock lock.Lock,
 ) error {
-	_, err := util.DoWriteTransaction(ctx, s.db, func(txn fdb.Transaction) (*struct{}, error) {
-		// Ensure that our lock is still valid before writing data
-		checkUpdateLock(txn)
-
-		key := s.KeyForIteratorPositions(key)
-		txn.Set(key, types.MustVersionstampToBytes(version))
-		return nil, nil
+	return lock.Transact(ctx, func(txn fdb.Transaction) error {
+		txn.Set(s.KeyForIteratorPositions(key), types.MustVersionstampToBytes(version))
+		return nil
 	})
-	return err
 }

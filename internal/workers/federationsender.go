@@ -267,7 +267,7 @@ func (fs *FederationSender) sendTransaction(ctx context.Context, serverName stri
 			return false, nil
 		}
 
-		err = fs.db.System.UpdateServerPositions(ctx, serverName, serverVersions, lock.TxnRefresh)
+		err = fs.db.System.UpdateServerPositions(ctx, serverName, serverVersions, lock)
 		if err != nil {
 			return false, err
 		}

@@ -18,7 +18,6 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/rooms/state"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
-	"github.com/beeper/babbleserv/internal/util/lock"
 	"github.com/beeper/babbleserv/internal/util/signedjson"
 )
 
@@ -28,8 +27,8 @@ var (
 )
 
 type SendLocalEventsOptions struct {
-	// Ensure (+refresh) a lock is held at commit time
-	LockTxnRefresh lock.LockTxnRefreshFunc
+	// Called last in every transaction attempt, eg to refresh a lock held in another database
+	BeforeCommit func()
 
 	TransactionDevice   *types.UserDevice
 	TransactionEndpoint string
@@ -169,8 +168,8 @@ func (s *localEventSender) txnPrepareLocal(ctx context.Context, txn fdb.ReadTran
 		if withTransactionID && len(plan.evs) > 0 {
 			s.r.txnStoreEventTransaction(txn, *options.TransactionDevice, room.ID, options.TransactionEndpoint, options.TransactionID, plan.evs[0].ID)
 		}
-		if options.LockTxnRefresh != nil {
-			options.LockTxnRefresh(txn)
+		if options.BeforeCommit != nil {
+			options.BeforeCommit()
 		}
 		return nil
 	}

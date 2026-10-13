@@ -110,7 +110,7 @@ func (e *EventsIterator) handleNewEvents(lock lock.Lock) {
 
 	// Update the position - refreshing the lock as part of the transaction to
 	// ensure the write is safe.
-	err = e.db.System.UpdateIteratorPositions(e.ctx, eventsIteratorPositionsKey, currentVersion, lock.TxnRefresh)
+	err = e.db.System.UpdateIteratorPositions(e.ctx, eventsIteratorPositionsKey, currentVersion, lock)
 	if err != nil {
 		e.log.Err(err).Msg("Failed to update current position")
 		return

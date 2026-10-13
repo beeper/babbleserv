@@ -141,7 +141,7 @@ func (d *DeviceChangeIterator) handleDeviceChanges(lock lock.Lock) {
 		d.ctx,
 		deviceChangeIteratorPositionsKey,
 		currentVersion,
-		lock.TxnRefresh,
+		lock,
 	)
 	if err != nil {
 		d.log.Err(err).Msg("Failed to update current position")
@@ -188,8 +188,8 @@ func (d *DeviceChangeIterator) processRemoteDeviceChange(lock lock.Lock, change 
 	}
 
 	_, err = d.db.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
-		// Ensure we hold the lock when comitting the events
-		LockTxnRefresh: lock.TxnRefresh,
+		// Lock lives in the system database, confirm it's still held just before the events commit
+		BeforeCommit: lock.Refresh,
 	})
 	return err
 }
@@ -266,8 +266,8 @@ func (d *DeviceChangeIterator) processLocalDeviceChange(lock lock.Lock, change t
 	}
 
 	_, err = d.db.SendToDeviceEvents(d.ctx, tds, transient.SendToDeviceOptions{
-		// Ensure we hold the lock when comitting the events
-		LockTxnRefresh: lock.TxnRefresh,
+		// Lock lives in the system database, confirm it's still held just before the events commit
+		BeforeCommit: lock.Refresh,
 	})
 	return err
 }

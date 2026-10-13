@@ -116,7 +116,7 @@ func (e *DeviceJoinEventIterator) handleNewEvents(lock lock.Lock) {
 
 	// Update the position - refreshing the lock as part of the transaction to
 	// ensure the write is safe.
-	err = e.db.System.UpdateIteratorPositions(e.ctx, deviceJoinIteratorPositionsKey, currentVersion, lock.TxnRefresh)
+	err = e.db.System.UpdateIteratorPositions(e.ctx, deviceJoinIteratorPositionsKey, currentVersion, lock)
 	if err != nil {
 		e.log.Err(err).Msg("Failed to update current position")
 		return
@@ -167,8 +167,8 @@ func (e *DeviceJoinEventIterator) sendLocalDeviceChanges(lock lock.Lock, tups []
 
 	if len(allTds) > 0 {
 		_, err := e.db.SendToDeviceEvents(e.ctx, allTds, transient.SendToDeviceOptions{
-			// Ensure we hold the lock when comitting the events
-			LockTxnRefresh: lock.TxnRefresh,
+			// Lock lives in the system database, confirm it's still held just before the events commit
+			BeforeCommit: lock.Refresh,
 		})
 		return err
 	}

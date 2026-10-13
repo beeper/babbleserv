@@ -28,12 +28,17 @@ type LockOptions struct {
 	Timeout       time.Duration
 }
 
-type LockTxnRefreshFunc func(fdb.Transaction)
-
 type Lock struct {
-	TxnRefresh LockTxnRefreshFunc
-	Refresh    func()
-	Release    func()
+	Refresh func()
+	Release func()
+
+	transact func(context.Context, func(fdb.Transaction) error) error
+}
+
+// Runs fn in a transaction against the database holding the lock, which only commits if
+// the lock is still held. Other databases may be separate FDB clusters so cannot be fenced.
+func (l Lock) Transact(ctx context.Context, fn func(fdb.Transaction) error) error {
+	return l.transact(ctx, fn)
 }
 
 func WithLockIfAvailable(
@@ -205,10 +210,18 @@ func makeLock(
 			Msg("Released lock")
 	}
 
+	transact := func(ctx context.Context, fn func(fdb.Transaction) error) error {
+		_, err := util.DoWriteTransaction(ctx, db, func(txn fdb.Transaction) (types.Nil, error) {
+			refreshLockTxn(txn)
+			return nil, fn(txn)
+		})
+		return err
+	}
+
 	return Lock{
-		TxnRefresh: refreshLockTxn,
-		Refresh:    refreshLock,
-		Release:    releaseLock,
+		Refresh:  refreshLock,
+		Release:  releaseLock,
+		transact: transact,
 	}
 }
 

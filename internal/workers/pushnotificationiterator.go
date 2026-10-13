@@ -115,7 +115,7 @@ func (n *PushNotificationIterator) handleNotifications(lock lock.Lock) {
 
 	// Update the position - refreshing the lock as part of the transaction to
 	// ensure the write is safe.
-	err = n.db.System.UpdateIteratorPositions(n.ctx, pushNotificationIteratorPositionsKey, currentVersion, lock.TxnRefresh)
+	err = n.db.System.UpdateIteratorPositions(n.ctx, pushNotificationIteratorPositionsKey, currentVersion, lock)
 	if err != nil {
 		n.log.Err(err).Msg("Failed to update current position")
 		return

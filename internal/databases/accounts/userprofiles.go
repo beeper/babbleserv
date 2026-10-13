@@ -75,10 +75,8 @@ func (a *AccountsDatabase) PaginateProfileChanges(
 func (a *AccountsDatabase) ClearProfileChanges(
 	ctx context.Context,
 	toVersion tuple.Versionstamp,
-	checkUpdateLock func(fdb.Transaction),
 ) error {
 	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (types.Nil, error) {
-		checkUpdateLock(txn)
 		a.users.TxnClearProfileChanges(txn, toVersion)
 		return nil, nil
 	})

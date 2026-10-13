@@ -97,11 +97,12 @@ func (a *AccountsDatabase) RescheduleRemoteDeviceJob(
 	ctx context.Context,
 	userID id.UserID,
 	dueAt time.Time,
-	checkWorkerLock func(fdb.Transaction),
+	beforeCommit func(),
 ) (bool, error) {
 	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
-		checkWorkerLock(txn)
-		return a.remotedevices.TxnRescheduleJob(txn, userID, dueAt)
+		rescheduled, err := a.remotedevices.TxnRescheduleJob(txn, userID, dueAt)
+		beforeCommit()
+		return rescheduled, err
 	})
 }
 
@@ -109,18 +110,18 @@ func (a *AccountsDatabase) PublishRemoteDeviceSnapshot(
 	ctx context.Context,
 	job types.RemoteDeviceJob,
 	snapshot *types.RemoteDeviceSnapshot,
-	checkWorkerLock func(fdb.Transaction),
+	beforeCommit func(),
 ) (bool, error) {
 	type publishOutcome struct {
 		published bool
 		notify    bool
 	}
 	outcome, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (publishOutcome, error) {
-		checkWorkerLock(txn)
 		published, notify, err := a.remotedevices.TxnPublishSnapshot(txn, job, snapshot, time.Now().UTC())
 		if err == nil && notify {
 			a.devices.TxnStoreDeviceChange(txn, job.UserID, id.DeviceID("*"), tuple.IncompleteVersionstamp(0))
 		}
+		beforeCommit()
 		return publishOutcome{published: published, notify: notify}, err
 	})
 	if err == nil && outcome.notify {

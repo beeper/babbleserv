@@ -168,7 +168,7 @@ func (w *RemoteDeviceCacheWorker) processJob(ctx context.Context, workerLock loc
 
 	delay := remoteDeviceRetryDelay(job.Attempts)
 	if rescheduled, rescheduleErr := w.db.Accounts.RescheduleRemoteDeviceJob(
-		ctx, job.UserID, time.Now().UTC().Add(delay), workerLock.TxnRefresh,
+		ctx, job.UserID, time.Now().UTC().Add(delay), workerLock.Refresh,
 	); rescheduleErr != nil {
 		log.Err(rescheduleErr).AnErr("cause", err).Msg("Failed to reschedule remote device snapshot fetch")
 	} else if !rescheduled {
@@ -206,7 +206,7 @@ func (w *RemoteDeviceCacheWorker) refreshCache(
 	if err != nil {
 		return err
 	}
-	published, err := w.db.Accounts.PublishRemoteDeviceSnapshot(ctx, job, snapshot, workerLock.TxnRefresh)
+	published, err := w.db.Accounts.PublishRemoteDeviceSnapshot(ctx, job, snapshot, workerLock.Refresh)
 	if err != nil {
 		return fmt.Errorf("failed to publish snapshot: %w", err)
 	}
