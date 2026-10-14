@@ -121,7 +121,7 @@ func (p *ProfileChangeIterator) handleProfilesChanges(lock lock.Lock) {
 		p.ctx,
 		profileChangeIteratorPositionsKey,
 		currentVersion,
-		lock.TxnRefresh,
+		lock,
 	)
 	if err != nil {
 		p.log.Err(err).Msg("Failed to update current position")
@@ -129,7 +129,7 @@ func (p *ProfileChangeIterator) handleProfilesChanges(lock lock.Lock) {
 	}
 
 	// Clear processed changes
-	err = p.db.Accounts.ClearProfileChanges(p.ctx, currentVersion, lock.TxnRefresh)
+	err = p.db.Accounts.ClearProfileChanges(p.ctx, currentVersion)
 	if err != nil {
 		p.log.Err(err).Msg("Failed to clear processed profile changes")
 		return
@@ -173,8 +173,8 @@ func (p *ProfileChangeIterator) processProfileChange(lock lock.Lock, change type
 			roomID,
 			[]*types.PartialEvent{partialEv},
 			rooms.SendLocalEventsOptions{
-				// Ensure we hold the lock when comitting the events
-				LockTxnRefresh: lock.TxnRefresh,
+				// Lock lives in the system database, confirm it's still held just before the events commit
+				BeforeCommit: lock.Refresh,
 			},
 		)
 

@@ -249,7 +249,7 @@ func doWriteTransactionWithRetries(
 				case <-time.After(retryIn):
 					continue // retry
 				case <-ctx.Done():
-					return ctx.Err(), nil
+					return nil, ctx.Err()
 				}
 			}
 			log.Err(err).Msg("Transaction error")

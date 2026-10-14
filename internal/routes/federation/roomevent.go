@@ -3,7 +3,6 @@ package federation
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/federation"
@@ -15,14 +14,15 @@ import (
 
 // https://spec.matrix.org/v1.10/server-server-api/#get_matrixfederationv1eventeventid
 func (f *FederationRoutes) GetEvent(w http.ResponseWriter, r *http.Request) {
-	eventID := chi.URLParam(r, "eventID")
-	// TODO: check server is in room?
-	ev, err := f.db.Rooms.GetEvent(r.Context(), id.EventID(eventID))
+	eventID := util.EventIDFromRequestURLParam(r, "eventID")
+	ev, err := f.db.Rooms.GetEvent(r.Context(), eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if ev == nil {
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
+		return
+	} else if !f.requireServerInRoom(w, r, ev.RoomID) {
 		return
 	}
 	util.ResponseJSON(w, r, http.StatusOK, ev)
@@ -30,10 +30,12 @@ func (f *FederationRoutes) GetEvent(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.10/server-server-api/#get_matrixfederationv1event_authroomideventid
 func (f *FederationRoutes) GetEventAuth(w http.ResponseWriter, r *http.Request) {
-	// roomID := chi.URLParam(r, "roomID") // don't actually need it!
-	// TODO: check server is in room?
-	eventID := chi.URLParam(r, "eventID")
-	authChain, err := f.db.Rooms.GetEventAuthChain(r.Context(), id.EventID(eventID))
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
+	eventID := util.EventIDFromRequestURLParam(r, "eventID")
+	if !f.requireServerInRoom(w, r, roomID) {
+		return
+	}
+	authChain, err := f.db.Rooms.GetEventAuthChain(r.Context(), roomID, eventID)
 	if err == types.ErrEventNotFound {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Event not found")
 		return
@@ -48,9 +50,12 @@ func (f *FederationRoutes) GetEventAuth(w http.ResponseWriter, r *http.Request) 
 
 // https://spec.matrix.org/v1.10/server-server-api/#post_matrixfederationv1get_missing_eventsroomid
 func (f *FederationRoutes) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
+	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
 	req, respErr := util.ParseRequestJSON[federation.ReqGetMissingEvents](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
+		return
+	} else if !f.requireServerInRoom(w, r, roomID) {
 		return
 	}
 
@@ -80,7 +85,7 @@ func (f *FederationRoutes) GetMissingEvents(w http.ResponseWriter, r *http.Reque
 		ev, err := f.db.Rooms.GetEvent(r.Context(), evID)
 		if err != nil {
 			return err
-		} else if ev != nil {
+		} else if ev != nil && ev.RoomID == roomID {
 			evs = append(evs, ev)
 			seenEvents[ev.ID] = struct{}{}
 			// Include if *not* one of the latestEventIDs provided

@@ -210,7 +210,7 @@ func (c *ClientRoutes) DeleteRoomKeys(w http.ResponseWriter, r *http.Request) {
 // https://spec.matrix.org/v1.11/client-server-api/#put_matrixclientv3room_keyskeysroomid
 func (c *ClientRoutes) PutRoomKeysByRoomID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing version query parameter")
@@ -248,7 +248,7 @@ func (c *ClientRoutes) PutRoomKeysByRoomID(w http.ResponseWriter, r *http.Reques
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3room_keyskeysroomid
 func (c *ClientRoutes) GetRoomKeysByRoomID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing version query parameter")
@@ -269,7 +269,7 @@ func (c *ClientRoutes) GetRoomKeysByRoomID(w http.ResponseWriter, r *http.Reques
 // https://spec.matrix.org/v1.11/client-server-api/#delete_matrixclientv3room_keyskeysroomid
 func (c *ClientRoutes) DeleteRoomKeysByRoomID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing version query parameter")
@@ -288,7 +288,7 @@ func (c *ClientRoutes) DeleteRoomKeysByRoomID(w http.ResponseWriter, r *http.Req
 // https://spec.matrix.org/v1.11/client-server-api/#put_matrixclientv3room_keyskeysroomidsessionid
 func (c *ClientRoutes) PutRoomKeyBySessionID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	sessionID := chi.URLParam(r, "sessionId")
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {
@@ -325,7 +325,7 @@ func (c *ClientRoutes) PutRoomKeyBySessionID(w http.ResponseWriter, r *http.Requ
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3room_keyskeysroomidsessionid
 func (c *ClientRoutes) GetRoomKeyBySessionID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	sessionID := chi.URLParam(r, "sessionId")
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {
@@ -350,7 +350,7 @@ func (c *ClientRoutes) GetRoomKeyBySessionID(w http.ResponseWriter, r *http.Requ
 // https://spec.matrix.org/v1.11/client-server-api/#delete_matrixclientv3room_keyskeysroomidsessionid
 func (c *ClientRoutes) DeleteRoomKeyBySessionID(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetRequestUserID(r)
-	roomID := chi.URLParam(r, "roomId")
+	roomID := string(util.RoomIDFromRequestURLParam(r, "roomId"))
 	sessionID := chi.URLParam(r, "sessionId")
 	versionString := r.URL.Query().Get("version")
 	if versionString == "" {

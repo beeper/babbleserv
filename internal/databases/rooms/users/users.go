@@ -11,16 +11,17 @@ type UsersDirectory struct {
 	log zerolog.Logger
 	db  fdb.Database
 
-	// Current user memberships
+	// Current memberships of local users, written with the room's current state, and outlier
+	// memberships received while this server is out of a room
 	//
 	// key: (id.UserID, id.RoomID)
-	// value: types.MembershipTup
+	// value: (EventID, RoomID, Membership[, Outlier]), see types.MembershipRow
 	memberships subspace.Subspace
 
-	// Membership changes
+	// Membership changes of local users, for sync
 	//
 	// key: (id.UserID, tuple.Versionstamp)
-	// value: types.MembershipTupWithVersion
+	// value: types.MembershipTup
 	membershipChanges subspace.Subspace
 
 	// Notification counts per event version

@@ -2,20 +2,21 @@ package events
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"slices"
-	"strings"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 // TxnEventsProvider is a per-txn singleton that handles pulling event objects from FoundationDB.
@@ -31,6 +32,8 @@ type TxnEventsProvider struct {
 
 	futures map[id.EventID]fdb.FutureByteSlice
 	events  map[id.EventID]*types.Event
+	// Events whose read found nothing in this transaction
+	missing map[id.EventID]struct{}
 }
 
 func (e *EventsDirectory) NewTxnEventsProvider(ctx context.Context, txn fdb.ReadTransaction) *TxnEventsProvider {
@@ -45,6 +48,7 @@ func (e *EventsDirectory) NewTxnEventsProvider(ctx context.Context, txn fdb.Read
 		byID:    e.idToEvent,
 		futures: make(map[id.EventID]fdb.FutureByteSlice, 10),
 		events:  make(map[id.EventID]*types.Event, 10),
+		missing: make(map[id.EventID]struct{}),
 	}
 
 	runtime.SetFinalizer(provider, func(ep *TxnEventsProvider) {
@@ -89,20 +93,36 @@ func (ep *TxnEventsProvider) WithProviderEvents(providers ...*TxnEventsProvider)
 	return ep
 }
 
+// Settle waits for every read started, so a provider for a later transaction takes the events read
+// with WithProviderEvents once this provider's transaction is too old to read with. A read that
+// failed is dropped, to start again there.
+func (ep *TxnEventsProvider) Settle() {
+	for eventID, fut := range ep.futures {
+		if _, err := fut.Get(); err != nil {
+			delete(ep.futures, eventID)
+		}
+	}
+}
+
 func (ep *TxnEventsProvider) keyForEventID(eventID id.EventID) fdb.Key {
 	return ep.byID.Pack(tuple.Tuple{eventID.String()})
 }
 
-func (ep *TxnEventsProvider) WillGet(eventID id.EventID) {
-	if _, found := ep.events[eventID]; found {
-		return
+func (ep *TxnEventsProvider) WillGet(eventIDs ...id.EventID) {
+	for _, eventID := range eventIDs {
+		if _, found := ep.events[eventID]; found {
+			continue
+		}
+		if _, found := ep.futures[eventID]; found {
+			continue
+		}
+		if _, found := ep.missing[eventID]; found {
+			continue
+		}
+		fut := ep.txn.Get(ep.keyForEventID(eventID))
+		ep.futures[eventID] = fut
+		ep.log.Trace().Str("event_id", eventID.String()).Msg("Will get event")
 	}
-	if _, found := ep.futures[eventID]; found {
-		return
-	}
-	fut := ep.txn.Get(ep.keyForEventID(eventID))
-	ep.futures[eventID] = fut
-	ep.log.Trace().Str("event_id", eventID.String()).Msg("Will get event")
 }
 
 func (ep *TxnEventsProvider) Add(ev *types.Event) {
@@ -116,6 +136,8 @@ func (ep *TxnEventsProvider) Add(ev *types.Event) {
 func (ep *TxnEventsProvider) Get(eventID id.EventID) (*types.Event, error) {
 	if ev, found := ep.events[eventID]; found {
 		return ev, nil
+	} else if _, found := ep.missing[eventID]; found {
+		return nil, nil
 	}
 
 	// Fallback to any future we have pending
@@ -137,6 +159,10 @@ func (ep *TxnEventsProvider) Get(eventID id.EventID) (*types.Event, error) {
 		return nil, err
 	} else if b == nil {
 		ep.log.Warn().Str("event_id", eventID.String()).Msg("Event does not exist")
+		if found {
+			ep.missing[eventID] = struct{}{}
+			delete(ep.futures, eventID)
+		}
 		return nil, nil
 	}
 
@@ -162,10 +188,89 @@ func (ep *TxnEventsProvider) MustGet(eventID id.EventID) *types.Event {
 	return ev
 }
 
-// TxnAuthEventsProvider implements the gomatrixserverlib.AuthEventProvider
-// interface in a way that allows us to overwrite event IDs with ones in the
-// current persist batch, so batches are authed against themselves if they
-// contain auth state changes.
+// GetRequired is Get for an event that must exist, failing with types.ErrEventNotFound otherwise.
+func (ep *TxnEventsProvider) GetRequired(eventID id.EventID) (*types.Event, error) {
+	ev, err := ep.Get(eventID)
+	if err == nil && ev == nil {
+		err = fmt.Errorf("%w: %s", types.ErrEventNotFound, eventID)
+	}
+	return ev, err
+}
+
+// GetAll is GetRequired for each event, fetching them all at once.
+func (ep *TxnEventsProvider) GetAll(eventIDs []id.EventID) ([]*types.Event, error) {
+	ep.WillGet(eventIDs...)
+	evs := make([]*types.Event, len(eventIDs))
+	for i, eventID := range eventIDs {
+		ev, err := ep.GetRequired(eventID)
+		if err != nil {
+			return nil, err
+		}
+		evs[i] = ev
+	}
+	return evs, nil
+}
+
+// An event citing an auth event that is not known was not evaluated, unlike one that fails auth
+var ErrAuthEventMissing = errors.New("auth event missing")
+
+// CheckEventAuthEvents authorizes an event using only its declared auth events. The event cache
+// is shared, but the auth state is fresh for each event so unrelated branches cannot affect it.
+// Auth failures and lookup errors are returned separately so database errors can be retried.
+func (ep *TxnEventsProvider) CheckEventAuthEvents(ctx context.Context, ev *types.Event) (authErr, err error) {
+	// Auth rule 2 in every room version: no duplicate tuples, and none outside the selection. An
+	// event citing more auth events than the selection holds breaks it without loading any.
+	selected := authEventSelection(ev)
+	if len(ev.AuthEventIDs) > len(selected) {
+		return fmt.Errorf("event cites %d auth events, its selection allows %d", len(ev.AuthEventIDs), len(selected)), nil
+	}
+	authState := make(types.StateMap, len(ev.AuthEventIDs))
+	for _, authID := range ev.AuthEventIDs {
+		authEv, err := ep.Get(authID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch auth event: %w", err)
+		} else if authEv == nil {
+			return fmt.Errorf("%w: %s", ErrAuthEventMissing, authID), nil
+		} else if authEv.Rejected {
+			return fmt.Errorf("auth event rejected: %s", authID), nil
+		} else if authEv.StateKey == nil {
+			return fmt.Errorf("auth event %s is not state", authID), nil
+		} else if authEv.RoomID != ev.RoomID {
+			return fmt.Errorf("auth event %s is for another room", authID), nil
+		} else if _, duplicate := authState[authEv.StateTup()]; duplicate {
+			return fmt.Errorf("duplicate auth tuple %v", authEv.StateTup()), nil
+		} else if !slices.Contains(selected, authEv.StateTup()) {
+			return fmt.Errorf("unexpected auth tuple %v", authEv.StateTup()), nil
+		}
+		authState[authEv.StateTup()] = authEv.ID
+	}
+	if ev.Type != event.StateCreate && util.RoomVersionHas(ev.RoomVersion, gomatrixserverlib.IRoomVersion.DomainlessRoomIDs) {
+		createID := ev.ImplicitCreateEventID()
+		create, err := ep.Get(createID)
+		if err != nil {
+			return nil, err
+		}
+		if create == nil {
+			return fmt.Errorf("%w: implicit create %s", ErrAuthEventMissing, createID), nil
+		}
+		if create.Rejected || create.Type != event.StateCreate || create.StateKey == nil || *create.StateKey != "" || create.RoomID != ev.RoomID {
+			return fmt.Errorf("invalid implicit create %s", createID), nil
+		}
+		authState[create.StateTup()] = createID
+	}
+	return NewTxnAuthEventsProvider(ctx, ep, authState).IsEventAllowed(ev)
+}
+
+func (ep *TxnEventsProvider) authEventIDs() AuthEventIDs {
+	known := make(AuthEventIDs, len(ep.events))
+	for eventID, ev := range ep.events {
+		known[eventID] = ev.AuthEventIDs
+	}
+	return known
+}
+
+// TxnAuthEventsProvider authorizes events against a supplied state map. Authorization never
+// changes that state.
 type TxnAuthEventsProvider struct {
 	log            zerolog.Logger
 	eventsProvider *TxnEventsProvider
@@ -189,140 +294,37 @@ func NewTxnAuthEventsProvider(
 	}
 }
 
-func (ap *TxnAuthEventsProvider) get(eventID id.EventID) (gomatrixserverlib.PDU, error) {
-	ev, err := ap.eventsProvider.Get(eventID)
-	if err != nil {
-		return nil, err
-	} else if ev == nil {
-		return nil, types.ErrEventNotFound
-	}
-	return ev.PDU(), nil
-}
-
-func (ap *TxnAuthEventsProvider) getByType(evType event.Type) (gomatrixserverlib.PDU, error) {
-	eventID, found := ap.stateMap[types.StateTup{Type: evType}]
+func (ap *TxnAuthEventsProvider) lookup(tup types.StateTup) (*types.Event, error) {
+	eventID, found := ap.stateMap[tup]
 	if !found {
-		ap.log.Trace().Str("type", evType.String()).Msg("Missed auth state event")
+		ap.log.Trace().Stringer("type", tup.Type).Str("state_key", tup.StateKey).Msg("Missed auth state event")
 		return nil, nil
 	}
-	return ap.get(eventID)
+	return ap.eventsProvider.GetRequired(eventID)
 }
 
-func (ap *TxnAuthEventsProvider) IsEventAllowed(ev *types.Event) error {
-	if err := gomatrixserverlib.Allowed(
-		ev.PDU(),
-		ap,
-		func(_ spec.RoomID, senderID spec.SenderID) (*spec.UserID, error) {
-			return senderID.ToUserID(), nil
-		},
-	); err != nil {
-		return err
+// IsEventAllowed authorizes an event without changing the provider's state. Auth failures and
+// failures to load that state are returned separately, so only the former reject the event.
+func (ap *TxnAuthEventsProvider) IsEventAllowed(ev *types.Event) (authErr, err error) {
+	authErr, err = util.Authorize(ev, ap.lookup)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load auth state for %s: %w", ev.ID, err)
 	}
-
-	// TODO: there's a TODO in GMSL eventauth ~L1300 that states these are not checked - but they
-	// are tested by complement.
-	// LOL: complement tests only check the API level, if we do this check in the DB write other
-	// federated leave tests rely on this!
-	// if ev.Type == event.StateMember && ev.Membership() == event.MembershipLeave {
-	// 	oldEvID, found := ap.stateMap[types.StateTup{
-	// 		Type:     event.StateMember,
-	// 		StateKey: *ev.StateKey,
-	// 	}]
-	// 	if !found {
-	// 		return fmt.Errorf("user does not have room membership")
-	// 	}
-	// 	oldEv, err := ap.eventsProvider.Get(oldEvID)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	if oldEv.Membership() == event.MembershipLeave {
-	// 		return fmt.Errorf("user is already left")
-	// 	}
-
-	// If we authorized this event and it's a state event type, overwrite any
-	// in our stateEventIDs/memberEventIDs. This means subsequent auth checks
-	// will use this event if it has altered the auth state.
-	switch ev.Type {
-	case event.StateCreate:
-		ap.stateMap[types.StateTup{Type: event.StateCreate}] = ev.ID
-	case event.StateJoinRules:
-		ap.stateMap[types.StateTup{Type: event.StateJoinRules}] = ev.ID
-	case event.StatePowerLevels:
-		ap.stateMap[types.StateTup{Type: event.StatePowerLevels}] = ev.ID
-	case event.StateMember:
-		ap.stateMap[types.StateTup{
-			Type:     event.StateMember,
-			StateKey: *ev.StateKey,
-		}] = ev.ID
-	}
-	return nil
+	return authErr, nil
 }
 
+// AuthEventIDsFor selects an event's auth events from the state it is authorized against.
 // https://spec.matrix.org/v1.11/server-server-api/#auth-events-selection
-func (ap *TxnAuthEventsProvider) GetAuthEventIDsForEvent(ev *types.Event) []id.EventID {
+func AuthEventIDsFor(ev *types.Event, authState types.StateMap) []id.EventID {
 	if ev.Type == event.StateCreate {
 		return nil
 	}
-	authEventIDs := make([]id.EventID, 0, len(ap.stateMap))
-	for stateTup, eventID := range ap.stateMap {
-		var include bool
-		switch stateTup.Type {
-		case event.StateCreate, event.StatePowerLevels:
-			// TODO: room version 12 excludes create event
-			include = true
-		case event.StateJoinRules:
-			if ev.Type == event.StateMember {
-				include = true
-			}
-		case event.StateMember:
-			if stateTup.StateKey == ev.Sender.String() || stateTup.StateKey == *ev.StateKey {
-				include = true
-			}
-			// TODO: If membership is invite and content contains a third_party_invite property, the current m.room.third_party_invite event with state_key matching content.third_party_invite.signed.token, if any.
-			// TODO: If content.join_authorised_via_users_server is present, and the room version supports restricted rooms, then the m.room.member event with state_key matching content.join_authorised_via_users_server.
-		}
-		if include {
+	authEventIDs := make([]id.EventID, 0, len(authState))
+	for _, stateTup := range authEventSelection(ev) {
+		if eventID, found := authState[stateTup]; found {
 			authEventIDs = append(authEventIDs, eventID)
 		}
 	}
-	slices.SortFunc(authEventIDs, func(a, b id.EventID) int {
-		return strings.Compare(a.String(), b.String())
-	})
+	slices.Sort(authEventIDs)
 	return authEventIDs
-}
-
-// Interface methods for gomatrixserverlib.AuthEventProvider
-
-func (ap *TxnAuthEventsProvider) Member(senderID spec.SenderID) (gomatrixserverlib.PDU, error) {
-	eventID, found := ap.stateMap[types.StateTup{
-		Type:     event.StateMember,
-		StateKey: string(senderID),
-	}]
-	if !found {
-		ap.log.Trace().Str("sender", string(senderID)).Msg("Missed member state event")
-		return nil, nil
-	}
-	return ap.get(eventID)
-}
-
-func (ap *TxnAuthEventsProvider) Create() (gomatrixserverlib.PDU, error) {
-	return ap.getByType(event.StateCreate)
-}
-
-func (ap *TxnAuthEventsProvider) JoinRules() (gomatrixserverlib.PDU, error) {
-	return ap.getByType(event.StateJoinRules)
-}
-
-func (ap *TxnAuthEventsProvider) PowerLevels() (gomatrixserverlib.PDU, error) {
-	return ap.getByType(event.StatePowerLevels)
-}
-
-func (ap *TxnAuthEventsProvider) ThirdPartyInvite(s string) (gomatrixserverlib.PDU, error) {
-	// TODO: implement
-	return nil, nil
-}
-
-func (ap *TxnAuthEventsProvider) Valid() bool {
-	// TODO: implement
-	return true
 }

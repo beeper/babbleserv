@@ -3,21 +3,16 @@ package users
 import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-func (u *UsersDirectory) TxnDeleteUserMembership(txn fdb.Transaction, userID id.UserID, roomID id.RoomID, version tuple.Versionstamp) {
-	txn.Clear(u.keyForMembership(userID, roomID))
-	txn.Clear(u.keyForMembershipChange(userID, version))
-}
-
-// Memberships (id.UserID, id.RoomID) -> types.MembershipTup
+// Memberships of local users (id.UserID, id.RoomID) -> types.MembershipRow, cleared when the user's
+// member key leaves the room's state
 //
 
-func (u *UsersDirectory) keyForMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
+func (u *UsersDirectory) KeyForMembership(userID id.UserID, roomID id.RoomID) fdb.Key {
 	return u.memberships.Pack(tuple.Tuple{userID.String(), roomID.String()})
 }
 
@@ -25,33 +20,33 @@ func (u *UsersDirectory) rangeForMemberships(userID id.UserID) fdb.Range {
 	return u.memberships.Sub(userID.String())
 }
 
-func (u *UsersDirectory) TxnStoreMembership(txn fdb.Transaction, userID id.UserID, roomID id.RoomID, tup types.MembershipTup) {
-	txn.Set(u.keyForMembership(userID, roomID), types.MembershipTupToBytes(tup))
+func (u *UsersDirectory) TxnStoreMembership(txn fdb.Transaction, userID id.UserID, roomID id.RoomID, row types.MembershipRow) {
+	txn.Set(u.KeyForMembership(userID, roomID), types.MembershipRowToBytes(row))
 }
 
-func (u *UsersDirectory) TxnGetMembership(
-	txn fdb.ReadTransaction,
-	userID id.UserID,
-	roomID id.RoomID,
-) *types.MembershipTup {
-	if b := txn.Get(u.keyForMembership(userID, roomID)).MustGet(); b == nil {
+func (u *UsersDirectory) TxnDeleteMembership(txn fdb.Transaction, userID id.UserID, roomID id.RoomID) {
+	txn.Clear(u.KeyForMembership(userID, roomID))
+}
+
+func membershipRowOf(b []byte) *types.MembershipRow {
+	if b == nil {
 		return nil
-	} else {
-		tup := types.BytesToMembershipTup(b)
-		return &tup
 	}
+	row := types.BytesToMembershipRow(b)
+	return &row
 }
 
-func (u *UsersDirectory) TxnIsUserJoinedRoom(
-	txn fdb.ReadTransaction,
-	userID id.UserID,
-	roomID id.RoomID,
-) bool {
-	mtup := u.TxnGetMembership(txn, userID, roomID)
-	if mtup == nil {
-		return false
+// MembershipRowsOf waits for reads of users' rows, nil for none
+func MembershipRowsOf[K comparable](futures map[K]fdb.FutureByteSlice) (map[K]*types.MembershipRow, error) {
+	rows := make(map[K]*types.MembershipRow, len(futures))
+	for key, future := range futures {
+		b, err := future.Get()
+		if err != nil {
+			return nil, err
+		}
+		rows[key] = membershipRowOf(b)
 	}
-	return mtup.Membership == event.MembershipJoin
+	return rows, nil
 }
 
 func (u *UsersDirectory) TxnLookupUserMemberships(
@@ -86,7 +81,7 @@ func (u *UsersDirectory) keyToMembershipChangeVersion(key fdb.Key) tuple.Version
 	return tup[1].(tuple.Versionstamp)
 }
 
-func (u *UsersDirectory) keyForMembershipChange(userID id.UserID, version tuple.Versionstamp) fdb.Key {
+func (u *UsersDirectory) KeyForMembershipChange(userID id.UserID, version tuple.Versionstamp) fdb.Key {
 	return types.MustPackVersionKey(u.membershipChanges, tuple.Tuple{userID.String(), version})
 }
 
@@ -103,7 +98,7 @@ func (u *UsersDirectory) TxnStoreMembershipChange(
 	version tuple.Versionstamp,
 	tup types.MembershipTup,
 ) {
-	txn.SetVersionstampedKey(u.keyForMembershipChange(userID, version), types.MembershipTupToBytes(tup))
+	txn.SetVersionstampedKey(u.KeyForMembershipChange(userID, version), types.MembershipTupToBytes(tup))
 }
 
 func (u *UsersDirectory) TxnLookupUserMembershipChanges(
@@ -130,7 +125,7 @@ func (u *UsersDirectory) TxnLookupUserMembershipChanges(
 	return changes
 }
 
-// TxnLookupUserMembershipRows returns at most limit current-membership rows,
+// TxnLookupUserMembershipRows returns the memberships of at most limit current-membership rows,
 // including terminal memberships, and reports whether the range had more rows.
 // It is used by privacy-sensitive user-directory filtering, where silently
 // skipping leave rows would make the transaction's scan bound ineffective.

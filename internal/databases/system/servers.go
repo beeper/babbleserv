@@ -8,6 +8,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
+	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
 func (s *SystemDatabase) GetServerNamesWithPositions(ctx context.Context) ([]string, error) {
@@ -54,19 +55,14 @@ func (s *SystemDatabase) UpdateServerPositions(
 	ctx context.Context,
 	serverName string,
 	versions types.VersionMap,
-	checkUpdateLock func(fdb.Transaction),
+	lock lock.Lock,
 ) error {
 	data, err := msgpack.Marshal(versions)
 	if err != nil {
 		return err
 	}
-	_, err = util.DoWriteTransaction(ctx, s.db, func(txn fdb.Transaction) (*struct{}, error) {
-		// Ensure lock is still valid before writing data
-		checkUpdateLock(txn)
-
-		key := s.servers.KeyForServerPosition(serverName)
-		txn.Set(key, data)
-		return nil, nil
+	return lock.Transact(ctx, func(txn fdb.Transaction) error {
+		txn.Set(s.servers.KeyForServerPosition(serverName), data)
+		return nil
 	})
-	return err
 }

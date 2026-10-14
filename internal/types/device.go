@@ -16,9 +16,38 @@ type UserDevice struct {
 	DeviceID id.DeviceID
 }
 
+type DeviceListStream struct {
+	StreamID int64
+	PrevID   int64
+}
+
 type UserDeviceChange struct {
 	UserDevice
 	Version tuple.Versionstamp
+	// Set when the change allocated a local device-list version
+	Stream *DeviceListStream
+}
+
+// One read of a local device for its device-list EDU; Device nil when deleted. Keys carry the
+// owner's signatures.
+type LocalDeviceListUpdate struct {
+	Version int64
+	Device  *Device
+	Keys    SignedDeviceKeys
+}
+
+type LocalSnapshotDevice struct {
+	Device Device
+	Keys   SignedDeviceKeys
+}
+
+// A local user's device list as one read: what /user/devices and join announcements serve. Keys
+// carry the owner's signatures.
+type LocalDeviceSnapshot struct {
+	Version        int64
+	Devices        []LocalSnapshotDevice
+	MasterKey      SignedCrossSigningKey
+	SelfSigningKey SignedCrossSigningKey
 }
 
 func NewDevice(id id.DeviceID, displayName string) *Device {

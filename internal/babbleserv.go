@@ -58,6 +58,7 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 		Pub:  id.SigningKey(key.Public().(ed25519.PublicKey)),
 		Priv: key,
 	}, fedCache)
+	fedClient.UserAgent = cfg.UserAgent
 
 	fedClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: true,
@@ -86,7 +87,7 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 
 	var wrks *workers.Workers
 	if cfg.WorkersEnabled {
-		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient)
+		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient, fedClient)
 	} else {
 		log.Info().Msg("Workers disabled")
 	}

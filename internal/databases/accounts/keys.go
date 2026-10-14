@@ -2,8 +2,9 @@ package accounts
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"maps"
+	"slices"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
@@ -46,10 +47,10 @@ func (a *AccountsDatabase) ClaimOrGetPreKeys(
 	deviceID id.DeviceID,
 	algorithm id.KeyAlgorithm,
 	limit int,
-) (map[id.KeyID]mautrix.OneTimeKey, error) {
+) (map[id.KeyID]json.RawMessage, error) {
 	log := zerolog.Ctx(ctx)
 
-	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (map[id.KeyID]mautrix.OneTimeKey, error) {
+	return util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (map[id.KeyID]json.RawMessage, error) {
 		if otks := a.devices.TxnClaimOneTimeKeys(txn, userID, deviceID, algorithm, limit); otks != nil {
 			return otks, nil
 		}
@@ -62,8 +63,8 @@ func (a *AccountsDatabase) ClaimOrGetPreKeys(
 				algorithm: key,
 			})
 			log.Warn().Msg("No one time key found, returning fallback key")
-			return map[id.KeyID]mautrix.OneTimeKey{
-				key.KeyID: key.Key,
+			return map[id.KeyID]json.RawMessage{
+				key.KeyID: key.Key.Raw,
 			}, nil
 		}
 
@@ -72,82 +73,148 @@ func (a *AccountsDatabase) ClaimOrGetPreKeys(
 	})
 }
 
+// Changed signatures of the signer's own devices allocate a device-list version, of the signer's own
+// master or self-signing key write a `*` record. Signatures of other users' keys are private
+// cross-signatures, never federated.
 func (a *AccountsDatabase) StoreKeySignatures(
 	ctx context.Context,
-	signatures map[id.UserID]map[id.KeyID]signatures.Signatures,
+	requestUserID id.UserID,
+	targets []types.KeySignatureTarget,
 ) error {
-	_, err := util.DoWriteTransaction(ctx, a.db, func(txn fdb.Transaction) (any, error) {
-		for userID, keyToSignatures := range signatures {
-			for keyID, signatures := range keyToSignatures {
-				a.users.TxnStoreKeySignatures(txn, userID, keyID, signatures)
+	recorded, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
+		targetKeys := make(map[id.UserID]map[id.KeyID]struct{}, len(targets))
+		for _, target := range targets {
+			if targetKeys[target.UserID] == nil {
+				targetKeys[target.UserID] = make(map[id.KeyID]struct{}, 1)
+			}
+			targetKeys[target.UserID][target.KeyID] = struct{}{}
+		}
+		_, stored := a.users.TxnGetKeySignatures(txn, requestUserID, targetKeys)
+
+		var changedDevices []id.DeviceID
+		var changedOwnKeys []id.KeyID
+		for _, target := range targets {
+			uploaded := target.Signatures[requestUserID]
+			if !types.SignaturesChanged(stored[target.UserID][target.KeyID], uploaded) {
+				continue
+			}
+			a.users.TxnStoreKeySignatures(txn, target.UserID, target.KeyID, signatures.Signatures{requestUserID: uploaded})
+
+			switch {
+			case target.UserID != requestUserID:
+				continue
+			case target.DeviceID != "":
+				changedDevices = append(changedDevices, target.DeviceID)
+			default:
+				changedOwnKeys = append(changedOwnKeys, target.KeyID)
 			}
 		}
-		return nil, nil
+
+		if len(changedDevices) >= types.MaxVersionstampUserVersion {
+			return false, fmt.Errorf("too many device signatures in one upload: %d", len(changedDevices))
+		}
+		for index, deviceID := range changedDevices {
+			if err := a.txnStoreDeviceListChange(txn, requestUserID, deviceID, uint16(index)); err != nil {
+				return false, err
+			}
+		}
+
+		publicKeyChanged, err := a.txnContainsPublicCrossSigningKey(txn, requestUserID, changedOwnKeys)
+		if err != nil {
+			return false, err
+		} else if publicKeyChanged {
+			version := tuple.IncompleteVersionstamp(uint16(len(changedDevices)))
+			a.devices.TxnStoreDeviceChange(txn, requestUserID, id.DeviceID("*"), version)
+		}
+
+		return len(changedDevices) > 0 || publicKeyChanged, nil
 	})
-	return err
+	if err != nil {
+		return err
+	} else if recorded {
+		a.notifier.SendChange(notifier.Change{
+			UserIDs: []id.UserID{requestUserID},
+		})
+	}
+	return nil
 }
 
+// The user-signing key is private to its owner, so signatures of it never federate
+func (a *AccountsDatabase) txnContainsPublicCrossSigningKey(txn fdb.ReadTransaction, userID id.UserID, keyIDs []id.KeyID) (bool, error) {
+	if len(keyIDs) == 0 {
+		return false, nil
+	}
+	keys, err := a.users.TxnGetUserCrossSigningKeys(txn, userID)
+	if err != nil || keys == nil {
+		return false, err
+	}
+	master := id.KeyID(types.CrossSigningPublicKey(keys.Master))
+	selfSigning := id.KeyID(types.CrossSigningPublicKey(keys.SelfSigning))
+	return slices.ContainsFunc(keyIDs, func(keyID id.KeyID) bool {
+		return keyID != "" && (keyID == master || keyID == selfSigning)
+	}), nil
+}
+
+// Returns target user → target key → signer key → signature
+func (a *AccountsDatabase) GetKeySignaturesBySigner(
+	ctx context.Context,
+	requestUserID id.UserID,
+	targets map[id.UserID]map[id.KeyID]struct{},
+) (map[id.UserID]map[id.KeyID]map[id.KeyID]string, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (map[id.UserID]map[id.KeyID]map[id.KeyID]string, error) {
+		_, signatures := a.users.TxnGetKeySignatures(txn, requestUserID, targets)
+		return signatures, nil
+	})
+}
+
+// The owner's signatures by target key: a device ID or a cross-signing public key
+func (a *AccountsDatabase) txnGetOwnerSignatures(
+	txn fdb.ReadTransaction,
+	userID id.UserID,
+	keyIDs []id.KeyID,
+) map[id.KeyID]map[id.KeyID]string {
+	targets := make(map[id.KeyID]struct{}, len(keyIDs))
+	for _, keyID := range keyIDs {
+		if keyID != "" {
+			targets[keyID] = struct{}{}
+		}
+	}
+	_, found := a.users.TxnGetKeySignatures(txn, userID, map[id.UserID]map[id.KeyID]struct{}{userID: targets})
+	return found[userID]
+}
+
+func ownerSignedCrossSigningKey(
+	key types.SignedCrossSigningKey,
+	userID id.UserID,
+	ownerSignatures map[id.KeyID]map[id.KeyID]string,
+) (types.SignedCrossSigningKey, error) {
+	return key.WithOwnerSignatures(userID, ownerSignatures[id.KeyID(types.CrossSigningPublicKey(key))])
+}
+
+// Absent when the device has no keys
 func (a *AccountsDatabase) GetDeviceKeys(
 	ctx context.Context,
 	userID id.UserID,
 	deviceID id.DeviceID,
-	requestUserID id.UserID,
-) (*mautrix.DeviceKeys, error) {
-	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*mautrix.DeviceKeys, error) {
+) (types.SignedDeviceKeys, error) {
+	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (types.SignedDeviceKeys, error) {
 		keys, err := a.devices.TxnGetDeviceKeys(txn, userID, deviceID)
-		if err != nil {
-			return nil, err
-		} else if keys == nil {
-			return nil, nil
+		if err != nil || keys.IsZero() {
+			return keys, err
 		}
-
 		deviceKeyID := id.KeyID(deviceID)
-
-		keysForSignatures := map[id.UserID]map[id.KeyID]struct{}{
-			// Get any signatures from the device users own keys
-			userID: {
-				deviceKeyID: {},
-			},
-		}
-		if userID != requestUserID {
-			// If we're requesting another users keys, grab any signatures from our keys for their device
-			keysForSignatures[requestUserID] = map[id.KeyID]struct{}{
-				deviceKeyID: {},
-			}
-		}
-
-		found, signatures := a.users.TxnGetKeySignatures(txn, userID, keysForSignatures)
-		zerolog.Ctx(ctx).Debug().
-			Int("signatures", found).
-			Str("target_user_id", userID.String()).
-			Str("target_device_id", deviceID.String()).
-			Msg("Found signatures for user device keys")
-
-		for keyID, keySigs := range signatures[userID] {
-			if len(keySigs) == 0 {
-				continue
-			}
-			if keyID != deviceKeyID {
-				panic(fmt.Errorf("unexpected signature for keyID: %s", keyID))
-			}
-			if keys.Signatures == nil {
-				keys.Signatures = map[id.UserID]map[id.KeyID]string{
-					userID: make(map[id.KeyID]string, len(keySigs)),
-				}
-			}
-			maps.Copy(keys.Signatures[userID], keySigs)
-		}
-
-		return keys, nil
+		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, []id.KeyID{deviceKeyID})
+		return keys.WithOwnerSignatures(userID, ownerSignatures[deviceKeyID])
 	})
 }
 
+// Every key is canonical signed JSON, already verified. Absent device keys are left as stored.
 func (a *AccountsDatabase) StoreKeysForDevice(
 	ctx context.Context,
 	userID id.UserID,
 	deviceID id.DeviceID,
-	deviceKeys *mautrix.DeviceKeys,
-	oneTimeKeys map[id.KeyID]mautrix.OneTimeKey,
+	deviceKeys types.SignedDeviceKeys,
+	oneTimeKeys map[id.KeyID]types.SignedOneTimeKey,
 	fallbackKeys map[id.KeyAlgorithm]types.FallbackKey,
 ) (mautrix.OTKCount, error) {
 	log := a.getTxnLogContext(ctx, "StoreKeysForDevice").Logger()
@@ -156,21 +223,20 @@ func (a *AccountsDatabase) StoreKeysForDevice(
 	changed, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {
 		var changed bool
 
-		if deviceKeys != nil {
-			keys := *deviceKeys
+		if !deviceKeys.IsZero() {
 			existingKeys, err := a.devices.TxnGetDeviceKeys(txn, userID, deviceID)
 			if err != nil {
 				return false, err
 			}
 
-			if a.config.SecretSwitches.DisableKeysEqualCheck || !util.CompareSignedObjectsJSON(existingKeys, keys) {
-				a.devices.TxnStoreDeviceKeys(txn, userID, deviceID, keys)
-				a.users.TxnIncrementUserDeviceListVersion(txn, userID)
-				a.users.TxnStoreKeySignatures(txn, userID, id.KeyID(deviceID), keys.Signatures)
-
-				// Store change for this device
-				version := tuple.IncompleteVersionstamp(0)
-				a.devices.TxnStoreDeviceChange(txn, userID, deviceID, version)
+			if a.config.SecretSwitches.DisableKeysEqualCheck || existingKeys.IsZero() || !existingKeys.Matches(deviceKeys.Raw) {
+				if err := a.devices.TxnStoreDeviceKeys(txn, userID, deviceID, deviceKeys); err != nil {
+					return false, err
+				}
+				a.users.TxnStoreKeySignatures(txn, userID, id.KeyID(deviceID), deviceKeys.View.Signatures)
+				if err := a.txnStoreDeviceListChange(txn, userID, deviceID, 0); err != nil {
+					return false, err
+				}
 				changed = true
 			}
 		}
@@ -201,6 +267,7 @@ func (a *AccountsDatabase) StoreKeysForDevice(
 	return counts, nil
 }
 
+// The user-signing key is private to its owner, so is only returned to them
 func (a *AccountsDatabase) GetUserCrossSigningKeys(
 	ctx context.Context,
 	userID id.UserID,
@@ -208,79 +275,37 @@ func (a *AccountsDatabase) GetUserCrossSigningKeys(
 ) (*types.UserCrossSigningKeys, error) {
 	return util.DoReadTransaction(ctx, a.db, func(txn fdb.ReadTransaction) (*types.UserCrossSigningKeys, error) {
 		keys, err := a.users.TxnGetUserCrossSigningKeys(txn, userID)
-		if err != nil {
+		if err != nil || keys == nil {
 			return nil, err
-		} else if keys == nil {
-			return nil, nil
+		}
+		if userID != requestUserID {
+			keys.UserSigning = types.SignedCrossSigningKey{}
 		}
 
-		keysForSignatures := map[id.UserID]map[id.KeyID]struct{}{
-			// Always grab signatures for the xs keys from the owner of those xs keys
-			userID: {
-				keys.Master.KeyID():      {},
-				keys.SelfSigning.KeyID(): {},
-			},
+		ownedKeys := []*types.SignedCrossSigningKey{&keys.Master, &keys.SelfSigning, &keys.UserSigning}
+		keyIDs := make([]id.KeyID, len(ownedKeys))
+		for i, key := range ownedKeys {
+			keyIDs[i] = id.KeyID(types.CrossSigningPublicKey(*key))
 		}
-
-		if userID == requestUserID {
-			// If we're requesting our own keys, also grab signatures for our user signing key
-			keysForSignatures[userID][keys.UserSigning.KeyID()] = struct{}{}
-		} else {
-			// If we're requesting another users keys, also grab signatures from our keys
-			keysForSignatures[requestUserID] = map[id.KeyID]struct{}{
-				keys.Master.KeyID():      {},
-				keys.SelfSigning.KeyID(): {},
-			}
-			// Empty the user signing xs key as this is private to the user only
-			keys.UserSigning = types.CrossSigningKey{}
-		}
-
-		found, signatures := a.users.TxnGetKeySignatures(txn, userID, keysForSignatures)
-		zerolog.Ctx(ctx).Debug().
-			Int("signatures", found).
-			Str("target_user_id", userID.String()).
-			Msg("Found signatures for user cross signing keys")
-
-		for keyID, keySigs := range signatures[userID] {
-			if len(keySigs) == 0 {
-				continue
-			}
-			switch keyID {
-			case keys.Master.KeyID():
-				if keys.Master.Signatures == nil {
-					keys.Master.Signatures = map[id.UserID]map[id.KeyID]string{
-						userID: make(map[id.KeyID]string, len(keySigs)),
-					}
-				}
-				maps.Copy(keys.Master.Signatures[userID], keySigs)
-
-			case keys.SelfSigning.KeyID():
-				if keys.SelfSigning.Signatures == nil {
-					keys.SelfSigning.Signatures = map[id.UserID]map[id.KeyID]string{
-						userID: make(map[id.KeyID]string, len(keySigs)),
-					}
-				}
-				maps.Copy(keys.SelfSigning.Signatures[userID], keySigs)
-
-			case keys.UserSigning.KeyID():
-				if keys.UserSigning.Signatures == nil {
-					keys.UserSigning.Signatures = map[id.UserID]map[id.KeyID]string{
-						userID: make(map[id.KeyID]string, len(keySigs)),
-					}
-				}
-				maps.Copy(keys.UserSigning.Signatures[userID], keySigs)
+		ownerSignatures := a.txnGetOwnerSignatures(txn, userID, keyIDs)
+		for _, key := range ownedKeys {
+			if *key, err = ownerSignedCrossSigningKey(*key, userID, ownerSignatures); err != nil {
+				return nil, err
 			}
 		}
-
 		return keys, nil
 	})
 }
 
+// Keys the upload omits are kept. Every uploaded key is canonical signed JSON, already verified
+// against the master key with the given public key, which an upload without a master key requires
+// to still be stored.
 func (a *AccountsDatabase) StoreUserCrossSigningKeys(
 	ctx context.Context,
 	userID id.UserID,
 	deviceID id.DeviceID,
-	keys types.UserCrossSigningKeys,
+	upload types.UserCrossSigningKeys,
+	verifiedMaster id.Ed25519,
 ) error {
 	log := a.getTxnLogContext(ctx, "StoreUserCrossSigningKeys").Logger()
 
@@ -289,25 +314,36 @@ func (a *AccountsDatabase) StoreUserCrossSigningKeys(
 		if err != nil {
 			return false, err
 		}
+		var existing types.UserCrossSigningKeys
+		if existingKeys != nil {
+			existing = *existingKeys
+		}
+		if upload.Master.IsZero() && types.CrossSigningPublicKey(existing.Master) != verifiedMaster {
+			return false, types.ErrMasterKeyChanged
+		}
+		keys := existing.Merge(upload)
 
-		if existingKeys == nil || a.config.SecretSwitches.DisableKeysEqualCheck ||
-			!util.CompareSignedObjectsJSON(existingKeys.Master, keys.Master) ||
-			!util.CompareSignedObjectsJSON(existingKeys.SelfSigning, keys.SelfSigning) ||
-			!util.CompareSignedObjectsJSON(existingKeys.UserSigning, keys.UserSigning) {
-
-			a.users.TxnStoreUserCrossSigningKeys(txn, userID, keys)
-			a.users.TxnStoreKeySignatures(txn, userID, keys.Master.KeyID(), keys.Master.Signatures)
-			a.users.TxnStoreKeySignatures(txn, userID, keys.SelfSigning.KeyID(), keys.SelfSigning.Signatures)
-			a.users.TxnStoreKeySignatures(txn, userID, keys.UserSigning.KeyID(), keys.UserSigning.Signatures)
-
-			// Store change for all devices
-			version := tuple.IncompleteVersionstamp(0)
-			a.devices.TxnStoreDeviceChange(txn, userID, id.DeviceID("*"), version)
-
-			return true, nil
+		if existingKeys != nil && !a.config.SecretSwitches.DisableKeysEqualCheck &&
+			sameSignedJSON(existing.Master, keys.Master) &&
+			sameSignedJSON(existing.SelfSigning, keys.SelfSigning) &&
+			sameSignedJSON(existing.UserSigning, keys.UserSigning) {
+			return false, nil
 		}
 
-		return false, nil
+		if err := a.users.TxnStoreUserCrossSigningKeys(txn, userID, keys); err != nil {
+			return false, err
+		}
+		for _, key := range []types.SignedCrossSigningKey{upload.Master, upload.SelfSigning, upload.UserSigning} {
+			if !key.IsZero() {
+				a.users.TxnStoreKeySignatures(txn, userID, id.KeyID(types.CrossSigningPublicKey(key)), key.View.Signatures)
+			}
+		}
+
+		// Store change for all devices
+		version := tuple.IncompleteVersionstamp(0)
+		a.devices.TxnStoreDeviceChange(txn, userID, id.DeviceID("*"), version)
+
+		return true, nil
 	}); err != nil {
 		return err
 	} else {
@@ -321,4 +357,11 @@ func (a *AccountsDatabase) StoreUserCrossSigningKeys(
 		}
 		return nil
 	}
+}
+
+func sameSignedJSON(a, b types.SignedCrossSigningKey) bool {
+	if a.IsZero() || b.IsZero() {
+		return a.IsZero() == b.IsZero()
+	}
+	return a.Matches(b.Raw)
 }

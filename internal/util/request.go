@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib/fclient"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -25,56 +28,38 @@ import (
 
 // Chi URL params
 
-func RoomIDFromRequestURLParam(r *http.Request, field string) id.RoomID {
+func urlParam(r *http.Request, field string) string {
 	p := chi.URLParam(r, field)
+	if r.URL.RawPath == "" {
+		return p
+	} else if parsed, err := url.PathUnescape(p); err == nil {
+		return parsed
+	}
+	return p
+}
 
-	if strings.HasSuffix(p, "!") {
-		return id.RoomID(p)
-	}
-	if parsed, err := url.PathUnescape(p); err != nil {
-		return id.RoomID("")
-	} else {
-		return id.RoomID(parsed)
-	}
+func RoomIDFromRequestURLParam(r *http.Request, field string) id.RoomID {
+	return id.RoomID(urlParam(r, field))
 }
 
 func RoomAliasFromRequestURLParam(r *http.Request, field string) id.RoomAlias {
-	p := chi.URLParam(r, field)
-
-	if strings.HasSuffix(p, "#") {
-		return id.RoomAlias(p)
-	}
-	if parsed, err := url.PathUnescape(p); err != nil {
-		return id.RoomAlias("")
-	} else {
-		return id.RoomAlias(parsed)
-	}
+	return id.RoomAlias(urlParam(r, field))
 }
 
 func EventIDFromRequestURLParam(r *http.Request, field string) id.EventID {
-	p := chi.URLParam(r, field)
-
-	if strings.HasSuffix(p, "$") {
-		return id.EventID(p)
-	}
-	if parsed, err := url.PathUnescape(p); err != nil {
-		return id.EventID("")
-	} else {
-		return id.EventID(parsed)
-	}
+	return id.EventID(urlParam(r, field))
 }
 
 func UserIDFromRequestURLParam(r *http.Request, field string) id.UserID {
-	p := chi.URLParam(r, field)
+	return id.UserID(urlParam(r, field))
+}
 
-	if strings.HasSuffix(p, "@") {
-		return id.UserID(p)
-	}
-	if parsed, err := url.PathUnescape(p); err != nil {
-		return id.UserID("")
-	} else {
-		return id.UserID(parsed)
-	}
+func StateKeyFromRequestURLParam(r *http.Request, field string) string {
+	return urlParam(r, field)
+}
+
+func EventTypeFromRequestURLParam(r *http.Request, field string) event.Type {
+	return event.NewEventType(urlParam(r, field))
 }
 
 func HomeserverForRoomID(roomID id.RoomID) string {
@@ -170,31 +155,79 @@ func VersionFromRequestQuery(r *http.Request, field, versionKey types.VersionKey
 // Request body
 
 func ParseRequestJSON[T any](r *http.Request) (T, *mautrix.RespError) {
+	return parseRequestJSON[T](r, false)
+}
+
+func ParseOptionalRequestJSON[T any](r *http.Request) (T, *mautrix.RespError) {
+	return parseRequestJSON[T](r, true)
+}
+
+func parseRequestJSON[T any](r *http.Request, optional bool) (T, *mautrix.RespError) {
 	var req T
-	decoder := json.NewDecoder(r.Body)
-	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		var sErr *json.SyntaxError
-		if errors.As(err, &sErr) {
-			return req, &mautrix.MNotJSON
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return req, requestReadError(err)
+	}
+	if optional && len(body) == 0 {
+		return req, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(body), []byte("null")) {
+		if optional {
+			return req, nil
 		}
 		return req, &mautrix.MBadJSON
 	}
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return req, &mautrix.MBadJSON
+	// We want to match how Python handles duplicate keys in JSON - go's jsonv2 merges nested values
+	// when allowing duplicates whereas Python overwrites. Catch the duplicate error from default
+	// decode and then use our own function that behaves like Python.
+	err = jsonv2.Unmarshal(body, &req, jsontext.AllowInvalidUTF8(true))
+	if errors.Is(err, jsontext.ErrDuplicateName) {
+		body, err = collapseDuplicateJSONKeys(body)
+		if err == nil {
+			var zero T
+			req = zero
+			err = jsonv2.Unmarshal(body, &req, jsontext.AllowInvalidUTF8(true))
+		}
 	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+	var semanticErr *jsonv2.SemanticError
+	if errors.As(err, &semanticErr) {
+		return req, &mautrix.MBadJSON
+	} else if err != nil {
 		return req, &mautrix.MNotJSON
 	}
-	if err := json.Unmarshal(raw, &req); err != nil {
-		var sErr *json.SyntaxError
-		if errors.As(err, &sErr) {
-			return req, &mautrix.MNotJSON
-		}
-		return req, &mautrix.MBadJSON
-	}
 	return req, nil
+}
+
+// collapseDuplicateKeys reads JSON as Python does, the last value of a duplicate key winning
+func collapseDuplicateJSONKeys(b []byte) ([]byte, error) {
+	// Decoding into a struct would merge the duplicates of a map field
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+func requestReadError(err error) *mautrix.RespError {
+	var sizeErr *http.MaxBytesError
+	if errors.As(err, &sizeErr) {
+		return &mautrix.MTooLarge
+	}
+	return &mautrix.MNotJSON
 }
 
 // Federation request authentication

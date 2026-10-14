@@ -56,13 +56,6 @@ func (u *UsersDirectory) TxnEnsureRemoteDirectoryUsers(
 			return err
 		}
 		current := u.txnGetRemoteProfileJob(txn, source.UserID)
-		if !source.Joined {
-			if current != nil {
-				txn.Clear(u.remoteProfileDueKey(*current))
-				txn.Clear(u.remoteProfileJobKey(source.UserID))
-			}
-			continue
-		}
 		user, err := u.txnGetUser(txn, source.UserID)
 		if err != nil {
 			return err
@@ -102,6 +95,27 @@ func (u *UsersDirectory) TxnEnsureRemoteDirectoryUsers(
 		})
 	}
 	return nil
+}
+
+// Call TxnEnsureRemoteDirectoryUsers for users with neither a profile fetch queued nor a profile stored
+func (u *UsersDirectory) TxnEnsureUnindexedRemoteDirectoryUsers(
+	txn fdb.Transaction,
+	sources []types.RemoteUserDirectorySource,
+	now, lookupAt time.Time,
+) error {
+	jobs := make([]fdb.FutureByteSlice, len(sources))
+	profiles := make([]fdb.FutureByteSlice, len(sources))
+	for i, source := range sources {
+		jobs[i] = txn.Get(u.remoteProfileJobKey(source.UserID))
+		profiles[i] = txn.Get(u.keyForProfile(source.UserID))
+	}
+	unindexed := make([]types.RemoteUserDirectorySource, 0, len(sources))
+	for i, source := range sources {
+		if jobs[i].MustGet() == nil && profiles[i].MustGet() == nil {
+			unindexed = append(unindexed, source)
+		}
+	}
+	return u.TxnEnsureRemoteDirectoryUsers(txn, unindexed, now, lookupAt)
 }
 
 func (u *UsersDirectory) TxnNextRemoteDirectoryProfileJob(

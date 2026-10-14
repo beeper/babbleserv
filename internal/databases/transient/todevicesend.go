@@ -12,7 +12,6 @@ import (
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
-	"github.com/beeper/babbleserv/internal/util/lock"
 )
 
 type RejectedToDeviceEvent struct {
@@ -33,8 +32,8 @@ type SendToDeviceOptions struct {
 	TransactionID string
 	DeviceID      id.DeviceID
 
-	// Ensure (+refresh) a lock is held at commit time
-	LockTxnRefresh lock.LockTxnRefreshFunc
+	// Called last in every transaction attempt, eg to refresh a lock held in another database
+	BeforeCommit func()
 }
 
 // Sends to-device events, raw meaning the DeviceIDs must be specific and not "*"
@@ -100,8 +99,8 @@ func (t *TransientDatabase) SendRawToDeviceEvents(
 			}
 		}
 
-		if options.LockTxnRefresh != nil {
-			options.LockTxnRefresh(txn)
+		if options.BeforeCommit != nil {
+			options.BeforeCommit()
 		}
 
 		change := notifier.Change{

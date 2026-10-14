@@ -7,7 +7,6 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
-	"github.com/tidwall/sjson"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
@@ -18,34 +17,22 @@ func (d *DevicesDirectory) keyForDeviceKeys(userID id.UserID, deviceID id.Device
 	return d.deviceKeys.Pack(tuple.Tuple{userID.String(), deviceID.String()})
 }
 
-func (d *DevicesDirectory) TxnStoreDeviceKeys(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, keys mautrix.DeviceKeys) {
-	b, err := json.Marshal(keys)
+func (d *DevicesDirectory) TxnStoreDeviceKeys(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, keys types.SignedDeviceKeys) error {
+	stored, err := keys.WithoutSignatures()
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-	// Device keys signatures are stored separately
-	b, _ = sjson.DeleteBytes(b, "signatures")
-
-	key := d.keyForDeviceKeys(userID, deviceID)
-	txn.Set(key, b)
+	txn.Set(d.keyForDeviceKeys(userID, deviceID), stored.Raw)
+	return nil
 }
 
-func (d *DevicesDirectory) TxnGetDeviceKeys(txn fdb.ReadTransaction, userID id.UserID, deviceID id.DeviceID) (*mautrix.DeviceKeys, error) {
-	key := d.keyForDeviceKeys(userID, deviceID)
-	b, err := txn.Get(key).Get()
+// The keys as stored, without signatures; absent when the device has none
+func (d *DevicesDirectory) TxnGetDeviceKeys(txn fdb.ReadTransaction, userID id.UserID, deviceID id.DeviceID) (types.SignedDeviceKeys, error) {
+	b, err := txn.Get(d.keyForDeviceKeys(userID, deviceID)).Get()
 	if err != nil {
-		return nil, err
+		return types.SignedDeviceKeys{}, err
 	}
-	if b == nil {
-		return nil, nil
-	}
-
-	var keys mautrix.DeviceKeys
-	if err := json.Unmarshal(b, &keys); err != nil {
-		return nil, err
-	}
-	return &keys, nil
+	return types.ParseSignedJSON[mautrix.DeviceKeys](b)
 }
 
 func (d *DevicesDirectory) keyForOneTimeKey(userID id.UserID, deviceID id.DeviceID, keyID id.KeyID) fdb.Key {
@@ -53,14 +40,10 @@ func (d *DevicesDirectory) keyForOneTimeKey(userID id.UserID, deviceID id.Device
 	return d.deviceOneTimeKeys.Pack(tuple.Tuple{userID.String(), deviceID.String(), string(algorithm), name})
 }
 
-func (d *DevicesDirectory) TxnStoreOneTimeKeys(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, keys map[id.KeyID]mautrix.OneTimeKey) {
+func (d *DevicesDirectory) TxnStoreOneTimeKeys(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, keys map[id.KeyID]types.SignedOneTimeKey) {
 	var v uint16
 	for keyID, key := range keys {
-		b, err := json.Marshal(key)
-		if err != nil {
-			panic(err)
-		}
-		txn.Set(d.keyForOneTimeKey(userID, deviceID, keyID), b)
+		txn.Set(d.keyForOneTimeKey(userID, deviceID, keyID), key.Raw)
 
 		algorithm, name := keyID.Parse()
 		k, err := d.deviceOneTimeKeysByVersion.PackWithVersionstamp(tuple.Tuple{
@@ -83,7 +66,7 @@ func (d *DevicesDirectory) TxnClaimOneTimeKeys(
 	deviceID id.DeviceID,
 	algorithm id.KeyAlgorithm,
 	limit int, // always 1 currently
-) map[id.KeyID]mautrix.OneTimeKey {
+) map[id.KeyID]json.RawMessage {
 	kVersions := txn.GetRange(
 		d.deviceOneTimeKeysByVersion.Sub(userID.String(), deviceID.String(), string(algorithm)),
 		fdb.RangeOptions{
@@ -95,7 +78,7 @@ func (d *DevicesDirectory) TxnClaimOneTimeKeys(
 		return nil
 	}
 
-	keys := make(map[id.KeyID]mautrix.OneTimeKey, len(kVersions))
+	keys := make(map[id.KeyID]json.RawMessage, len(kVersions))
 
 	for _, kVersion := range kVersions {
 		keyID := id.NewKeyID(algorithm, string(kVersion.Value))
@@ -107,12 +90,7 @@ func (d *DevicesDirectory) TxnClaimOneTimeKeys(
 			// Should be impossible as we clear both the key and version key together
 			panic("got nil one time key from version")
 		}
-		var key mautrix.OneTimeKey
-		if err := json.Unmarshal(keyB, &key); err != nil {
-			panic(err)
-		}
-
-		keys[keyID] = key
+		keys[keyID] = keyB
 
 		// Clear the key and the version key
 		txn.Clear(otkKey)

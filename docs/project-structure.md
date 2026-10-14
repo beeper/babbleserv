@@ -4,7 +4,10 @@ Babbleserv is designed to lean on FoundationDB as much as possible. Think of it 
 
 ## Transactions
 
-At the core of this lies transactions which FDB provides strong consistency guarantees for. By **evaluating event authorzation and state resolution within transactions** we simplify handling of both local and federated events significantly. See the `SendLocalEvents` and `SendFederatedEvents` in `internal/database/rooms/eventsend.go` which implement auth + store in single transactions.
+At the core of this lies transactions which FDB provides strong consistency guarantees for. Large changes (state resets, big joins) must perform work across multiple transactions to avoid limits.
+
+- [Room state storage](state-storage.md): FoundationDB records, immutable state trees, caching and membership indexes.
+- [Event sending](event-sending.md): transaction flow, publication guards, staging, artifact jobs, retries and state resolution.
 
 ### Transaction Rules
 
@@ -45,6 +48,10 @@ Babbleserv is roughly divided in three:
 - implement Matrix endpoints
 - call through to database transactions
 
-### `internal/federator/`
+### `internal/workers/`
 
-- federator?
+- asynchronous work after database changes, most as iterators over a database range, see [databases.md](databases.md#iterators-for-cross-database-transactions)
+
+### `internal/stateres/`
+
+- state resolution v2 and v2.1 over the conflicting part of the states, see [event-sending.md](event-sending.md#state-resolution)

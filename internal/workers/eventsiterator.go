@@ -110,7 +110,7 @@ func (e *EventsIterator) handleNewEvents(lock lock.Lock) {
 
 	// Update the position - refreshing the lock as part of the transaction to
 	// ensure the write is safe.
-	err = e.db.System.UpdateIteratorPositions(e.ctx, eventsIteratorPositionsKey, currentVersion, lock.TxnRefresh)
+	err = e.db.System.UpdateIteratorPositions(e.ctx, eventsIteratorPositionsKey, currentVersion, lock)
 	if err != nil {
 		e.log.Err(err).Msg("Failed to update current position")
 		return
@@ -127,7 +127,7 @@ func (e *EventsIterator) notifyFederationSenders(tups []types.EventTupWithVersio
 	// Now get unique server names from those rooms
 	serverNames := make(map[string]struct{})
 	for roomID := range roomIDs {
-		servers, err := e.db.Rooms.GetCurrentRoomServers(e.ctx, roomID)
+		servers, err := e.db.Rooms.RoomServers(e.ctx, roomID)
 		if err != nil {
 			return err
 		}

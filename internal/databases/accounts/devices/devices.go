@@ -8,6 +8,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -26,10 +27,12 @@ type DevicesDirectory struct {
 	// UserID/DeviceID to last seen time, separate to device bytes since updated on any req
 	deviceLastSeen subspace.Subspace
 
+	// key: (id.UserID, id.DeviceID)
+	// value: signed device keys JSON, its signatures stored as key signatures
 	deviceKeys subspace.Subspace
 
 	// key: (id.UserID, id.DeviceID, id.KeyAlgorithm, id.KeyID)
-	// value: mautrix.OneTimeKey
+	// value: signed one time key JSON
 	deviceOneTimeKeys subspace.Subspace
 
 	// Index keys by algo/version to claim in uploaded order (MSC4225), can also be used to clean
@@ -40,13 +43,14 @@ type DevicesDirectory struct {
 	deviceOneTimeKeysByVersion subspace.Subspace
 
 	// key: (id.UserID, id.DeviceID, id.KeyAlgorithm)
-	// value: mautrix.OneTimeKey
+	// value: types.FallbackKey JSON
 	deviceFallbackKeys subspace.Subspace
 
 	// version -> device change, paginated and cleared by the DeviceChangeIterator worker
 	//
 	// key: tuple.Versionstamp
-	// value: types.UserDevice
+	// value: (id.UserID, id.DeviceID) or, when a local device-list version was allocated,
+	// (id.UserID, id.DeviceID, stream ID, prev ID)
 	deviceChanges subspace.Subspace
 
 	// UserID/DeviceID/ConnID to types.UserSyncConn msgpack bytes, stores basic information about
@@ -122,18 +126,78 @@ func (d *DevicesDirectory) TxnStoreDevice(txn fdb.Transaction, userID id.UserID,
 	txn.Set(d.keyForDevice(userID, device.ID), device.ToBytes())
 }
 
-func (d *DevicesDirectory) TxnGetOrCreateDevice(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, initialDisplayName string) (*types.Device, error) {
+func (d *DevicesDirectory) TxnGetOrCreateDevice(
+	txn fdb.Transaction,
+	userID id.UserID,
+	deviceID id.DeviceID,
+	initialDisplayName string,
+) (*types.Device, bool, error) {
 	device, err := d.TxnGetDevice(txn, userID, deviceID)
 	if err != nil {
-		return nil, err
-	} else if device == nil {
-		device = types.NewDevice(deviceID, initialDisplayName)
-		// Store a change (device list update) for this user/device
-		d.TxnStoreDeviceChange(txn, userID, device.ID, tuple.IncompleteVersionstamp(0))
-		// Store the device itself
-		d.TxnStoreDevice(txn, userID, device)
+		return nil, false, err
+	} else if device != nil {
+		return device, false, nil
 	}
-	return device, nil
+	device = types.NewDevice(deviceID, initialDisplayName)
+	d.TxnStoreDevice(txn, userID, device)
+	return device, true, nil
+}
+
+func (d *DevicesDirectory) TxnGetUserDevicesWithKeys(txn fdb.ReadTransaction, userID id.UserID) ([]types.LocalSnapshotDevice, error) {
+	devicesRange := txn.GetRange(d.RangeForUserDevices(userID), fdb.RangeOptions{Mode: fdb.StreamingModeWantAll})
+	keysRange := txn.GetRange(d.deviceKeys.Sub(userID.String()), fdb.RangeOptions{Mode: fdb.StreamingModeWantAll})
+
+	deviceKVs, err := devicesRange.GetSliceWithError()
+	if err != nil {
+		return nil, err
+	}
+	keyKVs, err := keysRange.GetSliceWithError()
+	if err != nil {
+		return nil, err
+	}
+
+	keysByDevice := make(map[id.DeviceID]types.SignedDeviceKeys, len(keyKVs))
+	for _, kv := range keyKVs {
+		keyTup, err := d.deviceKeys.Unpack(kv.Key)
+		if err != nil {
+			return nil, err
+		}
+		if keysByDevice[id.DeviceID(keyTup[1].(string))], err = types.ParseSignedJSON[mautrix.DeviceKeys](kv.Value); err != nil {
+			return nil, err
+		}
+	}
+
+	devices := make([]types.LocalSnapshotDevice, len(deviceKVs))
+	for i, kv := range deviceKVs {
+		device := types.MustNewDeviceFromBytes(kv.Value)
+		devices[i] = types.LocalSnapshotDevice{Device: *device, Keys: keysByDevice[device.ID]}
+	}
+	return devices, nil
+}
+
+// Both reads are issued before either is awaited; keys are nil for a missing device
+func (d *DevicesDirectory) TxnGetDeviceWithKeys(
+	txn fdb.ReadTransaction,
+	userID id.UserID,
+	deviceID id.DeviceID,
+) (*types.Device, types.SignedDeviceKeys, error) {
+	deviceFuture := txn.Get(d.keyForDevice(userID, deviceID))
+	keysFuture := txn.Get(d.keyForDeviceKeys(userID, deviceID))
+
+	deviceBytes, err := deviceFuture.Get()
+	if err != nil || deviceBytes == nil {
+		return nil, types.SignedDeviceKeys{}, err
+	}
+	device, err := types.NewDeviceFromBytes(deviceBytes)
+	if err != nil {
+		return nil, types.SignedDeviceKeys{}, err
+	}
+	keysBytes, err := keysFuture.Get()
+	if err != nil {
+		return device, types.SignedDeviceKeys{}, err
+	}
+	keys, err := types.ParseSignedJSON[mautrix.DeviceKeys](keysBytes)
+	return device, keys, err
 }
 
 func (d *DevicesDirectory) TxnSetDeviceLastSeen(txn fdb.Transaction, userID id.UserID, deviceID id.DeviceID, ip string, time time.Time) {

@@ -34,6 +34,13 @@ notifier:
 rooms:
   enabled: true
   defaultVersion: 11
+  # Small, so that Complement stages over several transactions and runs an artifact job for every
+  # resolution with conflicts.
+  stateBudget:
+    stagingBytes: 8192
+    inlineResolutionCandidates: 1
+    # Every resolution with conflicts reads its auth difference in a job
+    inlineResolutionStateTuples: 1
 accounts:
   enabled: true
 transient:

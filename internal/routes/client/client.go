@@ -2,6 +2,7 @@ package client
 
 import (
 	"net/http"
+	"slices"
 	"sync"
 
 	"github.com/go-chi/chi/v5"
@@ -15,6 +16,7 @@ import (
 	"github.com/beeper/babbleserv/internal/databases"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/notifier"
+	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
 
@@ -27,6 +29,7 @@ type ClientRoutes struct {
 	fclient     fclient.FederationClient
 	fedClient   *federation.Client
 	mediaClient *federation.Client
+	keysClient  *federation.Client
 	keyStore    *util.KeyStore
 	datastores  *util.Datastores
 	notifiers   *notifier.Notifiers
@@ -46,10 +49,18 @@ func NewClientRoutes(
 		Str("routes", "client").
 		Logger()
 
+	if !slices.Contains(supportedRoomVersions, cfg.Rooms.DefaultVersion) {
+		panic("unsupported default room version: " + cfg.Rooms.DefaultVersion)
+	}
+
 	mediaClient := federation.NewClient(fedClient.ServerName, fedClient.Key, federation.NewInMemoryCache())
 	mediaClient.UserAgent = fedClient.UserAgent
 	mediaClient.HTTP.Timeout = 0 // The media acquisition context covers network and storage work.
 	mediaClient.HTTP.Transport.(*federation.ServerResolvingTransport).Transport.MaxResponseHeaderBytes = 64 * 1024
+
+	// Shares the transport and its resolution cache, with a size limit of its own
+	keysClient := *fedClient
+	keysClient.ResponseSizeLimit = types.MaxRemoteKeyQueryResponseBytes
 
 	return &ClientRoutes{
 		log:         log,
@@ -58,6 +69,7 @@ func NewClientRoutes(
 		fclient:     fclient,
 		fedClient:   fedClient,
 		mediaClient: mediaClient,
+		keysClient:  &keysClient,
 		keyStore:    keyStore,
 		datastores:  datastores,
 		notifiers:   notifiers,
@@ -249,16 +261,20 @@ func (f *ClientRoutes) GetVersions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var supportedRoomVersions = []string{"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3capabilities
 func (f *ClientRoutes) GetCapabilities(w http.ResponseWriter, r *http.Request) {
+	available := make(map[string]mautrix.CapRoomVersionStability, len(supportedRoomVersions))
+	for _, roomVersion := range supportedRoomVersions {
+		available[roomVersion] = mautrix.CapRoomVersionStable
+	}
 	util.ResponseJSON(w, r, http.StatusOK, map[string]any{
 		"capabilities": mautrix.RespCapabilities{
 			ChangePassword: &mautrix.CapBooleanTrue{},
 			RoomVersions: &mautrix.CapRoomVersions{
-				Default: "11",
-				Available: map[string]mautrix.CapRoomVersionStability{
-					"11": mautrix.CapRoomVersionStable,
-				},
+				Default:   f.config.Rooms.DefaultVersion,
+				Available: available,
 			},
 		},
 	})

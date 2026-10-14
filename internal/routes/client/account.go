@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -44,9 +43,9 @@ type reqLogin struct {
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3login
 func (c *ClientRoutes) Login(w http.ResponseWriter, r *http.Request) {
-	var req reqLogin
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
+	req, respErr := util.ParseRequestJSON[reqLogin](r)
+	if respErr != nil {
+		util.ResponseErrorJSON(w, r, *respErr)
 		return
 	}
 
@@ -237,7 +236,7 @@ func (c *ClientRoutes) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params, rawAuth, respErr := parseUIARequestBody(r, false)
+	params, rawAuth, respErr := parseUIARequestBody(w, r, false)
 	if respErr != nil {
 		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)
@@ -414,26 +413,16 @@ func respondPasswordUIA(w http.ResponseWriter, r *http.Request, session, errCode
 	})
 }
 
-func parseUIARequestBody(r *http.Request, allowEmpty bool) (json.RawMessage, json.RawMessage, *mautrix.RespError) {
-	var encoded json.RawMessage
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
-	if err != nil {
-		return nil, nil, &mautrix.MNotJSON
+// parseUIARequestBody splits a request body into its parameters and its auth. With allowEmpty a body
+// that is not JSON is taken as an empty object, as Synapse takes it for deleting a device.
+func parseUIARequestBody(w http.ResponseWriter, r *http.Request, allowEmpty bool) (json.RawMessage, json.RawMessage, *mautrix.RespError) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	encoded, respErr := util.ParseRequestJSON[json.RawMessage](r)
+	if respErr != nil && allowEmpty && respErr.ErrCode == mautrix.MNotJSON.ErrCode {
+		encoded, respErr = json.RawMessage("{}"), nil
 	}
-	if len(bodyBytes) > 64<<10 {
-		return nil, nil, &mautrix.MTooLarge
-	}
-	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
-	if err := decoder.Decode(&encoded); err != nil {
-		if allowEmpty && errors.Is(err, io.EOF) {
-			encoded = json.RawMessage("{}")
-		} else {
-			return nil, nil, &mautrix.MNotJSON
-		}
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, nil, &mautrix.MNotJSON
+	if respErr != nil {
+		return nil, nil, respErr
 	}
 	var body map[string]any
 	objectDecoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -580,7 +569,7 @@ func (c *ClientRoutes) logout(w http.ResponseWriter, r *http.Request, all bool) 
 }
 
 func (c *ClientRoutes) Refresh(w http.ResponseWriter, r *http.Request) {
-	body, _, parseErr := parseUIARequestBody(r, false)
+	body, _, parseErr := parseUIARequestBody(w, r, false)
 	if parseErr != nil {
 		if parseErr.ErrCode == mautrix.MTooLarge.ErrCode {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, parseErr)
@@ -611,7 +600,7 @@ func (c *ClientRoutes) Refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ClientRoutes) ChangePassword(w http.ResponseWriter, r *http.Request) {
-	params, rawAuth, respErr := parseUIARequestBody(r, false)
+	params, rawAuth, respErr := parseUIARequestBody(w, r, false)
 	if respErr != nil {
 		if respErr.ErrCode == mautrix.MTooLarge.ErrCode {
 			util.ResponseJSON(w, r, http.StatusRequestEntityTooLarge, respErr)

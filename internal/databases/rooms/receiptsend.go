@@ -3,7 +3,6 @@ package rooms
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -34,9 +33,7 @@ func (r *RoomsDatabase) SendReceipts(
 	roomID id.RoomID,
 	rcs []*types.Receipt,
 ) (*SendReceiptsResults, error) {
-	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
-	lock.Lock()
-	defer lock.Unlock()
+	defer r.lockRoom(roomID)()
 
 	if len(rcs) >= types.MaxVersionstampUserVersion {
 		// Very unlikely! But safety first
@@ -54,12 +51,20 @@ func (r *RoomsDatabase) SendReceipts(
 		allowedReceipts := make([]*types.Receipt, 0, len(rcs))
 		rejectedReceipts := make([]RejectedReceipt, 0)
 
-		for i, rc := range rcs {
+		userIDs := make([]id.UserID, 0, len(rcs))
+		for _, rc := range rcs {
 			if rc.RoomID != roomID {
 				panic("wrong room id provided")
 			}
+			userIDs = append(userIDs, rc.UserID)
+		}
+		joined, err := r.txnUsersJoined(txn, roomID, userIDs)
+		if err != nil {
+			return nil, err
+		}
 
-			if !r.users.TxnIsUserJoinedRoom(txn, rc.UserID, rc.RoomID) {
+		for i, rc := range rcs {
+			if !joined[rc.UserID] {
 				// Change from spec: silently ignore receipts for rooms the user is not a member of
 				log.Warn().
 					Stringer("user_id", rc.UserID).

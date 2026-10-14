@@ -2,8 +2,10 @@ package types
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"slices"
+	"strings"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/rs/zerolog"
@@ -74,11 +76,38 @@ type StateTup struct {
 	StateKey string     `json:"state_key"`
 }
 
+func MemberStateTup(userID id.UserID) StateTup {
+	return StateTup{Type: event.StateMember, StateKey: userID.String()}
+}
+
+// Compare orders state tuples by type, then state key
+func (tup StateTup) Compare(other StateTup) int {
+	return cmp.Or(strings.Compare(tup.Type.Type, other.Type.Type), strings.Compare(tup.StateKey, other.StateKey))
+}
+
 func (tup StateTup) MarshalText() ([]byte, error) {
 	if tup.StateKey == "" {
 		return []byte(tup.Type.String()), nil
 	}
 	return []byte(tup.Type.String() + "/" + tup.StateKey), nil
+}
+
+// TupleElements are the type and state key as FoundationDB tuple elements, read back with
+// StateTupFromElements.
+func (tup StateTup) TupleElements() tuple.Tuple {
+	return tuple.Tuple{tup.Type.String(), tup.StateKey}
+}
+
+func StateTupFromElements(elements tuple.Tuple) (StateTup, bool) {
+	if len(elements) != 2 {
+		return StateTup{}, false
+	}
+	evType, typeOK := elements[0].(string)
+	stateKey, stateKeyOK := elements[1].(string)
+	if !typeOK || !stateKeyOK {
+		return StateTup{}, false
+	}
+	return StateTup{Type: event.NewEventType(evType), StateKey: stateKey}, true
 }
 
 type EventStateTup struct {
@@ -110,21 +139,6 @@ func (s StateMap) ToTups() []EventStateTup {
 	return tups
 }
 
-func EventStateTupToBytes(tup EventStateTup) []byte {
-	return tuple.Tuple{tup.EventID.String(), tup.Type.String(), tup.StateKey}.Pack()
-}
-
-func BytesToEventStateTup(b []byte) EventStateTup {
-	tup, _ := tuple.Unpack(b)
-	return EventStateTup{
-		EventID: id.EventID(tup[0].(string)),
-		StateTup: StateTup{
-			Type:     event.NewEventType(tup[1].(string)),
-			StateKey: tup[2].(string),
-		},
-	}
-}
-
 // Membership tuples defined as (eventID, roomID, membership)
 type MembershipTup struct {
 	EventID    id.EventID       `json:"event_id"`
@@ -150,9 +164,35 @@ func MembershipTupToBytes(tup MembershipTup) []byte {
 
 func BytesToMembershipTup(b []byte) MembershipTup {
 	tup, _ := tuple.Unpack(b)
+	return membershipTupOf(tup)
+}
+
+func membershipTupOf(tup tuple.Tuple) MembershipTup {
 	return MembershipTup{
 		EventID:    id.EventID(tup[0].(string)),
 		RoomID:     id.RoomID(tup[1].(string)),
 		Membership: event.Membership(tup[2].(string)),
 	}
+}
+
+// MembershipRow is a local user's membership row of a room, marking an outlier membership received
+// while this server is out of the room.
+type MembershipRow struct {
+	MembershipTup
+	Outlier bool
+}
+
+// MembershipRowToBytes packs (event_id, room_id, membership), and true after them for an outlier
+// membership
+func MembershipRowToBytes(row MembershipRow) []byte {
+	tup := tuple.Tuple{row.EventID.String(), row.RoomID.String(), string(row.Membership)}
+	if row.Outlier {
+		tup = append(tup, true)
+	}
+	return tup.Pack()
+}
+
+func BytesToMembershipRow(b []byte) MembershipRow {
+	tup, _ := tuple.Unpack(b)
+	return MembershipRow{MembershipTup: membershipTupOf(tup), Outlier: len(tup) > 3 && tup[3] == true}
 }

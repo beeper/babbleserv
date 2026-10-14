@@ -43,14 +43,15 @@ func (r *RoomsDatabase) SetRoomPublished(
 			return nil, types.ErrRoomNotFound
 		}
 		room := types.MustNewRoomFromBytes(roomBytes, roomID)
-		if !r.users.TxnIsUserJoinedRoom(txn, userID, roomID) {
+		if joined, err := r.txnUsersJoined(txn, roomID, []id.UserID{userID}); err != nil {
+			return nil, err
+		} else if !joined[userID] {
 			return nil, types.ErrRoomPublicationForbidden
 		}
-		eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
-		createEvent := r.events.TxnGetCurrentRoomStateEvent(txn, roomID, types.StateTup{
-			Type: event.StateCreate,
-		}, eventsProvider)
-		if createEvent == nil || createEvent.Sender != userID {
+		createEvents, err := r.txnRoomStateEvents(ctx, txn, roomID, []types.StateTup{{Type: event.StateCreate}})
+		if err != nil {
+			return nil, err
+		} else if len(createEvents) == 0 || createEvents[0].Sender != userID {
 			return nil, types.ErrRoomPublicationForbidden
 		}
 

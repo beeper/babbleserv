@@ -12,6 +12,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/subspace"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
 	"maunium.net/go/mautrix/id"
@@ -20,6 +21,7 @@ import (
 	"github.com/beeper/babbleserv/internal/databases/rooms/events"
 	"github.com/beeper/babbleserv/internal/databases/rooms/receipts"
 	"github.com/beeper/babbleserv/internal/databases/rooms/servers"
+	"github.com/beeper/babbleserv/internal/databases/rooms/state"
 	"github.com/beeper/babbleserv/internal/databases/rooms/users"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
@@ -38,6 +40,7 @@ type RoomsDatabase struct {
 	users    *users.UsersDirectory
 	servers  *servers.ServersDirectory
 	receipts *receipts.ReceiptsDirectory
+	state    *state.StateDirectory
 
 	// Room ID to bytes we decode to `*types.Room` items
 	idToRoom subspace.Subspace
@@ -45,8 +48,14 @@ type RoomsDatabase struct {
 	// Room ID to depth int64
 	idToDepth subspace.Subspace
 
-	// Room ID to tuple.Versionstamp of the most recent receipt or event in the room
+	// Room ID to tuple.Versionstamp of the most recent event or receipt in the room
 	idToVersion subspace.Subspace
+
+	// Joined members of this server by room
+	//
+	// key: (RoomID, UserID)
+	// value: types.MembershipTup
+	localMembers subspace.Subspace
 
 	// Aliases to room IDs (and owner to authz delete)
 	//
@@ -72,6 +81,8 @@ type RoomsDatabase struct {
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
 	roomLocks *exsync.Map[id.RoomID, *sync.Mutex]
+	// Serializes this process's remote joins to a room, see lockJoin
+	joinLocks *exsync.Map[id.RoomID, chan struct{}]
 }
 
 func NewRoomsDatabase(
@@ -111,10 +122,13 @@ func NewRoomsDatabase(
 		users:    users.NewUsersDirectory(log, db, roomsDir),
 		servers:  servers.NewServersDirectory(log, db, roomsDir),
 		receipts: receipts.NewReceiptsDirectory(log, db, roomsDir),
+		state:    state.NewStateDirectory(log, db, roomsDir),
 
 		idToRoom:    roomsDir.Sub("id"),
 		idToDepth:   roomsDir.Sub("idd"),
 		idToVersion: roomsDir.Sub("iev"),
+
+		localMembers: roomsDir.Sub("rlm"),
 
 		aliasToID:      roomsDir.Sub("aid"),
 		idAliases:      roomsDir.Sub("ida"),
@@ -124,6 +138,7 @@ func NewRoomsDatabase(
 		eventTransactionIDs: roomsDir.Sub("eti"),
 
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
+		joinLocks: exsync.NewMap[id.RoomID, chan struct{}](),
 	}
 }
 
@@ -137,6 +152,25 @@ func (r *RoomsDatabase) getTxnLogContext(ctx context.Context, name string) zerol
 		Str("transaction", name)
 }
 
+// lockRoom serializes this process's writes to a room until the returned func is called
+func (r *RoomsDatabase) lockRoom(roomID id.RoomID) (unlock func()) {
+	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
+	lock.Lock()
+	return lock.Unlock
+}
+
+// lockJoin serializes this process's remote joins to a room until the returned func is called, or
+// fails once ctx ends while it waits.
+func (r *RoomsDatabase) lockJoin(ctx context.Context, roomID id.RoomID) (unlock func(), err error) {
+	lock, _ := r.joinLocks.GetOrSet(roomID, make(chan struct{}, 1))
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for another join to the room: %w", ctx.Err())
+	}
+}
+
 func (r *RoomsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (*time.Time, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*time.Time, error) {
 		time := util.TxnGetTimeForVersion(txn, version)
@@ -144,7 +178,13 @@ func (r *RoomsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Ver
 	})
 }
 
-func (r *RoomsDatabase) GenerateRoomID(ctx context.Context) id.RoomID {
+// GenerateRoomID returns the ID of the room a local create event creates. A domainless room ID is
+// derived from the create event as SendLocalEvents stores it, so this fixes the create event's
+// timestamp, including across retries of the send.
+func (r *RoomsDatabase) GenerateRoomID(ctx context.Context, createEv *types.PartialEvent) (id.RoomID, error) {
+	if roomVersion := createRoomVersion(createEv); util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.DomainlessRoomIDs) {
+		return r.domainlessRoomID(createEv, roomVersion)
+	}
 	for {
 		rid := util.GenerateRandomStringBase32Hex(16)
 		roomID := id.RoomID("!" + rid + ":" + r.config.ServerName)
@@ -152,25 +192,33 @@ func (r *RoomsDatabase) GenerateRoomID(ctx context.Context) id.RoomID {
 		// Extremely unlikely but check the room ID isn't taken, the chance of this is incredibly
 		// small but nice to be sure.
 		if existing, err := r.GetRoom(ctx, roomID); err != nil {
-			panic(fmt.Errorf("failed to check for existing room: %w", err))
+			return "", fmt.Errorf("failed to check for existing room: %w", err)
 		} else if existing != nil {
 			zerolog.Ctx(ctx).Warn().Stringer("room_id", roomID).Msg("Generated duplicate roomID!")
 			continue
 		}
 
-		return roomID
+		return roomID, nil
 	}
+}
+
+func (r *RoomsDatabase) domainlessRoomID(createEv *types.PartialEvent, roomVersion string) (id.RoomID, error) {
+	now := time.Now()
+	if createEv.Timestamp == 0 {
+		createEv.Timestamp = now.UnixMilli()
+	}
+	// The first event of a room has no depth or prev events
+	create := newLocalEvent(createEv, roomVersion, 0, nil, now)
+	keyID, key := r.config.MustGetActiveSigningKey()
+	if err := util.HashAndSignEvent(create, r.config.ServerName, keyID, key); err != nil {
+		return "", err
+	}
+	return create.DomainlessRoomID(), nil
 }
 
 func (r *RoomsDatabase) GetRoom(ctx context.Context, roomID id.RoomID) (*types.Room, error) {
 	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*types.Room, error) {
-		key := r.KeyForRoom(roomID)
-		b := txn.Get(key).MustGet()
-		if b == nil {
-			return nil, nil
-		}
-		ev := types.MustNewRoomFromBytes(b, roomID)
-		return ev, nil
+		return roomOrNil(r.txnGetRoom(txn, roomID))
 	})
 }
 
@@ -190,6 +238,14 @@ func (r *RoomsDatabase) KeyForRoomVersion(roomID id.RoomID) fdb.Key {
 
 func (r *RoomsDatabase) KeyForRoomDepth(roomID id.RoomID) fdb.Key {
 	return r.idToDepth.Pack(tuple.Tuple{roomID.String()})
+}
+
+func (r *RoomsDatabase) keyForLocalMember(roomID id.RoomID, userID id.UserID) fdb.Key {
+	return r.localMembers.Pack(tuple.Tuple{roomID.String(), userID.String()})
+}
+
+func (r *RoomsDatabase) isLocalUser(userID id.UserID) bool {
+	return userID.Homeserver() == r.config.ServerName
 }
 
 func (r *RoomsDatabase) KeyForRoomAlias(roomAlias id.RoomAlias) fdb.Key {

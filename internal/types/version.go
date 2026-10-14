@@ -245,21 +245,24 @@ func VersionstampAfter(version tuple.Versionstamp) (tuple.Versionstamp, bool) {
 	return ZeroVersionstamp, false
 }
 
-// VersionstampBefore returns the largest versionstamp less than version, borrowing from the
-// transaction version so that VersionstampAfter maps the result back to version. Returns
-// ZeroVersionstamp, an open range start, when version has no predecessor.
-func VersionstampBefore(version tuple.Versionstamp) tuple.Versionstamp {
+// VersionstampBefore returns the greatest versionstamp less than version, borrowing from the
+// transaction version when the user version is 0, as the first event of a transaction has. Neither
+// the zero versionstamp nor an incomplete one has a predecessor.
+func VersionstampBefore(version tuple.Versionstamp) (tuple.Versionstamp, bool) {
+	if version == ZeroVersionstamp || IsIncompleteVersionstamp(version) {
+		return ZeroVersionstamp, false
+	}
 	if version.UserVersion > 0 {
 		version.UserVersion--
-		return version
+		return version, true
 	}
 	version.UserVersion = math.MaxUint16
 	for i := len(version.TransactionVersion) - 1; i >= 0; i-- {
 		if version.TransactionVersion[i] != 0 {
 			version.TransactionVersion[i]--
-			return version
+			return version, true
 		}
 		version.TransactionVersion[i] = math.MaxUint8
 	}
-	return ZeroVersionstamp
+	return ZeroVersionstamp, false
 }

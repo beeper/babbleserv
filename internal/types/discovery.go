@@ -43,7 +43,7 @@ type UserDirectoryResponse struct {
 	Results []*UserDirectoryCandidate `json:"results"`
 }
 
-// RemoteUserDirectorySource identifies the current remote membership event
+// RemoteUserDirectorySource identifies the current remote join event
 // which made a user known to this homeserver. SourceEventID acts as a stable
 // generation for pending profile refresh jobs. Profile is set when the source
 // membership is in a public or world-readable room, whose member event profile
@@ -51,7 +51,6 @@ type UserDirectoryResponse struct {
 type RemoteUserDirectorySource struct {
 	UserID        id.UserID
 	SourceEventID id.EventID
-	Joined        bool
 	Profile       *UserProfile
 }
 
