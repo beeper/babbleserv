@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sync"
 	"time"
 
@@ -27,8 +26,6 @@ import (
 var (
 	// Ends a unit of work early, its targets published, failed or replaced
 	errWorkDone = errors.New("the work's targets are done")
-	// Ends a round that held back work failing or that failed within the retry pause
-	errWorkHeld = errors.New("the job held back work that failed")
 	// Causes ending a job's context
 	errLeaseLost  = errors.New("the job's lock lease was lost")
 	errNoProgress = errors.New("the job made no progress for its lease timeout")
@@ -37,8 +34,7 @@ var (
 // A target whose work fails this many times, other than by its job ending, fails
 const maxTargetFailures = 3
 
-// The pause before work that failed runs again, and a job that stopped on an error, sooner than the
-// IngestJobWorker's scan
+// The pause before a job that stopped on an error runs again, sooner than the IngestJobWorker's scan
 const jobRetryPause = 10 * time.Second
 
 func lockName(roomID id.RoomID) string {
@@ -134,16 +130,12 @@ func (j *Jobs) forget(roomID id.RoomID, runner *roomRunner) {
 
 // runRoom runs the room's job while this process can take its lock and work remains. Once the job
 // finished, a target written since starts it again: its writer may have failed to take the lock this
-// runner held, or asked this runner to run again. A job that held back failed work runs again at
-// once when asked to, for the targets written since, else after a pause, as does a job stopped by an
-// error, unless another runner took its lock.
+// runner held, or asked this runner to run again. A job stopped by an error runs again after a pause,
+// unless another runner took its lock.
 func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner) {
 	for {
 		finished, err := j.runOnce(ctx, roomID)
-		held := errors.Is(err, errWorkHeld)
-		if held {
-			zerolog.Ctx(ctx).Info().Err(err).Msg("Ingest job held back failed work, it runs again after a pause")
-		} else if err != nil {
+		if err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Ingest job stopped, it resumes later")
 		}
 		var restarted bool
@@ -152,7 +144,7 @@ func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner
 			restarted = err == nil && job != nil
 		}
 		j.mu.Lock()
-		again := finished && err == nil && (restarted || runner.again) || held && runner.again
+		again := finished && err == nil && (restarted || runner.again)
 		runner.again = false
 		if !again || ctx.Err() != nil {
 			delete(j.running, roomID)
@@ -309,10 +301,8 @@ func (run *jobRun) ended(ctx context.Context, err error) error {
 }
 
 // round publishes the targets a round collected, through the work the room version's strategy groups
-// them into. Work failing holds back its targets, and work whose targets failed within the retry
-// pause or cite a target held back is held back too, until a later round after the pause: asking
-// again at once, as each PDU enqueued meanwhile would, could fail the targets within seconds. The
-// rest of the work goes on.
+// them into. A unit of work failing ends the round, as later work can depend on it: the room's PDUs
+// wait for its joins.
 func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) error {
 	strategy, err := strategyFor(run.roomVersion)
 	if err != nil {
@@ -323,41 +313,12 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	held := make(map[id.EventID]struct{})
-	var errs []error
 	for _, work := range works {
-		if heldBack(work.targets(), held, now) {
-			hold(work.targets(), held)
-			continue
-		}
-		err := run.runWork(ctx, work)
-		if cause := context.Cause(ctx); cause != nil {
-			return cause
-		} else if err != nil {
-			errs = append(errs, err)
-			hold(work.targets(), held)
+		if err := run.runWork(ctx, work); err != nil {
+			return err
 		}
 	}
-	if len(held) == 0 {
-		return nil
-	} else if len(errs) == 0 {
-		return fmt.Errorf("%w: %d targets", errWorkHeld, len(held))
-	}
-	return fmt.Errorf("%w: %d targets: %w", errWorkHeld, len(held), errors.Join(errs...))
-}
-
-// heldBack reports whether a target of work failed within the retry pause or cites one held back
-func heldBack(targets []*types.IngestTarget, held map[id.EventID]struct{}, now time.Time) bool {
-	return slices.ContainsFunc(targets, func(target *types.IngestTarget) bool {
-		return now.Sub(time.UnixMilli(target.FailedAt)) < jobRetryPause || citesAny(target.Event, held)
-	})
-}
-
-func hold(targets []*types.IngestTarget, held map[id.EventID]struct{}) {
-	for _, target := range targets {
-		held[target.Event.ID] = struct{}{}
-	}
+	return nil
 }
 
 // runWork runs a unit of work through its phases. A failure counts against its targets, unless the
@@ -396,11 +357,9 @@ func (run *jobRun) countFailure(ctx context.Context, targets []*types.IngestTarg
 	// The work's context may have ended, as its watchdog ends it
 	ctx = context.WithoutCancel(ctx)
 	zerolog.Ctx(ctx).Warn().Err(cause).Int("targets", len(targets)).Msg("Ingest work failed")
-	now := time.Now().UnixMilli()
 	for _, target := range targets {
 		before, err := run.jobs.db.Rooms.UpdateIngestTarget(ctx, run.roomID, target.Event.ID, func(target *types.IngestTarget) {
 			target.Failures++
-			target.FailedAt = now
 		})
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to count an ingest target's failure")

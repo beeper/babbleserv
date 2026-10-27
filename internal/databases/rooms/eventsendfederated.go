@@ -599,7 +599,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	plan.stateSteps = current.steps
 	if len(s.options.Targets) > 0 {
 		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
-			return s.r.txnClearPublishedTargets(txn, s.roomID, plan.evs, s.options.Targets)
+			return s.r.txnClearPublishedTargets(txn, plan.evs, s.options.Targets)
 		}
 	}
 	return readyToPublish{plan: plan}, nil

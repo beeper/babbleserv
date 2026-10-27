@@ -2,12 +2,11 @@ package ingest
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,7 +102,7 @@ func testTarget(kind types.IngestTargetKind, eventID id.EventID, enqueued int64)
 	return &types.IngestTarget{Kind: kind, Event: ev, Enqueued: enqueued}
 }
 
-func TestLegacyWorksRunJoinsOldestFirst(t *testing.T) {
+func TestLegacyWorksRunJoinsOldestFirstThenThePDUs(t *testing.T) {
 	joins, pdus := splitTargets([]*types.IngestTarget{
 		testTarget(types.IngestTargetPDU, "$pdu2", 5),
 		testTarget(types.IngestTargetJoin, "$join2", 3),
@@ -111,24 +110,16 @@ func TestLegacyWorksRunJoinsOldestFirst(t *testing.T) {
 		testTarget(types.IngestTargetJoin, "$join1", 1),
 		testTarget(types.IngestTargetPDU, "$pdu0", 2),
 	})
-	citesJoin := testTarget(types.IngestTargetPDU, "$citesJoin", 6)
-	citesJoin.Event.PrevEventIDs = []id.EventID{"$join1"}
-	citesThat := testTarget(types.IngestTargetPDU, "$citesThat", 7)
-	citesThat.Event.PrevEventIDs = []id.EventID{"$citesJoin"}
-
 	run := &jobRun{}
-	works := legacyWorks(run, joins, pdus[1:], []*types.IngestTarget{pdus[0], citesJoin, citesThat}, true)
-	require.Len(t, works, 5)
-	assert.Equal(t, []id.EventID{"$pdu1", "$pdu2"}, targetIDs(works[0].targets()),
-		"in a room this server is in, connected PDUs go first, together")
-	assert.False(t, works[0].(*legacyPDUs).gap)
-	assert.Equal(t, []id.EventID{"$pdu0"}, targetIDs(works[1].targets()), "then those with a gap")
-	assert.True(t, works[1].(*legacyPDUs).gap)
-	assert.Equal(t, []id.EventID{"$join1"}, targetIDs(works[2].targets()), "then the joins, oldest first")
-	assert.Equal(t, []id.EventID{"$join2"}, targetIDs(works[3].targets()))
-	assert.Equal(t, []id.EventID{"$citesJoin", "$citesThat"}, targetIDs(works[4].targets()),
-		"PDUs citing a pending join, or one citing it, go after the joins")
-	assert.True(t, works[4].(*legacyPDUs).gap)
+	works := legacyWorks(run, joins, pdus[1:], pdus[:1], true)
+	require.Len(t, works, 4)
+	assert.Equal(t, []id.EventID{"$join1"}, targetIDs(works[0].targets()))
+	assert.Equal(t, []id.EventID{"$join2"}, targetIDs(works[1].targets()))
+	assert.Equal(t, []id.EventID{"$pdu1", "$pdu2"}, targetIDs(works[2].targets()),
+		"connected PDUs go together after the joins")
+	assert.False(t, works[2].(*legacyPDUs).gap)
+	assert.Equal(t, []id.EventID{"$pdu0"}, targetIDs(works[3].targets()), "then those with a gap")
+	assert.True(t, works[3].(*legacyPDUs).gap)
 
 	works = legacyWorks(run, joins, nil, nil, false)
 	assert.Len(t, works, 2, "while this server is not in the room, PDUs wait for its joins")
@@ -182,36 +173,28 @@ func TestSplitConnectedNeedsTheImplicitCreateEvent(t *testing.T) {
 }
 
 func TestRefusedRequest(t *testing.T) {
-	answered := func(code int, wrapped error) error {
-		return fmt.Errorf("get_missing_events: %w", mautrix.HTTPError{Response: &http.Response{StatusCode: code}, WrappedError: wrapped})
+	answered := func(code int) error {
+		return fmt.Errorf("get_missing_events: %w", mautrix.HTTPError{Response: &http.Response{StatusCode: code}})
 	}
-	assert.True(t, refusedRequest(answered(http.StatusNotFound, nil)))
-	assert.True(t, refusedRequest(answered(http.StatusForbidden, nil)))
-	assert.True(t, refusedRequest(answered(http.StatusOK, &json.SyntaxError{})), "a response that is not JSON")
-	assert.True(t, refusedRequest(answered(http.StatusOK, &json.UnmarshalTypeError{})), "JSON that is not what was asked")
-	assert.True(t, refusedRequest(answered(http.StatusOK, mautrix.ErrBodyReadReachedLimit)), "a response too large")
-	assert.True(t, refusedRequest(answered(http.StatusOK, fmt.Errorf("%w (600 MiB)", mautrix.ErrResponseTooLong))))
-	assert.False(t, refusedRequest(answered(http.StatusOK, context.DeadlineExceeded)),
-		"a response whose body timed out on its way")
-	assert.False(t, refusedRequest(answered(http.StatusOK, io.ErrUnexpectedEOF)), "a connection cut off mid-body")
-	assert.False(t, refusedRequest(answered(http.StatusTooManyRequests, nil)))
-	assert.False(t, refusedRequest(answered(http.StatusBadGateway, nil)))
+	assert.True(t, refusedRequest(answered(http.StatusNotFound)))
+	assert.True(t, refusedRequest(answered(http.StatusForbidden)))
+	assert.True(t, refusedRequest(answered(http.StatusOK)), "a response that is not the JSON asked for")
+	assert.False(t, refusedRequest(answered(http.StatusTooManyRequests)))
+	assert.False(t, refusedRequest(answered(http.StatusBadGateway)))
 	assert.False(t, refusedRequest(mautrix.HTTPError{Message: "request error", WrappedError: context.DeadlineExceeded}),
 		"no response, as a timeout or a broken connection")
 	assert.False(t, refusedRequest(errors.New("failed to verify")))
 }
 
 func TestChunkPDUs(t *testing.T) {
-	const evSize = 100
 	var pdus []*types.IngestTarget
 	for i := range 7 {
-		pdu := testTarget(types.IngestTargetPDU, id.EventID(fmt.Sprintf("$pdu%d", i)), int64(i))
-		pdu.Size = evSize
-		pdus = append(pdus, pdu)
+		pdus = append(pdus, testTarget(types.IngestTargetPDU, id.EventID(fmt.Sprintf("$pdu%d", i)), int64(i)))
 	}
 	big := testTarget(types.IngestTargetPDU, "$big", 7)
-	big.Size = 5 * evSize
+	big.Event.Content = []byte(`{"body":"` + strings.Repeat("x", 500) + `"}`)
 	pdus = append(pdus, big)
+	evSize := len(pdus[0].Event.ToMsgpack())
 
 	chunks := chunkPDUs(pdus, 3, 4*evSize)
 	var sizes []int
@@ -257,41 +240,6 @@ func TestGapFillServers(t *testing.T) {
 	servers := gapFillServers([]string{"origin.example"}, many, "self.example")
 	assert.Len(t, servers, maxGapFillServers, "a large room's servers are not all asked")
 	assert.Equal(t, "origin.example", servers[0])
-}
-
-func TestHoldUnanswered(t *testing.T) {
-	pdus := []*types.IngestTarget{
-		gapTarget("$filled", "a.example", "$pulled"),
-		gapTarget("$unanswered", "a.example", "$missing"),
-		gapTarget("$citesUnanswered", "a.example", "$unanswered"),
-		gapTarget("$citesFilled", "a.example", "$filled"),
-	}
-	sent, held := holdUnanswered(pdus, map[id.EventID]struct{}{"$unanswered": {}})
-	assert.Equal(t, []id.EventID{"$filled", "$citesFilled"}, targetIDs(sent))
-	assert.Equal(t, []id.EventID{"$unanswered", "$citesUnanswered"}, targetIDs(held),
-		"a PDU citing one held back would be dropped for its missing prev")
-
-	sent, held = holdUnanswered(pdus, nil)
-	assert.Len(t, sent, 4)
-	assert.Empty(t, held)
-}
-
-func TestHeldBackWithinTheRetryPause(t *testing.T) {
-	now := time.UnixMilli(1_000_000)
-	failed := testTarget(types.IngestTargetPDU, "$failed", 1)
-	failed.FailedAt = now.Add(-time.Second).UnixMilli()
-	dependent := gapTarget("$dependent", "a.example", "$failed")
-	other := testTarget(types.IngestTargetPDU, "$other", 2)
-
-	held := make(map[id.EventID]struct{})
-	assert.True(t, heldBack([]*types.IngestTarget{other, failed}, held, now),
-		"work whose target failed seconds ago is not asked again, as each PDU enqueued would")
-	hold([]*types.IngestTarget{other, failed}, held)
-	assert.True(t, heldBack([]*types.IngestTarget{dependent}, held, now), "nor work citing it")
-
-	assert.False(t, heldBack([]*types.IngestTarget{other}, map[id.EventID]struct{}{}, now))
-	assert.False(t, heldBack([]*types.IngestTarget{failed}, map[id.EventID]struct{}{}, now.Add(jobRetryPause)),
-		"after the pause it runs again")
 }
 
 func stateEvent(evType event.Type, stateKey, content string) *types.Event {

@@ -45,7 +45,6 @@ type respTransaction struct {
 }
 
 func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Request) {
-	arrived := time.Now()
 	var req reqTransaction
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		util.ResponseErrorJSON(w, r, mautrix.MNotJSON)
@@ -74,13 +73,23 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 
 	log.Debug().Msg("Processing incoming federation transaction")
 
+	var wg sync.WaitGroup
 	var resp *respTransaction
-	pduErr, eduErr := runTransaction(&log, func(admitted *admission) (err error) {
-		resp, err = f.processTransactionPDUs(r, arrived, req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
-		return err
-	}, func() error {
-		return f.processTransactionEDUs(r, req.Origin, req.EDUs)
+	var pduErr, eduErr error
+
+	admitted := newAdmission()
+	wg.Go(func() {
+		defer admitted.resolve(false)
+		defer util.RecoverPanic(&log, &pduErr)
+		resp, pduErr = f.processTransactionPDUs(r, req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
 	})
+	wg.Go(func() {
+		defer util.RecoverPanic(&log, &eduErr)
+		if admitted.wait() {
+			eduErr = f.processTransactionEDUs(r, req.Origin, req.EDUs)
+		}
+	})
+	wg.Wait()
 
 	if errors.Is(pduErr, errQueueFull) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MLimitExceeded, "Too many events of a room are waiting to be processed")
@@ -96,28 +105,6 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 
 	log.Info().Msg("Processed incoming federation transaction")
 	util.ResponseJSON(w, r, http.StatusOK, resp)
-}
-
-// runTransaction processes a transaction's PDUs and EDUs concurrently, the EDUs once the PDUs admit
-// them: at once for a transaction whose PDUs cannot wait on a room's ingest queue, else once the PDUs
-// succeeded. A transaction failing is sent again whole, so its EDUs are left for then rather than
-// processed twice.
-func runTransaction(log *zerolog.Logger, pdus func(*admission) error, edus func() error) (pduErr, eduErr error) {
-	admitted := newAdmission()
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		defer func() { admitted.resolve(pduErr == nil) }()
-		defer util.RecoverPanic(log, &pduErr)
-		pduErr = pdus(admitted)
-	})
-	wg.Go(func() {
-		defer util.RecoverPanic(log, &eduErr)
-		if admitted.wait() {
-			eduErr = edus()
-		}
-	})
-	wg.Wait()
-	return pduErr, eduErr
 }
 
 const remoteDeviceIngestConcurrency = 4
@@ -414,7 +401,6 @@ func (p *pduRooms) invitedVersion(ev *types.Event) (string, error) {
 
 func (f *FederationRoutes) processTransactionPDUs(
 	r *http.Request,
-	arrived time.Time,
 	origin string,
 	pdus []*types.Event,
 	admitted *admission,
@@ -470,25 +456,27 @@ func (f *FederationRoutes) processTransactionPDUs(
 		roomToEvs[verifiedEv.RoomID] = append(roomToEvs[verifiedEv.RoomID], verifiedEv)
 	}
 
-	waits := f.waitForQueues(r, txnRooms, roomToEvs, arrived.Add(f.config.Rooms.Ingest.QueueWait))
+	waits := f.waitForQueues(r, txnRooms, roomToEvs, admitted)
 
 	var wg sync.WaitGroup
 	resultsCh := make(chan *rooms.SendEventsResult, len(roomToEvs))
-	errsCh := make(chan error, len(roomToEvs))
 
 	for roomID, evs := range roomToEvs {
 		room := txnRooms.rooms[roomID]
 		wg.Go(func() {
 			log := hlog.FromRequest(r).With().Stringer("room_id", roomID).Logger()
 			ctx := log.WithContext(r.Context())
-			// A panic leaves the room's events out of the response rather than failing every
-			// transaction its sender sends with them
+			// A panic leaves the room's events out of the response, as an error does
 			defer util.RecoverPanic(&log, nil)
 			results, err := f.processRoomPDUs(ctx, origin, roomID, room, waits[roomID], evs)
 			if err != nil {
-				log.Err(err).Msg("Failed to enqueue federated events for the room's ingest job")
-				errsCh <- fmt.Errorf("%s: %w", roomID, err)
-			} else if results != nil {
+				// This is *BAD*, an unexpected error handling results for a room, we can't bail the
+				// request here as we'll poison other parallel room sends. So we just log and those
+				// of the events in question without results will not be in the response.
+				// Does this make other servers angry? Will they retry those events?
+				log.Err(err).Msg("Sending federated events failed")
+			}
+			if results != nil {
 				resultsCh <- results
 			}
 		})
@@ -496,20 +484,12 @@ func (f *FederationRoutes) processTransactionPDUs(
 
 	wg.Wait()
 	close(resultsCh)
-	close(errsCh)
-	// The transaction fails whole, its sender sending it again, with the EDUs left for then
 	for _, wait := range waits {
 		<-wait.done
+		// The transaction fails whole, as its EDUs were left for the sender to send again
 		if wait.err != nil {
 			return nil, wait.err
 		}
-	}
-	var errs []error
-	for err := range errsCh {
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
 	}
 
 	for results := range resultsCh {
@@ -538,10 +518,8 @@ func (f *FederationRoutes) processTransactionPDUs(
 // a job, every PDU waits for it, once the job's queue has room. Otherwise the PDUs citing only stored
 // events and each other publish now, unless a job starts meanwhile, and the rest are enqueued after
 // for the job to fill their gaps: enqueueing them first would start the job, which the publish would
-// then defer to. Should the split or the publish fail, every PDU is enqueued instead, so an error
-// returned is an enqueue's, which fails the transaction for its sender to send again. PDUs of a state
-// DAG room are sent at once, which drops them or keeps them as outlier memberships, see
-// rooms.ErrStateDAGFederation: no job ingests them yet.
+// then defer to. PDUs of a state DAG room are sent at once, which drops them or keeps them as outlier
+// memberships, see rooms.ErrStateDAGFederation: no job ingests them yet.
 func (f *FederationRoutes) processRoomPDUs(
 	ctx context.Context,
 	origin string,
@@ -550,13 +528,8 @@ func (f *FederationRoutes) processRoomPDUs(
 	wait *queueWait,
 	evs []*types.Event,
 ) (*rooms.SendEventsResult, error) {
-	log := zerolog.Ctx(ctx)
 	if slices.ContainsFunc(evs, (*types.Event).StateDAGs) {
-		results, err := f.db.SendFederatedEvents(ctx, roomID, evs, nil, rooms.SendFederatedEventsOptions{})
-		if err != nil {
-			log.Err(err).Msg("Sending federated events failed")
-		}
-		return results, nil
+		return f.db.SendFederatedEvents(ctx, roomID, evs, nil, rooms.SendFederatedEventsOptions{})
 	} else if wait != nil {
 		// A wait failing fails the whole transaction
 		<-wait.done
@@ -571,8 +544,7 @@ func (f *FederationRoutes) processRoomPDUs(
 	if room.joined {
 		var err error
 		if connected, rest, err = f.ingestJobs.SplitConnected(ctx, evs); err != nil {
-			log.Warn().Err(err).Msg("Failed to split federated events, enqueueing them all")
-			return f.enqueueRoomPDUs(ctx, origin, roomID, evs)
+			return nil, err
 		}
 	}
 	var results *rooms.SendEventsResult
@@ -581,11 +553,10 @@ func (f *FederationRoutes) processRoomPDUs(
 		results, err = f.db.SendFederatedEvents(ctx, roomID, connected, nil, rooms.SendFederatedEventsOptions{
 			RefuseWhileIngesting: true,
 		})
-		if err != nil {
-			if !errors.Is(err, rooms.ErrRoomIngesting) {
-				log.Warn().Err(err).Msg("Sending federated events failed, enqueueing them")
-			}
+		if errors.Is(err, rooms.ErrRoomIngesting) {
 			return f.enqueueRoomPDUs(ctx, origin, roomID, evs)
+		} else if err != nil {
+			return nil, err
 		}
 	}
 	if len(rest) == 0 {
@@ -593,7 +564,7 @@ func (f *FederationRoutes) processRoomPDUs(
 	}
 	queued, err := f.enqueueRoomPDUs(ctx, origin, roomID, rest)
 	if err != nil {
-		return nil, err
+		return results, err
 	} else if results == nil {
 		return queued, nil
 	}
@@ -623,8 +594,9 @@ var errQueueFull = errors.New("the room's ingest queue stayed full")
 // How often a full ingest queue is read again
 const queuePollInterval = time.Second
 
-// admission tells a transaction's EDUs whether its PDUs, which may wait on rooms' ingest queues and
-// fail the transaction, let them be processed
+// admission tells a transaction's EDUs whether its PDUs were let into their rooms. A transaction whose
+// PDUs for a room stayed out, its job's queue full, fails, and its sender sends it again whole, so its
+// EDUs are left for then rather than processed twice.
 type admission struct {
 	once sync.Once
 	done chan struct{}
@@ -654,12 +626,12 @@ type queueWait struct {
 }
 
 // waitForQueues waits, for each room with an ingest job that the transaction has PDUs for, until
-// the job's queue has room or the deadline passes. Other rooms' PDUs do not wait.
+// the job's queue has room, then resolves the transaction's admission. Other rooms' PDUs do not wait.
 func (f *FederationRoutes) waitForQueues(
 	r *http.Request,
 	txnRooms *pduRooms,
 	roomToEvs map[id.RoomID][]*types.Event,
-	deadline time.Time,
+	admitted *admission,
 ) map[id.RoomID]*queueWait {
 	waits := make(map[id.RoomID]*queueWait)
 	for roomID := range roomToEvs {
@@ -672,30 +644,37 @@ func (f *FederationRoutes) waitForQueues(
 			defer close(wait.done)
 			log := hlog.FromRequest(r).With().Stringer("room_id", roomID).Logger()
 			defer util.RecoverPanic(&log, &wait.err)
-			wait.err = f.waitForQueue(log.WithContext(r.Context()), roomID, deadline)
+			wait.err = f.waitForQueue(log.WithContext(r.Context()), roomID)
 		}()
 	}
+	go func() {
+		ok := true
+		for _, wait := range waits {
+			<-wait.done
+			ok = ok && wait.err == nil
+		}
+		admitted.resolve(ok)
+	}()
 	return waits
 }
 
 // waitForQueue waits until the room's job has room in its queue for more PDUs, failing with
-// errQueueFull once it stayed full until the deadline, which counts from the transaction's arrival,
-// so that its sender has an answer within the minute it waits
-func (f *FederationRoutes) waitForQueue(ctx context.Context, roomID id.RoomID, deadline time.Time) error {
+// errQueueFull once it stayed full for the configured wait
+func (f *FederationRoutes) waitForQueue(ctx context.Context, roomID id.RoomID) error {
 	cfg := f.config.Rooms.Ingest
+	ctx, cancel := context.WithTimeout(ctx, cfg.QueueWait)
+	defer cancel()
 	for waited := false; ; waited = true {
 		queue, err := f.db.Rooms.GetIngestQueue(ctx, roomID)
-		if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %s", errQueueFull, roomID)
+		} else if err != nil {
 			return err
 		} else if !queue.Full(cfg.MaxQueuedPDUs, cfg.MaxQueuedPDUBytes) {
 			if waited {
 				zerolog.Ctx(ctx).Info().Msg("Room's ingest queue has room again")
 			}
 			return nil
-		}
-		left := time.Until(deadline)
-		if left <= 0 {
-			return fmt.Errorf("%w: %s", errQueueFull, roomID)
 		} else if !waited {
 			zerolog.Ctx(ctx).Warn().
 				Int64("pdus", queue.PDUs).
@@ -703,9 +682,9 @@ func (f *FederationRoutes) waitForQueue(ctx context.Context, roomID id.RoomID, d
 				Msg("Room's ingest queue is full, waiting for it to drain")
 		}
 		select {
-		case <-time.After(min(queuePollInterval, left)):
+		case <-time.After(queuePollInterval):
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("%w: %s", errQueueFull, roomID)
 		}
 	}
 }

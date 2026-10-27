@@ -8,7 +8,6 @@ import (
 	"slices"
 
 	"github.com/matrix-org/gomatrixserverlib"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -44,8 +43,8 @@ func strategyFor(roomVersion string) (strategy, error) {
 }
 
 // legacyStrategy runs jobs of rooms without state DAGs, room versions 1 to 12: each join on the
-// remote join path, oldest first, and the PDUs as federated sends in chunks, those citing only stored
-// events and each other apart from those with gaps to fill
+// remote join path, oldest first, then the PDUs as federated sends in chunks: first those citing only
+// stored events and each other, then those with gaps to fill
 type legacyStrategy struct{}
 
 func (legacyStrategy) collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error) {
@@ -75,52 +74,23 @@ const (
 
 // legacyWorks are the units of work publishing a round's targets. While this server is not in the
 // room, the PDUs wait for a later round without joins: one whose join was replaced or found gone
-// publishes nothing, and the PDUs would be dropped as a room's this server is not in. In a room it is
-// in, a member's join is a whole send_join, so the PDUs go first but for those citing a pending join,
-// whose gap fill would pull the join from another server: connected PDUs cite none with a gap, and
-// the PDUs with gaps fill them before the joins.
+// publishes nothing, and the PDUs would be dropped as a room's this server is not in. Connected PDUs
+// cite none with a gap, so they go first, and a gap fill failing holds back only the PDUs it is for.
 func legacyWorks(run *jobRun, joins, connected, gaps []*types.IngestTarget, joined bool) []ingestWork {
 	works := make([]ingestWork, 0, len(joins)+2)
-	joinWorks := make([]ingestWork, len(joins))
-	for i, target := range joins {
-		joinWorks[i] = &legacyJoin{run: run, target: target}
+	for _, target := range joins {
+		works = append(works, &legacyJoin{run: run, target: target})
 	}
 	if len(joins) > 0 && !joined {
-		return joinWorks
+		return works
 	}
 	for _, chunk := range chunkPDUs(connected, maxPDUChunk, maxPDUChunkBytes) {
 		works = append(works, &legacyPDUs{run: run, pdus: chunk})
 	}
-	beforeJoins, afterJoins := splitCitingJoins(gaps, joins)
-	for _, chunk := range chunkPDUs(beforeJoins, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &legacyPDUs{run: run, pdus: chunk, gap: true})
-	}
-	works = append(works, joinWorks...)
-	for _, chunk := range chunkPDUs(afterJoins, maxPDUChunk, maxPDUChunkBytes) {
+	for _, chunk := range chunkPDUs(gaps, maxPDUChunk, maxPDUChunkBytes) {
 		works = append(works, &legacyPDUs{run: run, pdus: chunk, gap: true})
 	}
 	return works
-}
-
-// splitCitingJoins splits PDU targets in topological order into those citing neither a join target
-// nor a PDU citing one, and the rest, keeping the order in both
-func splitCitingJoins(pdus, joins []*types.IngestTarget) (independent, citing []*types.IngestTarget) {
-	if len(joins) == 0 {
-		return pdus, nil
-	}
-	citingIDs := make(map[id.EventID]struct{}, len(joins))
-	for _, join := range joins {
-		citingIDs[join.Event.ID] = struct{}{}
-	}
-	for _, target := range pdus {
-		if citesAny(target.Event, citingIDs) {
-			citingIDs[target.Event.ID] = struct{}{}
-			citing = append(citing, target)
-		} else {
-			independent = append(independent, target)
-		}
-	}
-	return independent, citing
 }
 
 // chunkPDUs splits PDU targets, in order, into chunks of at most maxCount targets and, past their
@@ -129,12 +99,13 @@ func chunkPDUs(pdus []*types.IngestTarget, maxCount, maxBytes int) [][]*types.In
 	var chunks [][]*types.IngestTarget
 	size := 0
 	for _, target := range pdus {
-		if n := len(chunks); n == 0 || len(chunks[n-1]) == maxCount || size+target.Size > maxBytes {
+		evSize := len(target.Event.ToMsgpack())
+		if n := len(chunks); n == 0 || len(chunks[n-1]) == maxCount || size+evSize > maxBytes {
 			chunks = append(chunks, nil)
 			size = 0
 		}
 		chunks[len(chunks)-1] = append(chunks[len(chunks)-1], target)
-		size += target.Size
+		size += evSize
 	}
 	return chunks
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"math/rand/v2"
 	"slices"
 	"time"
@@ -223,18 +222,27 @@ func (w *legacyJoin) verifyResponse(ctx context.Context, state, authChain gomatr
 // at prev events without it, asking each PDU's origin first, then the room's other servers. Phase C
 // sends them as federated events, dropping those still citing missing events as /send did before.
 type legacyPDUs struct {
-	run  *jobRun
-	pdus []*types.IngestTarget
-	gap  bool
-	fill *GapFill
+	run    *jobRun
+	pdus   []*types.IngestTarget
+	gap    bool
+	pulled []*types.Event
+	given  *rooms.GivenStates
 }
 
 func (w *legacyPDUs) targets() []*types.IngestTarget {
 	return w.pdus
 }
 
-// fetch fills the PDUs' gaps. A gap no server filled leaves its PDU to be dropped once every server
-// asked answered or refused, as asking again would not change it.
+func (w *legacyPDUs) events() []*types.Event {
+	evs := make([]*types.Event, len(w.pdus))
+	for i, target := range w.pdus {
+		evs[i] = target.Event
+	}
+	return evs
+}
+
+// fetch fills the PDUs' gap. A fill every server refused leaves the PDUs to be dropped, as asking
+// again would not change it; one failing otherwise fails the work, so that a later round asks again.
 func (w *legacyPDUs) fetch(ctx context.Context) error {
 	if !w.gap {
 		return nil
@@ -248,45 +256,34 @@ func (w *legacyPDUs) fetch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.fill, err = w.run.jobs.fetcher.GapFill(ctx, w.run.roomID, w.run.roomVersion, w.pdus, roomServers)
-	return err
+	var origins []string
+	for _, target := range w.pdus {
+		origins = append(origins, target.Servers...)
+	}
+	servers := gapFillServers(origins, roomServers, w.run.jobs.config.ServerName)
+	pulled, given, err := w.run.jobs.fetcher.GapFill(ctx, servers, w.run.roomID, w.run.roomVersion, w.events())
+	if errors.Is(err, errGapRefused) {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Servers refused the events the room's PDUs cite")
+		return nil
+	} else if err != nil {
+		return err
+	}
+	w.pulled, w.given = pulled, given
+	return nil
 }
 
 func (w *legacyPDUs) build(context.Context) error {
 	return nil
 }
 
-// publish sends the PDUs, but for those whose gap a server failed to answer for and those citing
-// them, which stay targets, failing the work for a later round to ask again
 func (w *legacyPDUs) publish(ctx context.Context) error {
-	var pulled []*types.Event
-	var given *rooms.GivenStates
-	sent, held := w.pdus, []*types.IngestTarget(nil)
-	if w.fill != nil {
-		pulled, given = w.fill.Pulled, w.fill.Given
-		sent, held = holdUnanswered(w.pdus, w.fill.Unanswered)
-	}
-	if len(sent) > 0 {
-		if err := w.send(ctx, pulled, given, sent); err != nil {
-			return err
-		}
-	}
-	if len(held) == 0 {
-		return nil
-	}
-	w.pdus = held
-	return fmt.Errorf("no server gave what %d PDUs cite: %w", len(held), errors.Join(w.fill.Errs...))
-}
-
-func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *rooms.GivenStates, targets []*types.IngestTarget) error {
-	pdus := make(map[id.EventID]types.IngestTargetKind, len(targets))
-	// Pulled events are older so go first, the send keeps the order of unrelated events
-	evs := slices.Clone(pulled)
-	for _, target := range targets {
+	pdus := make(map[id.EventID]types.IngestTargetKind, len(w.pdus))
+	for _, target := range w.pdus {
 		pdus[target.Event.ID] = types.IngestTargetPDU
-		evs = append(evs, target.Event)
 	}
-	res, err := w.run.jobs.db.SendFederatedEvents(ctx, w.run.roomID, evs, given, rooms.SendFederatedEventsOptions{Targets: pdus})
+	// Pulled events are older so go first, the send keeps the order of unrelated events
+	evs := slices.Concat(w.pulled, w.events())
+	res, err := w.run.jobs.db.SendFederatedEvents(ctx, w.run.roomID, evs, w.given, rooms.SendFederatedEventsOptions{Targets: pdus})
 	if err != nil {
 		return err
 	}
@@ -297,31 +294,7 @@ func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *roo
 	}
 	// What the publish did not clear: dropped events, and outlier memberships of a room this server
 	// is not in, which have no publish
-	return w.run.jobs.db.Rooms.ClearIngestTargets(ctx, w.run.roomID, targetIDs(targets))
-}
-
-// holdUnanswered splits PDU targets in topological order into those to send and those held back:
-// the unanswered and those citing a held one
-func holdUnanswered(pdus []*types.IngestTarget, unanswered map[id.EventID]struct{}) (sent, held []*types.IngestTarget) {
-	heldIDs := make(map[id.EventID]struct{}, len(unanswered))
-	maps.Copy(heldIDs, unanswered)
-	for _, target := range pdus {
-		if _, found := heldIDs[target.Event.ID]; found || citesAny(target.Event, heldIDs) {
-			heldIDs[target.Event.ID] = struct{}{}
-			held = append(held, target)
-		} else {
-			sent = append(sent, target)
-		}
-	}
-	return sent, held
-}
-
-func citesAny(ev *types.Event, eventIDs map[id.EventID]struct{}) bool {
-	cited := func(eventID id.EventID) bool {
-		_, found := eventIDs[eventID]
-		return found
-	}
-	return slices.ContainsFunc(ev.PrevEventIDs, cited) || slices.ContainsFunc(ev.AuthDependencyIDs(), cited)
+	return w.run.jobs.db.Rooms.ClearIngestTargets(ctx, w.run.roomID, targetIDs(w.pdus))
 }
 
 // Most servers a gap fill asks
