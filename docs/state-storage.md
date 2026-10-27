@@ -49,6 +49,8 @@ events/rmv / (room_id, versionstamp)     -> EventTup
 events/elv / (room_id, versionstamp)     -> EventTup
 events/rch / (room_id, versionstamp)     -> (context_id)
 events/rex / (room_id, event_id)         -> empty
+events/srx / (room_id, event_id)         -> versionstamp
+events/sdg / (room_id, versionstamp)     -> event_id
 ```
 
 `EventTup` is the tuple `(event_id, room_id, sender, event_type)`. Versionstamp values are also tuple-encoded.
@@ -62,18 +64,21 @@ The event body holds `BeforeState` (`bst`) and `AfterState` (`ast`). They descri
 | Rejected event evaluated with known state | B | B |
 | Soft-failed event | B | B with its tuple replaced, if it is a state event |
 | Outlier or event staged without state | Unknown | Unknown |
+| State event a state DAG room's ingest job replayed and has not published (`Unpublished`, `unp`) | B | B with its tuple replaced |
 
 The indexes have different purposes:
 
-- `etv` records storage of a non-outlier event. Staged, rejected and soft-failed events have it too; it does not imply that an event has contexts or appears in a timeline.
-- `evr` is the stream workers walk. Publication and outlier membership storage add rows; staging fetched events does not.
-- `rmv` is the room timeline; `elv` is its locally sent subset used for federation. Rejected and soft-failed events enter neither.
-- `rex` lists forward extremities. Accepted events replace the extremities they descend from.
+- `etv` records storage of a non-outlier event. Staged, rejected and soft-failed events have it too; it does not imply that an event has contexts or appears in a timeline. Publishing an event staged or replayed before writes it again, at the publication version.
+- `evr` is the stream workers walk. Publication and outlier membership storage add rows; staging fetched events and replaying them do not.
+- `rmv` is the room timeline; `elv` is its locally sent subset used for federation. Rejected and soft-failed events enter neither, nor do the state events a state DAG gap fill replayed, which publish as Synapse keeps the state events it fetches, out of the timeline.
+- `rex` lists forward extremities. Accepted events replace the extremities they descend from, but for the state events a state DAG gap fill replayed.
+- `srx` lists the state extremities of a state DAG room ([MSC4242](https://github.com/matrix-org/matrix-spec-proposals/pull/4242)), the tips of the DAG its state events form through `prev_state_events`. Only publication writes it: an accepted state event replaces the prev state events it cites, and messages, rejected and soft-failed events leave it alone. A local user's join publishing while this server is not in the room replaces every row with the join and the tips of the state DAG the resident served with it that the join does not cite, all at the join's version. No published event cites a state event replayed but not published yet, so a publish never adds an event something published cites already: the events an ingest job's replay gives contexts in a room this server is in are marked `Unpublished` in their bodies until the job publishes them, ahead of the events citing them, and the fast path, the federated pipeline and local sends never cite one. Current state is the after-context of the sole state extremity, or the resolution of all their after-contexts. The value is the version the event was published at: past the cap of 20 `prev_state_events`, local events cite the extremities published last, without reading their bodies, and received events citing more are dropped. Rooms of other versions have no rows.
+- `sdg` is a state DAG room's state DAG as other servers see it: every accepted state event, at the version it was published at, so in topological order. `send_join` serves a joining server the rows before its join's, neither the join nor what was published after it. Publication writes it, local and federated alike, and so does the replay of a join from outside the room, at the version of the transaction giving the event contexts, in topological order, as the resident server published those events; a replay the job publishes afterwards, of a gap fill or a member's join, leaves it to the publish. Staging never writes it: a joiner served an event no other server published would adopt state no one else has. Rejected events never enter it, so every event it holds cites only events it holds. Rooms of other versions have no rows.
 - `rch` records each change to current state at the version of the event causing it. A batch can write several rows. A historical lookup takes the last row at or before its version; the room has empty state before its first row.
 
 Versionstamps order publication and membership changes. They are distinct from context IDs: two versions can refer to the same state, and an event's after-context need not be the current context recorded at its publication version.
 
-Event bodies are not content-addressed immutable records. They can be rewritten when an outlier is published or a remote join accepts an event previously stored as rejected.
+Event bodies are not content-addressed immutable records. They can be rewritten when an outlier is published, a remote join accepts an event previously stored as rejected, a replay gives a staged event contexts, or a replayed event is published.
 
 ### Room record and membership indexes
 
@@ -112,11 +117,25 @@ Publication updates current state and the affected membership indexes in the sam
 
 **Room indexes.** `iev` lets sync skip unchanged rooms. `pub` orders published rooms by member count; storing a changed count moves the published-room key in the same transaction.
 
+### Ingest jobs
+
+```text
+ijb / room_id              -> IngestJob (msgpack)
+ijt / (room_id, event_id)  -> IngestTarget (msgpack)
+iju / (room_id, user_id)   -> IngestJoin (msgpack)
+ijq / (room_id, counter)   -> int64, little-endian
+bot / user_id              -> room_id
+```
+
+A room's ingest job (`ijb`) exists while it has targets (`ijt`) to publish: local users' joins to a room this server is not in, PDUs citing events not stored here, and the PDUs received meanwhile. `iju` names a local user's pending join, or why it failed, and is what the user's `/join` watches. `ijq` counts the queued PDU targets and their bytes, which `/send` reads to hold back a sender while the queue is full. `bot` records BabbleBot's direct message room with each user. [Ingest jobs](event-sending.md#ingest-jobs) has the rules their transactions keep. Until a join publishes, a room can have a job and targets but no room record; the job holds the room version.
+
 ### Auth graph
 
 An event's **auth chain** is the set of state events reached by following its `auth_events` references recursively: its direct auth events, their auth events, and so on. These are the events needed to check its authorization, including the authorization of those dependencies. For example, a message can reference the sender's joined membership and the room's power levels; the auth chain also includes the earlier events that authorized that membership and those power levels.
 
 In room v12, authorization also depends on the create event identified implicitly by the room ID. `AuthDependencyIDs` includes it for fetching and event ordering, but the auth-chain index follows only the explicit `auth_events` references.
+
+State DAG rooms (MSC4242) have no `auth_events` on the wire. An event's stored `AuthEventIDs` there are calculated from the state before it, by the same selection a v12 event cites, and the auth graph and chain cover are built from them as in v12. Serialization drops them, so hashes, signatures and other servers never see them. `AuthDependencyIDs` follows `prev_state_events` instead, so fetching and ordering follow the state DAG. An event a join or gap fill stages from another server's state DAG has an unfinalized header citing nothing until a replay gives it contexts and calculates its auth events, whose header then replaces the stored one (`AuthGraph.AddCalculated`); the federated pipeline does the same for an event it finds stored without state, which it evaluates as new. Publishing a replayed event keeps the header its replay finalized.
 
 Despite the name, an auth chain can branch and share ancestors: it is a graph, not necessarily a linear sequence. `auth_events` links describe authorization dependencies; `prev_events` links describe predecessors in the room's event DAG. Being an earlier event in the room does not by itself make an event part of the auth chain.
 

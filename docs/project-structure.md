@@ -52,6 +52,16 @@ Babbleserv is roughly divided in three:
 
 - asynchronous work after database changes, most as iterators over a database range, see [databases.md](databases.md#iterators-for-cross-database-transactions)
 
+### `internal/ingest/`
+
+- rooms' ingest jobs: local users' joins to rooms this server is not in, and the federated PDUs citing events it lacks, one job per room under an FDB lock, see [event-sending.md](event-sending.md#ingest-jobs)
+- fetches from other servers (`send_join`, gap fills, the state DAG of [MSC4242](https://github.com/matrix-org/matrix-spec-proposals/pull/4242) rooms) outside any transaction, then calls the rooms database to stage, replay and publish
+- `/join` and `/send` enqueue targets and run jobs; the `IngestJobWorker` resumes jobs whose runner stopped
+
+### `internal/babblebot/`
+
+- BabbleBot, a server-owned local user telling local users about work on their behalf in a direct message room with each, such as a join that takes a while
+
 ### `internal/stateres/`
 
 - state resolution v2 and v2.1 over the conflicting part of the states, see [event-sending.md](event-sending.md#state-resolution)
