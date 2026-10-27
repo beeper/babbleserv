@@ -899,3 +899,27 @@ func TestAuthHeaderCodecAndIncompleteGraph(t *testing.T) {
 	require.Equal(t, hs, again)
 	require.Empty(t, g.dirty)
 }
+
+// A state DAG event staged with no auth events takes those calculated when it is replayed, rather
+// than the unfinalized header stored for it, and its header is written whether finalized or not
+func TestAddCalculatedReplacesStoredHeaders(t *testing.T) {
+	s := newGraphStore()
+	create := s.addCreate()
+	s.finalize(t, create)
+	accepted, rejected := s.add(1, 1), s.add(2, 2)
+	s.headers[accepted], s.headers[rejected] = types.AuthHeader{}, types.AuthHeader{}
+
+	g := s.graph()
+	s.events[accepted].AuthEventIDs = []id.EventID{create}
+	s.events[rejected].AuthEventIDs = []id.EventID{create, accepted}
+	g.AddCalculated(s.events[accepted], s.events[rejected])
+	headers, err := g.Headers([]id.EventID{accepted})
+	require.NoError(t, err)
+	require.True(t, headers[0].Finalized())
+	require.Equal(t, []id.EventID{create}, headers[0].AuthEventIDs)
+	s.commit(g)
+
+	require.True(t, s.headers[accepted].Finalized())
+	require.False(t, s.headers[rejected].Finalized())
+	require.Equal(t, []id.EventID{create, accepted}, s.headers[rejected].AuthEventIDs, "an unfinalized header is rewritten too")
+}

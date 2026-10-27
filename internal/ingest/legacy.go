@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -28,38 +29,25 @@ const (
 	longestSendJoinRetryPause = 30 * time.Second
 )
 
-// legacyJoin is a local user's join to a room through a resident server, run on the remote join
-// path. Phase A sends the stored join event in a send_join, verifies the response and stages its
-// events; phase B builds the state before the join; phase C publishes it, as a member's join should
-// another have got this server into the room first.
-type legacyJoin struct {
+// joinWork is a local user's join to a room through a resident server, run on the remote join path
+// in phases B and C: build the state before the join, then publish it, as a member's join should
+// another have got this server into the room first. The room version's strategy fetches what the
+// join needs in phase A.
+type joinWork struct {
 	run    *jobRun
 	target *types.IngestTarget
 	join   *databases.RemoteJoin
 }
 
-func (w *legacyJoin) targets() []*types.IngestTarget {
+func (w *joinWork) targets() []*types.IngestTarget {
 	return []*types.IngestTarget{w.target}
 }
 
-func (w *legacyJoin) fetch(ctx context.Context) error {
-	stateEvs, authEvs, err := w.sendJoin(ctx)
-	if err != nil {
-		return err
-	}
-	w.run.setRoomName(roomDisplayName(stateEvs))
-	w.join, err = w.run.jobs.db.NewRemoteJoin(ctx, w.target.Event, util.EventsToIDs(stateEvs), slices.Concat(stateEvs, authEvs))
-	if err != nil {
-		return err
-	}
-	return w.refused(ctx, w.join.Stage(ctx))
-}
-
-func (w *legacyJoin) build(ctx context.Context) error {
+func (w *joinWork) build(ctx context.Context) error {
 	return w.refused(ctx, w.join.BuildState(ctx))
 }
 
-func (w *legacyJoin) publish(ctx context.Context) error {
+func (w *joinWork) publish(ctx context.Context) error {
 	res, err := w.join.Publish(ctx)
 	if err := w.refused(ctx, err); err != nil {
 		return err
@@ -77,11 +65,126 @@ func (w *legacyJoin) publish(ctx context.Context) error {
 }
 
 // refused fails the target on an error refusing the join, passing any other on
-func (w *legacyJoin) refused(ctx context.Context, err error) error {
+func (w *joinWork) refused(ctx context.Context, err error) error {
 	if errors.Is(err, rooms.ErrAuthStage4) || errors.Is(err, rooms.ErrAuthStage5) {
 		return w.run.fail(ctx, w.target, rejectedFailure(err))
 	}
 	return err
+}
+
+// errResendRefused is a server refusing a join an earlier send_join may have landed with
+var errResendRefused = errors.New("a server refused a join that may have landed")
+
+// mayLand records that the send_join about to be sent may land, returning the target as it was, or
+// errWorkDone once the target is gone
+func (w *joinWork) mayLand(ctx context.Context) (*types.IngestTarget, error) {
+	before, err := w.run.jobs.db.Rooms.UpdateIngestTarget(ctx, w.run.roomID, w.target.Event.ID, func(target *types.IngestTarget) {
+		target.MayHaveLanded = true
+	})
+	if err != nil {
+		return nil, err
+	} else if before == nil {
+		zerolog.Ctx(ctx).Debug().Stringer("event_id", w.target.Event.ID).Msg("Join target is gone, another runner published, failed or replaced it")
+		w.run.cancelNotice(w.target.Event.ID)
+		return nil, errWorkDone
+	}
+	return before, nil
+}
+
+// sendFailed handles a send_join that got no response, before being the target as it was before
+// the send. A server refusing the join fails it, unless an earlier send may have landed, which
+// returns errResendRefused. Otherwise it pauses before the next attempt, failing the join once it
+// timed out.
+func (w *joinWork) sendFailed(ctx context.Context, before *types.IngestTarget, server string, attempt int, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	log := zerolog.Ctx(ctx).With().
+		Stringer("event_id", w.target.Event.ID).
+		Err(err).
+		Str("server", server).
+		Int("attempt", attempt+1).
+		Logger()
+	switch classifySendJoinError(err) {
+	case sendJoinRefused:
+		if !before.MayHaveLanded {
+			log.Warn().Msg("Server refused the join")
+			return w.run.fail(ctx, w.target, failureFromError(err))
+		}
+		log.Warn().Msg("Server refused a join an earlier send_join may have landed with")
+		return fmt.Errorf("%w: %w", errResendRefused, err)
+	case sendJoinRateLimited:
+		if !before.MayHaveLanded {
+			if _, err := w.run.jobs.db.Rooms.UpdateIngestTarget(ctx, w.run.roomID, w.target.Event.ID, func(target *types.IngestTarget) {
+				target.MayHaveLanded = false
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	if time.Now().After(time.UnixMilli(w.target.Enqueued).Add(w.run.jobs.config.Rooms.Ingest.JoinTimeout)) {
+		log.Warn().Msg("Giving up sending the join")
+		return w.run.fail(ctx, w.target, unreachableFailure(err))
+	}
+	// Each attempt is bounded by the request's timeout, and JoinTimeout bounds them all
+	util.ReportProgress(ctx)
+	pause := sendJoinRetryPause(attempt)
+	log.Info().Dur("retry_in", pause).Msg("Failed to send the join, sending it again")
+	select {
+	case <-time.After(pause):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func sendJoinRetryPause(attempt int) time.Duration {
+	pause := min(firstSendJoinRetryPause<<min(attempt, 8), longestSendJoinRetryPause)
+	return pause/2 + rand.N(pause/2)
+}
+
+// replaceJoin replaces the target with a join from a fresh make_join, which the next round sends
+func (w *joinWork) replaceJoin(ctx context.Context, refusal error) error {
+	userID := id.UserID(*w.target.Event.StateKey)
+	joinEv, server, err := w.run.jobs.makeJoin(ctx, w.run.roomID, w.run.roomVersion, userID, w.target.Servers)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to make a fresh join")
+		return w.run.fail(ctx, w.target, failureFromError(refusal))
+	}
+	servers := slices.Concat([]string{server}, slices.DeleteFunc(slices.Clone(w.target.Servers), func(other string) bool {
+		return other == server
+	}))
+	if replaced, err := w.run.jobs.db.Rooms.ReplaceIngestJoin(ctx, w.target, joinEv, servers); err != nil {
+		return err
+	} else if !replaced {
+		// The user's iju no longer names the target, which would otherwise be refused again each round
+		return w.run.fail(ctx, w.target, failureFromError(refusal))
+	}
+	w.run.cancelNotice(w.target.Event.ID)
+	zerolog.Ctx(ctx).Info().
+		Stringer("event_id", w.target.Event.ID).
+		Stringer("new_event_id", joinEv.ID).
+		Msg("Replaced a join the resident server refused with a fresh one")
+	return errWorkDone
+}
+
+// legacyJoin is a join to a room without a state DAG. Phase A sends the stored join event in a
+// send_join, verifies the response and stages its events.
+type legacyJoin struct {
+	joinWork
+}
+
+func (w *legacyJoin) fetch(ctx context.Context) error {
+	stateEvs, authEvs, err := w.sendJoin(ctx)
+	if err != nil {
+		return err
+	}
+	w.run.setRoomName(roomDisplayName(stateEvs))
+	w.join, err = w.run.jobs.db.NewRemoteJoin(ctx, w.target.Event, util.EventsToIDs(stateEvs), slices.Concat(stateEvs, authEvs))
+	if err != nil {
+		return err
+	}
+	return w.refused(ctx, w.join.Stage(ctx))
 }
 
 // sendJoin sends the stored join event to a server of the room, and returns the verified state
@@ -89,67 +192,23 @@ func (w *legacyJoin) refused(ctx context.Context, err error) error {
 // times out. Should a server refuse a join an earlier send may have landed with, the state before
 // the join is fetched instead, or failing that the target replaced with a fresh join.
 func (w *legacyJoin) sendJoin(ctx context.Context) (stateEvs, authEvs []*types.Event, err error) {
-	ev := w.target.Event
-	log := zerolog.Ctx(ctx).With().Stringer("event_id", ev.ID).Logger()
-	timeout := time.UnixMilli(w.target.Enqueued).Add(w.run.jobs.config.Rooms.Ingest.JoinTimeout)
 	origin := spec.ServerName(w.run.jobs.config.ServerName)
 	for attempt := 0; ; attempt++ {
 		server := w.target.Servers[attempt%len(w.target.Servers)]
-		before, err := w.run.jobs.db.Rooms.UpdateIngestTarget(ctx, w.run.roomID, ev.ID, func(target *types.IngestTarget) {
-			target.MayHaveLanded = true
-		})
+		before, err := w.mayLand(ctx)
 		if err != nil {
 			return nil, nil, err
-		} else if before == nil {
-			log.Debug().Msg("Join target is gone, another runner published, failed or replaced it")
-			w.run.cancelNotice(ev.ID)
-			return nil, nil, errWorkDone
 		}
-
-		resp, err := w.run.jobs.fclient.SendJoin(ctx, origin, spec.ServerName(server), ev.PDU())
+		resp, err := w.run.jobs.fclient.SendJoin(ctx, origin, spec.ServerName(server), w.target.Event.PDU())
 		if err == nil {
 			util.ReportProgress(ctx)
 			return w.verifyResponse(ctx, resp.StateEvents, resp.AuthEvents)
-		} else if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		log := log.With().Err(err).Str("server", server).Int("attempt", attempt+1).Logger()
-		switch classifySendJoinError(err) {
-		case sendJoinRefused:
-			if !before.MayHaveLanded {
-				log.Warn().Msg("Server refused the join")
-				return nil, nil, w.run.fail(ctx, w.target, failureFromError(err))
-			}
-			log.Warn().Msg("Server refused a join an earlier send_join may have landed with")
+		} else if err := w.sendFailed(ctx, before, server, attempt, err); errors.Is(err, errResendRefused) {
 			return w.afterRefusedResend(ctx, err)
-		case sendJoinRateLimited:
-			if !before.MayHaveLanded {
-				if _, err := w.run.jobs.db.Rooms.UpdateIngestTarget(ctx, w.run.roomID, ev.ID, func(target *types.IngestTarget) {
-					target.MayHaveLanded = false
-				}); err != nil {
-					return nil, nil, err
-				}
-			}
-		}
-		if time.Now().After(timeout) {
-			log.Warn().Msg("Giving up sending the join")
-			return nil, nil, w.run.fail(ctx, w.target, unreachableFailure(err))
-		}
-		// Each attempt is bounded by the request's timeout, and JoinTimeout bounds them all
-		util.ReportProgress(ctx)
-		pause := sendJoinRetryPause(attempt)
-		log.Info().Dur("retry_in", pause).Msg("Failed to send the join, sending it again")
-		select {
-		case <-time.After(pause):
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+		} else if err != nil {
+			return nil, nil, err
 		}
 	}
-}
-
-func sendJoinRetryPause(attempt int) time.Duration {
-	pause := min(firstSendJoinRetryPause<<min(attempt, 8), longestSendJoinRetryPause)
-	return pause/2 + rand.N(pause/2)
 }
 
 // afterRefusedResend fetches the state before a join that may have landed from the target's servers,
@@ -172,37 +231,12 @@ func (w *legacyJoin) afterRefusedResend(ctx context.Context, refusal error) ([]*
 	return nil, nil, w.replaceJoin(ctx, refusal)
 }
 
-// replaceJoin replaces the target with a join from a fresh make_join, which the next round sends
-func (w *legacyJoin) replaceJoin(ctx context.Context, refusal error) error {
-	userID := id.UserID(*w.target.Event.StateKey)
-	joinEv, server, err := w.run.jobs.makeJoin(ctx, w.run.roomID, userID, w.target.Servers)
-	if err != nil {
-		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to make a fresh join")
-		return w.run.fail(ctx, w.target, failureFromError(refusal))
-	}
-	servers := slices.Concat([]string{server}, slices.DeleteFunc(slices.Clone(w.target.Servers), func(other string) bool {
-		return other == server
-	}))
-	if replaced, err := w.run.jobs.db.Rooms.ReplaceIngestJoin(ctx, w.target, joinEv, servers); err != nil {
-		return err
-	} else if !replaced {
-		// The user's iju no longer names the target, which would otherwise be refused again each round
-		return w.run.fail(ctx, w.target, failureFromError(refusal))
-	}
-	w.run.cancelNotice(w.target.Event.ID)
-	zerolog.Ctx(ctx).Info().
-		Stringer("event_id", w.target.Event.ID).
-		Stringer("new_event_id", joinEv.ID).
-		Msg("Replaced a join the resident server refused with a fresh one")
-	return errWorkDone
-}
-
 // verifyResponse verifies the events of a send_join response, skipping those failing, within the
 // size a join accepts
 func (w *legacyJoin) verifyResponse(ctx context.Context, state, authChain gomatrixserverlib.EventJSONs) ([]*types.Event, []*types.Event, error) {
 	limit := w.run.jobs.config.Rooms.Ingest.MaxJoinEvents
 	if count := len(state) + len(authChain); count > limit {
-		return nil, nil, w.run.fail(ctx, w.target, tooLargeFailure(count, limit))
+		return nil, nil, w.run.fail(ctx, w.target, tooLargeFailure("state and auth chain have", count, limit))
 	}
 	roomVersion := w.target.Event.RoomVersion
 	seenIDs := make(map[id.EventID]struct{}, len(state)+len(authChain))
@@ -279,6 +313,12 @@ func (w *legacyPDUs) publish(ctx context.Context) error {
 }
 
 func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *rooms.GivenStates, targets []*types.IngestTarget) error {
+	return w.run.sendPDUs(ctx, pulled, given, targets)
+}
+
+// sendPDUs sends PDU targets as federated events, after the events pulled for them, then clears
+// those the publish did not
+func (run *jobRun) sendPDUs(ctx context.Context, pulled []*types.Event, given *rooms.GivenStates, targets []*types.IngestTarget) error {
 	pdus := make(map[id.EventID]types.IngestTargetKind, len(targets))
 	// Pulled events are older so go first, the send keeps the order of unrelated events
 	evs := slices.Clone(pulled)
@@ -286,7 +326,7 @@ func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *roo
 		pdus[target.Event.ID] = types.IngestTargetPDU
 		evs = append(evs, target.Event)
 	}
-	res, err := w.run.jobs.db.SendFederatedEvents(ctx, w.run.roomID, evs, given, rooms.SendFederatedEventsOptions{Targets: pdus})
+	res, err := run.jobs.db.SendFederatedEvents(ctx, run.roomID, evs, given, rooms.SendFederatedEventsOptions{Targets: pdus})
 	if err != nil {
 		return err
 	}
@@ -297,7 +337,7 @@ func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *roo
 	}
 	// What the publish did not clear: dropped events, and outlier memberships of a room this server
 	// is not in, which have no publish
-	return w.run.jobs.db.Rooms.ClearIngestTargets(ctx, w.run.roomID, targetIDs(targets))
+	return run.jobs.db.Rooms.ClearIngestTargets(ctx, run.roomID, targetIDs(targets))
 }
 
 // holdUnanswered splits PDU targets in topological order into those to send and those held back:
@@ -341,34 +381,34 @@ func gapFillServers(origins, roomServers []string, self string) []string {
 	return servers
 }
 
-// roomDisplayName is how BabbleBot names a room from its state: by name, else canonical alias
+// roomDisplayName is how BabbleBot names a room from its state events: by name, else canonical alias,
+// the last of each when there are several, as a state DAG in topological order holds every name the
+// room had
 func roomDisplayName(stateEvs []*types.Event) string {
-	var alias string
+	var name, alias string
 	for _, ev := range stateEvs {
 		if ev.StateKey == nil || *ev.StateKey != "" {
 			continue
 		}
 		switch ev.Type {
 		case event.StateRoomName:
-			if name := gjson.GetBytes(ev.Content, "name").String(); name != "" {
-				return name
-			}
+			name = gjson.GetBytes(ev.Content, "name").String()
 		case event.StateCanonicalAlias:
 			alias = gjson.GetBytes(ev.Content, "alias").String()
 		}
 	}
-	return alias
+	return cmp.Or(name, alias)
 }
 
-// makeJoin makes and signs a fresh join of the user from the first server giving a template
-func (j *Jobs) makeJoin(ctx context.Context, roomID id.RoomID, userID id.UserID, servers []string) (*types.Event, string, error) {
+// makeJoin makes and signs a fresh join of the user from the first server giving a template of the
+// room's version
+func (j *Jobs) makeJoin(ctx context.Context, roomID id.RoomID, roomVersion string, userID id.UserID, servers []string) (*types.Event, string, error) {
 	origin := spec.ServerName(j.config.ServerName)
 	var errs []error
 	for _, server := range servers {
 		resp, err := j.fclient.MakeJoin(ctx, origin, spec.ServerName(server), roomID.String(), userID.String())
 		// Held to the versions /join takes templates of
-		if version := string(resp.RoomVersion); err == nil &&
-			(!j.config.JoinsRoomVersion(version) || util.RoomVersionHas(version, gomatrixserverlib.IRoomVersion.StateDAGs)) {
+		if version := string(resp.RoomVersion); err == nil && (version != roomVersion || !j.config.JoinsRoomVersion(version)) {
 			err = fmt.Errorf("%w: %s", errUnsupportedRoomVersion, version)
 		}
 		var joinEv *types.Event

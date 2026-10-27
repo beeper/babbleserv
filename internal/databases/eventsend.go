@@ -69,6 +69,21 @@ func (d *Databases) NewRemoteJoin(
 	return &RemoteJoin{RemoteJoin: join, d: d, joinEv: joinEv}, nil
 }
 
+// NewStateDAGRemoteJoin prepares a local user's join to a state DAG room through another server,
+// once the room's ingest job replayed the state DAG the resident served, whose tips are given, see
+// rooms.RoomsDatabase.NewStateDAGRemoteJoin
+func (d *Databases) NewStateDAGRemoteJoin(ctx context.Context, joinEv *types.Event, tips []id.EventID) (*RemoteJoin, error) {
+	userPushRules, userRoomContext, err := d.pushContext(ctx, joinEv.RoomID)
+	if err != nil {
+		return nil, err
+	}
+	join, err := d.Rooms.NewStateDAGRemoteJoin(ctx, joinEv, tips, userPushRules, userRoomContext)
+	if err != nil {
+		return nil, err
+	}
+	return &RemoteJoin{RemoteJoin: join, d: d, joinEv: joinEv}, nil
+}
+
 // Publish publishes the join. While this server is not in the room the join takes the response
 // state as the room's state, otherwise it is sent like any federated event, against that state and
 // the room's current state.

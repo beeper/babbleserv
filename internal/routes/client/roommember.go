@@ -25,12 +25,10 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
-	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
@@ -416,8 +414,6 @@ func (c *ClientRoutes) remoteJoin(r *http.Request, roomID id.RoomID, userID id.U
 		})
 		if err != nil {
 			return err
-		} else if ev.StateDAGs() {
-			return fmt.Errorf("%w: %s", rooms.ErrStateDAGRemoteJoin, roomID)
 		}
 		joinServers := slices.Concat([]string{server}, slices.DeleteFunc(slices.Clone(servers), func(other string) bool {
 			return other == server || other == c.config.ServerName
@@ -506,7 +502,7 @@ func (c *ClientRoutes) remoteMembership(
 		destination := spec.ServerName(server)
 		switch membership {
 		case event.MembershipKnock:
-			resp, err := c.fclient.MakeKnock(r.Context(), origin, destination, roomID.String(), target.String(), []gomatrixserverlib.RoomVersion{})
+			resp, err := c.fclient.MakeKnock(r.Context(), origin, destination, roomID.String(), target.String(), c.joinedRoomVersions())
 			return federatedMakeResp{resp.KnockEvent, resp.RoomVersion}, err
 		default:
 			resp, err := c.fclient.MakeLeave(r.Context(), origin, destination, roomID.String(), target.String())
@@ -518,8 +514,6 @@ func (c *ClientRoutes) remoteMembership(
 			return fmt.Errorf("%w: %w", errRemoteLeaveFailed, err)
 		}
 		return err
-	} else if membership != event.MembershipLeave && ev.StateDAGs() {
-		return fmt.Errorf("%w: %s", rooms.ErrStateDAGRemoteJoin, roomID)
 	}
 
 	ctx := hlog.FromRequest(r).With().
@@ -546,10 +540,7 @@ func (c *ClientRoutes) remoteMembership(
 
 func responseRemoteMembershipError(w http.ResponseWriter, r *http.Request, err error) {
 	var failure *types.IngestFailure
-	if errors.Is(err, rooms.ErrStateDAGRemoteJoin) {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
-		return
-	} else if errors.As(err, &failure) {
+	if errors.As(err, &failure) {
 		hlog.FromRequest(r).Warn().
 			Int("status", failure.Status).
 			Str("errcode", failure.ErrCode).

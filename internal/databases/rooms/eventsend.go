@@ -142,9 +142,8 @@ func (r *RoomsDatabase) txnStoreEvents(
 				}
 			}
 
-			if relType == event.RelAnnotation {
-				// room-ev-reactions/rel-ev/uid/key
-				// Note: dupe check is handled before we call storeEvents
+			if isReaction(ev) {
+				// room-ev-reactions/rel-ev/uid/key, which a local send checks for its duplicates
 				txn.Set(r.events.KeyForRoomReaction(room.ID, relEvID, ev.Sender, ev.ReactionKey()), []byte(ev.ID))
 			}
 		}
@@ -600,8 +599,7 @@ func createRoomVersion(createEv *types.PartialEvent) string {
 
 var errRoomNotFederated = errors.New("this room is not federated")
 
-// Run final internal checks on an event before we accept it for storage, this
-// is where we prevent duplicate annotations currently.
+// Run final internal checks on an event before we accept it for storage
 func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	txn fdb.ReadTransaction,
 	roomID id.RoomID,
@@ -616,15 +614,27 @@ func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	} else if ev.RoomVersion == "" {
 		panic("event room version is missing")
 	}
+	return nil
+}
 
-	relEvID, relType := ev.RelatesTo()
-	if relType == event.RelAnnotation {
-		existng := txn.Get(r.events.KeyForRoomReaction(ev.RoomID, relEvID, ev.Sender, ev.ReactionKey())).MustGet()
-		if existng != nil {
-			return errors.New("duplicate reaction for this event/user")
-		}
+// isReaction reports whether an event is a reaction the reaction index records: an m.reaction
+// message annotating another event
+func isReaction(ev *types.Event) bool {
+	_, relType := ev.RelatesTo()
+	return ev.Type == event.EventReaction && ev.StateKey == nil && relType == event.RelAnnotation
+}
+
+// txnCheckDuplicateReaction refuses a local user's reaction they sent already. As Synapse does, only
+// local sends are checked: a federated event is never refused for it, which in a state DAG room would
+// cut this server off from every event descending from it.
+func (r *RoomsDatabase) txnCheckDuplicateReaction(txn fdb.ReadTransaction, ev *types.Event) error {
+	if !isReaction(ev) {
+		return nil
 	}
-
+	relEvID, _ := ev.RelatesTo()
+	if txn.Get(r.events.KeyForRoomReaction(ev.RoomID, relEvID, ev.Sender, ev.ReactionKey())).MustGet() != nil {
+		return errors.New("duplicate reaction for this event/user")
+	}
 	return nil
 }
 

@@ -58,7 +58,8 @@ type ingestConfig struct {
 	// be transient, before the join fails
 	// Default: 10m
 	JoinTimeout time.Duration `yaml:"joinTimeout"`
-	// Most state and auth chain events a join accepts from the resident server
+	// Most events a join accepts from the resident server: state and auth chain events, or in a
+	// state DAG room (MSC4242) the state DAG
 	// Default: 1000000
 	MaxJoinEvents int `yaml:"maxJoinEvents"`
 	// Most PDUs, and their bytes, a room's job holds queued before /send waits for it to publish
@@ -99,8 +100,8 @@ type BabbleConfig struct {
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
 
-		// Offer the unstable state DAG room version (MSC4242): advertise it, create rooms of it and
-		// take invites to them. Federation in its rooms is not supported yet.
+		// Offer the unstable state DAG room version (MSC4242): advertise it, create rooms of it, join
+		// and take invites to them. Filling gaps in their state DAGs is not supported yet.
 		UnstableStateDAGs bool `yaml:"unstableStateDAGs"`
 
 		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
@@ -182,6 +183,10 @@ type BabbleConfig struct {
 	Federation struct {
 		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
 		FetchProfileForMemberEvents bool `yaml:"fetchProfileForMemberEvents"`
+		// Most state events send_join serves of a state DAG room (MSC4242). A room with more refuses
+		// joins before taking them, rather than leave the joining server joined here alone.
+		// Default: 1000000
+		MaxServedStateDAG int `yaml:"maxServedStateDAG"`
 	} `yaml:"federation"`
 
 	// For development usage - serve the .well-known client/server endpoints
@@ -285,6 +290,9 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 	if cfg.Rooms.Ingest.MaxJoinEvents <= 0 {
 		cfg.Rooms.Ingest.MaxJoinEvents = 1_000_000
+	}
+	if cfg.Federation.MaxServedStateDAG <= 0 {
+		cfg.Federation.MaxServedStateDAG = 1_000_000
 	}
 	if cfg.Rooms.Ingest.MaxQueuedPDUs <= 0 {
 		cfg.Rooms.Ingest.MaxQueuedPDUs = 2000

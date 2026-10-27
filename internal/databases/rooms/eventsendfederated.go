@@ -525,6 +525,11 @@ func (s *federatedEventSender) txnPrepareFederated(
 		plan.boundary = join.diff
 		plan.resetExtremities = join.ev.ID
 		p.givenBefore = map[id.EventID]types.StateHash{join.ev.ID: join.boundary}
+		if stateDAGs {
+			if stateExtremities, err = s.stateDAGJoinTips(eventsProvider); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		boundaries, givenBefore, err := p.txnBoundaryContexts(evs, &s.given)
 		if err != nil {
@@ -633,6 +638,9 @@ func (s *federatedEventSender) txnPrepareFederated(
 			Msg("Room has several state extremities, current state is resolved")
 	}
 	plan.stateSteps = current.steps
+	if join.inJoinMode() && stateDAGs {
+		plan.resetStateExtremities = stateExtremities
+	}
 	if len(s.options.Targets) > 0 {
 		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
 			return s.r.txnClearPublishedTargets(txn, s.roomID, plan.evs, s.options.Targets)
@@ -642,14 +650,20 @@ func (s *federatedEventSender) txnPrepareFederated(
 }
 
 // evaluate assigns an event its state and authorizes it against the state before it, step 5.
-// Returns false for an event dropped from the batch. In a state DAG room the state before an event
-// is the state after its prev state events, which must all have state here, and its auth events are
-// calculated from that state.
+// Returns false for an event dropped from the batch. In a state DAG room the MSC's section 2 comes
+// first, then the state before an event is the state after its prev state events, which must all
+// have state here, and its auth events are calculated from that state.
 func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.ResolutionRequest, error) {
 	log := zerolog.Ctx(p.ctx).With().
 		Stringer("event_id", ev.ID).
 		Stringer("type", ev.Type).
 		Logger()
+
+	if p.stateDAGs && !ev.Rejected {
+		if keep, err := p.authorizePrevStateEvents(ev); err != nil || !keep || ev.Rejected {
+			return keep, nil, err
+		}
+	}
 
 	before, given := p.givenBefore[ev.ID]
 	var knownPrevs []id.EventID
@@ -707,13 +721,6 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		p.reject(ev, fmt.Errorf("%w: auth event %s was rejected", ErrAuthStage4, authEventID))
 		return true, nil, nil
 	}
-	// Batch events carry the outcome this attempt gave them, stored events their stored one
-	if authErr, err := util.AuthorizePrevStateEvents(ev, p.plan.eventsProvider.Get); err != nil {
-		return false, nil, err
-	} else if authErr != nil {
-		p.reject(ev, fmt.Errorf("%w: %w", ErrAuthStage5, authErr))
-		return true, nil, nil
-	}
 
 	authState, err := p.plan.txnLookupAuthState(p.txn, before, ev)
 	if err != nil {
@@ -756,6 +763,26 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		return false, nil, err
 	}
 	return true, nil, nil
+}
+
+// authorizePrevStateEvents applies the MSC's section 2 to a state DAG event, so that one citing a
+// rejected event, a message or another room's event is rejected rather than dropped, an event ID
+// fixing its room, without working out the state before it: the event takes known empty state, as
+// nothing reads it, events citing it being rejected in turn. Batch events carry the outcome this
+// attempt gave them, stored events their stored one. Returns false for an event dropped, citing an
+// event that is not stored.
+func (p *federatedPreparation) authorizePrevStateEvents(ev *types.Event) (bool, error) {
+	authErr, err := util.AuthorizePrevStateEvents(ev, p.plan.eventsProvider.Get)
+	if errors.Is(err, util.ErrPrevStateEventMissing) {
+		p.drop(ev, fmt.Errorf("%w: %w: %w", ErrEventDropped, ErrPrevStateEventsUnavailable, err))
+		return false, nil
+	} else if err != nil {
+		return false, err
+	} else if authErr != nil {
+		ev.BeforeState, ev.AfterState = state.EmptyContext, state.EmptyContext
+		p.reject(ev, fmt.Errorf("%w: %w", ErrAuthStage5, authErr))
+	}
+	return true, nil
 }
 
 func (p *federatedPreparation) resolutionWork(request *eventsendutil.ResolutionRequest) needsWork {
@@ -1191,7 +1218,8 @@ func (s *federatedEventSender) txnReadoptedEvents(
 
 // buildJoinBoundary is the artifact job building the state before a remote join as a boundary over
 // the room's current state, and diffing the current state against it for the join's publish. It
-// stages what it builds.
+// stages what it builds. In a state DAG room the state before the join is the state after its prev
+// state events instead, see stateDAGJoinBefore.
 func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 	join := s.join
 	room, err := s.r.GetRoom(ctx, s.roomID)
@@ -1207,12 +1235,16 @@ func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 		return err
 	}
 	stateBatch := s.r.state.NewJobBatch(s.roomID, reads.Read)
-	// A job batch reads in the job's transactions whatever transaction it is given
-	base, baseState, err := s.txnBoundaryBase(nil, stateBatch, room.CurrentState, len(join.state))
-	if err != nil {
-		return err
+	var base, boundary types.StateHash
+	var baseState types.StateEntries
+	if join.ev.StateDAGs() {
+		boundary, err = s.stateDAGJoinBefore(ctx, reads, stateBatch, room.Version)
+	} else {
+		// A job batch reads in the job's transactions whatever transaction it is given
+		if base, baseState, err = s.txnBoundaryBase(nil, stateBatch, room.CurrentState, len(join.state)); err == nil {
+			boundary, err = s.txnApplyBoundary(nil, stateBatch, base, baseState, join.state)
+		}
 	}
-	boundary, err := s.txnApplyBoundary(nil, stateBatch, base, baseState, join.state)
 	if err != nil {
 		return err
 	}

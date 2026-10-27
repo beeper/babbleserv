@@ -43,11 +43,15 @@ type Fetcher struct {
 	config    config.BabbleConfig
 	db        *databases.Databases
 	fedclient *federation.Client
-	keyStore  *util.KeyStore
+	// fedclient without its timeout on whole requests, for responses read as they arrive
+	streamClient *federation.Client
+	keyStore     *util.KeyStore
 }
 
 func NewFetcher(cfg config.BabbleConfig, db *databases.Databases, fedclient *federation.Client, keyStore *util.KeyStore) *Fetcher {
-	return &Fetcher{config: cfg, db: db, fedclient: fedclient, keyStore: keyStore}
+	streamClient := *fedclient
+	streamClient.HTTP = &http.Client{Transport: fedclient.HTTP.Transport, CheckRedirect: fedclient.HTTP.CheckRedirect}
+	return &Fetcher{config: cfg, db: db, fedclient: fedclient, streamClient: &streamClient, keyStore: keyStore}
 }
 
 // GapFill is what a gap fill pulled for PDUs citing events missing here
@@ -450,7 +454,7 @@ func (f *Fetcher) StateBefore(
 	} else if resp == nil {
 		return nil, nil, fmt.Errorf("null state response for %s", eventID)
 	} else if count := len(resp.PDUs) + len(resp.AuthChain); count > limit {
-		return nil, nil, tooLargeFailure(count, limit)
+		return nil, nil, tooLargeFailure("state and auth chain have", count, limit)
 	}
 	seenIDs := make(map[id.EventID]struct{}, len(resp.PDUs)+len(resp.AuthChain))
 	if stateEvs, err = util.VerifyRemoteEvents(ctx, resp.PDUs, roomVersion, f.keyStore, seenIDs); err != nil {

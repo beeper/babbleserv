@@ -178,16 +178,36 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 	keyStore *KeyStore,
 	seenIDs map[id.EventID]struct{},
 ) ([]*types.Event, error) {
-	log := zerolog.Ctx(ctx)
+	return VerifyParsedRemoteEvents(ctx, ParseRemoteEvents(ctx, raws, roomVersion), keyStore, seenIDs)
+}
+
+// ParseRemoteEvents parses events fetched from another server, skipping those that cannot be parsed
+func ParseRemoteEvents[S ~[]E, E ~[]byte](ctx context.Context, raws S, roomVersion string) []*types.Event {
 	evs := make([]*types.Event, 0, len(raws))
-	for i, b := range raws {
-		if i > 0 && i%verifyProgressEvents == 0 {
-			ReportProgress(ctx)
-		}
+	for _, b := range raws {
 		remoteEv := &types.Event{RoomVersion: roomVersion}
 		if err := json.Unmarshal(b, remoteEv); err != nil {
-			log.Warn().Err(err).Msg("Skipping remote event that cannot be parsed")
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Skipping remote event that cannot be parsed")
 			continue
+		}
+		evs = append(evs, remoteEv)
+	}
+	return evs
+}
+
+// VerifyParsedRemoteEvents verifies events parsed with ParseRemoteEvents, as VerifyRemoteEvents does.
+// An event given its ID already, its reference hash, is verified to have it.
+func VerifyParsedRemoteEvents(
+	ctx context.Context,
+	remoteEvs []*types.Event,
+	keyStore *KeyStore,
+	seenIDs map[id.EventID]struct{},
+) ([]*types.Event, error) {
+	log := zerolog.Ctx(ctx)
+	evs := make([]*types.Event, 0, len(remoteEvs))
+	for i, remoteEv := range remoteEvs {
+		if i > 0 && i%verifyProgressEvents == 0 {
+			ReportProgress(ctx)
 		}
 		verifiedEv, verifyErr, err := VerifyRemoteEvent(ctx, remoteEv, keyStore)
 		if err != nil {

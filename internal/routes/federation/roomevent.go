@@ -24,14 +24,16 @@ type respGetEvent struct {
 }
 
 // https://spec.matrix.org/v1.10/server-server-api/#get_matrixfederationv1eventeventid
+//
+// Rejected events are served, as Synapse serves them: a server fetching one a state DAG event cites
+// rejects that event itself.
 func (f *FederationRoutes) GetEvent(w http.ResponseWriter, r *http.Request) {
 	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 	ev, err := f.db.Rooms.GetEvent(r.Context(), eventID)
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
-	} else if ev == nil || ev.Rejected {
-		// As Synapse, which serves no rejected event
+	} else if ev == nil {
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
 		return
 	} else if !f.requireServerInRoom(w, r, ev.RoomID) {

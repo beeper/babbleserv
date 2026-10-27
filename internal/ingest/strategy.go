@@ -38,7 +38,7 @@ func strategyFor(roomVersion string) (strategy, error) {
 	if _, err := gomatrixserverlib.GetRoomVersion(gomatrixserverlib.RoomVersion(roomVersion)); err != nil {
 		return nil, fmt.Errorf("%w: %q", errUnsupportedRoomVersion, roomVersion)
 	} else if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.StateDAGs) {
-		return nil, fmt.Errorf("%w: %s, state DAG rooms are not joined yet", errUnsupportedRoomVersion, roomVersion)
+		return stateDAGStrategy{}, nil
 	}
 	return legacyStrategy{}, nil
 }
@@ -83,7 +83,7 @@ func legacyWorks(run *jobRun, joins, connected, gaps []*types.IngestTarget, join
 	works := make([]ingestWork, 0, len(joins)+2)
 	joinWorks := make([]ingestWork, len(joins))
 	for i, target := range joins {
-		joinWorks[i] = &legacyJoin{run: run, target: target}
+		joinWorks[i] = &legacyJoin{joinWork{run: run, target: target}}
 	}
 	if len(joins) > 0 && !joined {
 		return joinWorks

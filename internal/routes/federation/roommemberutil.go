@@ -111,11 +111,17 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	}{ev, ev.RoomVersion})
 }
 
-// membershipResponse is how a send_ endpoint answers once the event is sent, refusing it beforehand
-// with the error beforeSend returns
+// membershipResponse is how a send_ endpoint answers once the event is sent, refusing it beforehand,
+// once it is verified, with the error beforeSend returns. A response too large to build whole is a
+// streamedResponse.
 type membershipResponse struct {
-	beforeSend func(room *types.Room) error
+	beforeSend func(room *types.Room, ev *types.Event) error
 	afterSend  func(room *types.Room, ev *types.Event) (any, error)
+}
+
+// streamedResponse is a response written as it is read
+type streamedResponse interface {
+	write(w http.ResponseWriter, r *http.Request)
 }
 
 func (f *FederationRoutes) sendMembershipEventFromOtherServer(
@@ -164,12 +170,6 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		return
 	}
 	ev.RoomVersion = room.Version
-	if response.beforeSend != nil {
-		if err := response.beforeSend(room); err != nil {
-			responseMembershipError(w, r, err)
-			return
-		}
-	}
 
 	// Veriy the event is signed by the requesting HS
 	verifyErr, err := util.VerifyEvent(r.Context(), &ev, f.keyStore)
@@ -179,6 +179,12 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	} else if verifyErr != nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
 		return
+	}
+	if response.beforeSend != nil {
+		if err := response.beforeSend(room, &ev); err != nil {
+			responseMembershipError(w, r, err)
+			return
+		}
 	}
 
 	// For a room this server is not in, none is taken, as a remote user's membership is never an
@@ -206,6 +212,10 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 			responseMembershipError(w, r, err)
 			return
 		}
+	}
+	if streamed, ok := resp.(streamedResponse); ok {
+		streamed.write(w, r)
+		return
 	}
 	util.ResponseJSON(w, r, http.StatusOK, resp)
 }

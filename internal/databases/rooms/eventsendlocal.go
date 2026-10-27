@@ -366,6 +366,9 @@ func (s *localEventSender) txnPrepareLocalEvents(
 		} else if err := s.r.txnCheckEventBeforeStore(txn, room.ID, ev); err != nil {
 			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
 			continue
+		} else if err := s.r.txnCheckDuplicateReaction(txn, ev); err != nil {
+			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
+			continue
 		}
 
 		// Holds by construction while events/srx holds only accepted state events

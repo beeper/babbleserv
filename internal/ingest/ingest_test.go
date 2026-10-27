@@ -89,7 +89,7 @@ func TestFailureFromError(t *testing.T) {
 	assert.NotContains(t, failure.Message, "dial")
 	assert.Equal(t, 503, unreachableFailure(remoteError(503, `{"errcode":"M_UNKNOWN","error":"down"}`)).Status)
 
-	failure = tooLargeFailure(2000, 1000)
+	failure = tooLargeFailure("state and auth chain have", 2000, 1000)
 	assert.Equal(t, 413, failure.Status)
 	assert.Contains(t, failure.Message, "2000")
 }
@@ -162,11 +162,11 @@ func TestSplitConnected(t *testing.T) {
 	assert.Equal(t, []id.EventID{"$gap", "$citesGap", "$missingAuth"}, util.EventsToIDs(rest),
 		"citing an unstored prev or auth event, or an event with a gap")
 
-	storedIDs, withStateIDs := citedEventIDs(evs)
+	storedIDs, prevStateIDs := citedEventIDs(evs)
 	assert.ElementsMatch(t,
 		[]id.EventID{"$citesConnected", "$connected", "$create", "$gap", "$member", "$missing", "$outlier", "$power", "$tip"},
 		storedIDs, "each cited event once")
-	assert.Empty(t, withStateIDs, "only state DAG events need state at what they cite")
+	assert.Empty(t, prevStateIDs, "only state DAG events cite prev state events")
 }
 
 func stateDAGTestPDU(eventID id.EventID, prevIDs []id.EventID, prevStateIDs ...id.EventID) *types.Event {
@@ -175,33 +175,33 @@ func stateDAGTestPDU(eventID id.EventID, prevIDs []id.EventID, prevStateIDs ...i
 	return ev
 }
 
-// A state DAG event is connected once its prev events are stored and its prev state events, the
-// create event among them, have state here, or are earlier connected events
+// A state DAG event is connected once its prev state events, the create event among them, are in
+// place here or are earlier connected events, whether or not its prev events are stored
 func TestSplitConnectedStateDAG(t *testing.T) {
-	stored := map[id.EventID]struct{}{"$createhash": {}, "$tip": {}, "$state": {}, "$staged": {}}
-	withState := map[id.EventID]struct{}{"$createhash": {}, "$tip": {}, "$state": {}}
+	inPlace := map[id.EventID]struct{}{"$createhash": {}, "$tip": {}, "$state": {}, "$otherRoom": {}}
 	evs := rooms.SortEventsTopologically([]*types.Event{
 		stateDAGTestPDU("$message", []id.EventID{"$tip"}, "$state"),
 		stateDAGTestPDU("$citesStaged", []id.EventID{"$tip"}, "$staged"),
 		stateDAGTestPDU("$citesStagedAsPrev", []id.EventID{"$staged"}, "$state"),
 		stateDAGTestPDU("$unknownPrev", []id.EventID{"$missing"}, "$state"),
 		stateDAGTestPDU("$citesMessage", []id.EventID{"$message"}, "$message"),
+		stateDAGTestPDU("$citesOtherRoom", []id.EventID{"$tip"}, "$otherRoom"),
 		stateDAGTestPDU("$citesGap", []id.EventID{"$tip"}, "$citesStaged"),
 	})
-	connected, rest := splitConnected(evs, stored, withState)
-	assert.Equal(t, []id.EventID{"$message", "$citesStagedAsPrev", "$citesMessage"}, util.EventsToIDs(connected),
-		"a prev event only needs storing, and an earlier connected event counts as having state")
-	assert.Equal(t, []id.EventID{"$citesStaged", "$unknownPrev", "$citesGap"}, util.EventsToIDs(rest),
-		"citing a prev state event stored without state, an unstored prev event, or an event with a gap")
+	connected, rest := splitConnected(evs, nil, inPlace)
+	assert.Equal(t, []id.EventID{"$message", "$citesStagedAsPrev", "$unknownPrev", "$citesMessage", "$citesOtherRoom"}, util.EventsToIDs(connected),
+		"prev events need not be stored, and an earlier connected event is in place")
+	assert.Equal(t, []id.EventID{"$citesStaged", "$citesGap"}, util.EventsToIDs(rest),
+		"citing a prev state event stored without state, or an event with a gap")
 
-	storedIDs, withStateIDs := citedEventIDs(evs)
-	assert.ElementsMatch(t, []id.EventID{"$tip", "$staged", "$missing", "$message"}, storedIDs)
-	assert.ElementsMatch(t, []id.EventID{"$createhash", "$state", "$staged", "$message", "$citesStaged"}, withStateIDs,
+	storedIDs, prevStateIDs := citedEventIDs(evs)
+	assert.Empty(t, storedIDs, "nothing a state DAG event cites must merely be stored")
+	assert.ElementsMatch(t, []id.EventID{"$createhash", "$state", "$staged", "$message", "$otherRoom", "$citesStaged"}, prevStateIDs,
 		"the prev state events with the implicit create event")
 
-	connected, rest = splitConnected(evs[:1], stored, map[id.EventID]struct{}{"$state": {}})
+	connected, rest = splitConnected(evs[:1], nil, map[id.EventID]struct{}{"$state": {}})
 	assert.Empty(t, connected)
-	assert.Len(t, rest, 1, "the create event must have state too")
+	assert.Len(t, rest, 1, "the create event must be in place too")
 }
 
 func TestSplitConnectedNeedsTheImplicitCreateEvent(t *testing.T) {
@@ -271,8 +271,9 @@ func TestStrategyFor(t *testing.T) {
 		require.NoError(t, err, version)
 		assert.IsType(t, legacyStrategy{}, strategy)
 	}
-	_, err := strategyFor("org.matrix.msc4242.12")
-	assert.ErrorIs(t, err, errUnsupportedRoomVersion, "state DAG rooms join on their own strategy")
+	strategy, err := strategyFor("org.matrix.msc4242.12")
+	require.NoError(t, err)
+	assert.IsType(t, stateDAGStrategy{}, strategy)
 	_, err = strategyFor("unknown")
 	assert.ErrorIs(t, err, errUnsupportedRoomVersion)
 }
@@ -361,7 +362,7 @@ func TestSendJoinRetryPause(t *testing.T) {
 
 func TestFailureReasonKeepsServerErrorsOutOfNotices(t *testing.T) {
 	assert.Equal(t, "you are not allowed to join it", failureReason(&types.IngestFailure{ErrCode: "M_FORBIDDEN", Message: "failed to auth event (step 5): x"}))
-	assert.Equal(t, "it is too large for this server", failureReason(tooLargeFailure(10, 1)))
+	assert.Equal(t, "it is too large for this server", failureReason(tooLargeFailure("state DAG has", 10, 1)))
 	reason := failureReason(&types.IngestFailure{ErrCode: "M_UNKNOWN", Message: "storage failed"})
 	assert.NotContains(t, reason, "storage")
 }

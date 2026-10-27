@@ -535,12 +535,12 @@ func (f *FederationRoutes) processTransactionPDUs(
 }
 
 // processRoomPDUs sends a room's PDUs, or enqueues them for the room's ingest job. While the room has
-// a job, every PDU waits for it, once the job's queue has room. Otherwise the PDUs citing only stored
-// events and each other publish now, unless a job starts meanwhile, and the rest are enqueued after
-// for the job to fill their gaps: enqueueing them first would start the job, which the publish would
-// then defer to. Should the split or the publish fail, every PDU is enqueued instead, so an error
-// returned is an enqueue's, which fails the transaction for its sender to send again. PDUs of a state
-// DAG room are never enqueued, see processStateDAGRoomPDUs.
+// a job, every PDU waits for it, once the job's queue has room. Otherwise the PDUs citing only events
+// in place here and each other publish now, unless a job starts meanwhile, and the rest are enqueued
+// after for the job to fill their gaps: enqueueing them first would start the job, which the publish
+// would then defer to. Should the split or the publish fail, every PDU is enqueued instead, so an
+// error returned is an enqueue's, which fails the transaction for its sender to send again. Until
+// state DAG gap fills, a state DAG room's PDUs with gaps are dropped rather than enqueued.
 func (f *FederationRoutes) processRoomPDUs(
 	ctx context.Context,
 	origin string,
@@ -550,9 +550,7 @@ func (f *FederationRoutes) processRoomPDUs(
 	evs []*types.Event,
 ) (*rooms.SendEventsResult, error) {
 	log := zerolog.Ctx(ctx)
-	if slices.ContainsFunc(evs, (*types.Event).StateDAGs) {
-		return f.processStateDAGRoomPDUs(ctx, roomID, room, evs), nil
-	} else if wait != nil {
+	if wait != nil {
 		// A wait failing fails the whole transaction
 		<-wait.done
 		if wait.err != nil {
@@ -570,7 +568,7 @@ func (f *FederationRoutes) processRoomPDUs(
 			return f.enqueueRoomPDUs(ctx, origin, roomID, evs)
 		}
 	}
-	var results *rooms.SendEventsResult
+	results := &rooms.SendEventsResult{}
 	if len(connected) > 0 {
 		var err error
 		results, err = f.db.SendFederatedEvents(ctx, roomID, connected, nil, rooms.SendFederatedEventsOptions{
@@ -585,12 +583,12 @@ func (f *FederationRoutes) processRoomPDUs(
 	}
 	if len(rest) == 0 {
 		return results, nil
+	} else if slices.ContainsFunc(rest, (*types.Event).StateDAGs) {
+		return dropStateDAGGaps(ctx, results, rest), nil
 	}
 	queued, err := f.enqueueRoomPDUs(ctx, origin, roomID, rest)
 	if err != nil {
 		return nil, err
-	} else if results == nil {
-		return queued, nil
 	}
 	results.Allowed = append(results.Allowed, queued.Allowed...)
 	return results, nil
@@ -599,42 +597,12 @@ func (f *FederationRoutes) processRoomPDUs(
 // Until state DAG gap fills, a state DAG room's PDU with a gap is dropped: no job strategy fills it
 var errStateDAGGap = errors.New("cites events without state here")
 
-// processStateDAGRoomPDUs sends a state DAG room's connected PDUs, see ingest.Jobs.SplitConnected,
-// as processRoomPDUs does, and drops the rest. A failure to split or send is logged, leaving the
-// room's PDUs out of the response.
-func (f *FederationRoutes) processStateDAGRoomPDUs(
-	ctx context.Context,
-	roomID id.RoomID,
-	room pduRoom,
-	evs []*types.Event,
-) *rooms.SendEventsResult {
-	log := zerolog.Ctx(ctx)
-	connected, rest := evs, []*types.Event(nil)
-	if room.joined {
-		var err error
-		if connected, rest, err = f.ingestJobs.SplitConnected(ctx, evs); err != nil {
-			log.Err(err).Msg("Failed to split federated events")
-			return nil
-		}
-	}
-	results := &rooms.SendEventsResult{}
-	if len(connected) > 0 {
-		var err error
-		results, err = f.db.SendFederatedEvents(ctx, roomID, connected, nil, rooms.SendFederatedEventsOptions{
-			RefuseWhileIngesting: true,
-		})
-		if errors.Is(err, rooms.ErrRoomIngesting) {
-			results, rest = &rooms.SendEventsResult{}, evs
-		} else if err != nil {
-			log.Err(err).Msg("Sending federated events failed")
-			return nil
-		}
-	}
-	for _, ev := range rest {
-		log.Warn().
+// dropStateDAGGaps drops a state DAG room's PDUs whose prev state events have no state here
+func dropStateDAGGaps(ctx context.Context, results *rooms.SendEventsResult, evs []*types.Event) *rooms.SendEventsResult {
+	for _, ev := range evs {
+		zerolog.Ctx(ctx).Warn().
 			Stringer("event_id", ev.ID).
 			Strs("prev_state_event_ids", util.StringersToStrs(ev.PrevStateEventIDs)).
-			Strs("prev_event_ids", util.StringersToStrs(ev.PrevEventIDs)).
 			Msg("Dropping state DAG event citing events without state here")
 		results.Rejected = append(results.Rejected, rooms.RejectedEvent{
 			Event: ev,

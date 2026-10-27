@@ -10,13 +10,10 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms/eventsendutil"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
-
-// Until state DAG joins, this server joins no state DAG room (MSC4242) another server hosts, nor
-// knocks on one
-var ErrStateDAGRemoteJoin = errors.New("joining or knocking on state DAG rooms over federation is not supported yet")
 
 // A state DAG room's events cite only events with state here, so no other server gives states
 var errStateDAGGivenStates = errors.New("state DAG rooms take no given states")
@@ -56,61 +53,94 @@ func citedExtremities(extremities []id.EventID) []id.EventID {
 	return append([]id.EventID{}, extremities[max(len(extremities)-types.MaxStateDAGPrevEvents, 0):]...)
 }
 
-// The most state events send_join serves of a state DAG room, which it reads in one transaction
-// until it streams them
-const maxServedStateDAG = 10_000
+// ErrStateDAGTooLarge refuses a join to a state DAG room whose state DAG, with the join, would hold
+// more events than this server serves
+var ErrStateDAGTooLarge = errors.New("the room's state DAG has more events than this server serves")
 
-var ErrStateDAGTooLarge = fmt.Errorf("the room's state DAG has more than %d events, more than this server serves yet", maxServedStateDAG)
-
-// CheckServedStateDAG fails with ErrStateDAGTooLarge for a state DAG room with more state events than
-// GetServedStateDAG serves
+// CheckServedStateDAG fails with ErrStateDAGTooLarge for a state DAG room whose state DAG would hold
+// more than config.Federation.MaxServedStateDAG events with one more, as a join's publish adds
 func (r *RoomsDatabase) CheckServedStateDAG(ctx context.Context, roomID id.RoomID) error {
+	limit := r.config.Federation.MaxServedStateDAG
 	_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
-		if _, more, err := r.events.TxnLookupRoomStateDAGEventIDs(txn, roomID, maxServedStateDAG); err != nil {
+		if longer, err := r.events.TxnRoomStateDAGLonger(txn, roomID, limit-1); err != nil {
 			return nil, err
-		} else if more {
-			return nil, ErrStateDAGTooLarge
+		} else if longer {
+			return nil, fmt.Errorf("%w: more than %d events", ErrStateDAGTooLarge, limit)
 		}
 		return nil, nil
 	})
 	return err
 }
 
-// GetServedStateDAG returns a state DAG room's state DAG as published, every accepted state event in
-// the order it was published, failing with ErrStateDAGTooLarge past maxServedStateDAG
-func (r *RoomsDatabase) GetServedStateDAG(ctx context.Context, roomID id.RoomID) ([]*types.Event, error) {
-	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.Event, error) {
-		eventIDs, more, err := r.events.TxnLookupRoomStateDAGEventIDs(txn, roomID, maxServedStateDAG)
+// Events of a state DAG that send_join serves per transaction
+const servedStateDAGPage = 500
+
+// StreamServedStateDAG hands each a state DAG room's state DAG as published, every accepted state
+// event in the order it was published, a page per transaction. It reads on to the end, so a state
+// event published meanwhile may be among them, harmlessly: it cites only events before it.
+func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.RoomID, each func([]*types.Event) error) error {
+	type page struct {
+		evs  []*types.Event
+		next fdb.Key
+	}
+	var after fdb.Key
+	for {
+		pg, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (page, error) {
+			eventIDs, next, err := r.events.TxnRoomStateDAGPage(txn, roomID, after, servedStateDAGPage)
+			if err != nil {
+				return page{}, err
+			}
+			evs, err := r.events.NewTxnEventsProvider(ctx, txn).GetAll(eventIDs)
+			return page{evs, next}, err
+		})
 		if err != nil {
-			return nil, err
-		} else if more {
-			return nil, ErrStateDAGTooLarge
+			return err
+		} else if err := each(pg.evs); err != nil {
+			return err
+		} else if pg.next == nil {
+			return nil
 		}
-		return r.events.NewTxnEventsProvider(ctx, txn).GetAll(eventIDs)
-	})
+		after = pg.next
+	}
 }
 
-// Events a get_missing_events walk of a state DAG reads per transaction
+// Events a walk of a state DAG reads per batch of reads, which share a transaction until it is too
+// old
 const stateDAGWalkChunk = 1000
 
 // GetMissingStateDAGEvents answers get_missing_events in a state DAG room with the MSC's state_dag
 // flag, see walkStateDAG
 func (r *RoomsDatabase) GetMissingStateDAGEvents(ctx context.Context, roomID id.RoomID, earliest, latest []id.EventID, limit int) ([]*types.Event, error) {
-	return walkStateDAG(roomID, earliest, latest, limit, func(eventIDs []id.EventID) (map[id.EventID]*types.Event, error) {
-		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (map[id.EventID]*types.Event, error) {
+	read, err := r.renewableEventReads(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	return walkStateDAG(roomID, earliest, latest, limit, read)
+}
+
+// renewableEventReads returns a reader of events that reads each batch in the transaction the last
+// one used, starting another once it is too old or failed with a retryable error, as one too old
+// does, so that a walk reading one hop of a state DAG at a time is not a transaction a hop
+func (r *RoomsDatabase) renewableEventReads(ctx context.Context, roomID id.RoomID) (func([]id.EventID) (map[id.EventID]*types.Event, error), error) {
+	reads, err := eventsendutil.NewArtifactReads(ctx, r.db, r.events, roomID, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return func(eventIDs []id.EventID) (map[id.EventID]*types.Event, error) {
+		evs := make(map[id.EventID]*types.Event, len(eventIDs))
+		return evs, reads.Read(func(txn fdb.ReadTransaction) error {
 			eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
 			eventsProvider.WillGet(eventIDs...)
-			evs := make(map[id.EventID]*types.Event, len(eventIDs))
 			for _, eventID := range eventIDs {
 				ev, err := eventsProvider.Get(eventID)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				evs[eventID] = ev
 			}
-			return evs, nil
+			return nil
 		})
-	})
+	}, nil
 }
 
 // walkStateDAG walks a state DAG back from latest along prev_state_events, a message's included, as

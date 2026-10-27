@@ -7,14 +7,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/matrix-org/gomatrix"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix"
 
-	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/types"
 )
 
@@ -87,10 +89,14 @@ func TestRemoteMembershipErrors(t *testing.T) {
 		status  int
 		errcode string
 	}{
-		"state DAG room":        {fmt.Errorf("%w: !room", rooms.ErrStateDAGRemoteJoin), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
 		"template of a version": {fmt.Errorf("%w: 1", errIncompatibleRoomVersion), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
 		"failed by the job":     {&types.IngestFailure{Status: http.StatusForbidden, ErrCode: mautrix.MForbidden.ErrCode}, http.StatusForbidden, mautrix.MForbidden.ErrCode},
 		"invalid template":      {fmt.Errorf("%w from other", errInvalidMembershipTemplate), http.StatusBadGateway, mautrix.MUnknown.ErrCode},
+		"refused make_join": {
+			gomatrix.HTTPError{Code: http.StatusForbidden, Contents: []byte(`{"errcode":"M_FORBIDDEN","error":"not invited"}`)},
+			http.StatusForbidden, mautrix.MForbidden.ErrCode,
+		},
+		"failed make_join": {gomatrix.HTTPError{Code: http.StatusInternalServerError}, http.StatusBadGateway, mautrix.MUnknown.ErrCode},
 	} {
 		w := httptest.NewRecorder()
 		responseRemoteMembershipError(w, httptest.NewRequest(http.MethodPost, "/join", nil), test.err)
@@ -105,4 +111,16 @@ func TestOtherServersSkipsDomainlessRoomIDs(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/join?server_name=a.example.com", nil)
 	assert.Equal(t, []string{"a.example.com", "b.example.com"}, getOtherServers(request, "!room:b.example.com"))
 	assert.Equal(t, []string{"a.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
+}
+
+func TestKnocksOfferTheVersionsThisServerJoins(t *testing.T) {
+	c := &ClientRoutes{}
+	versions := c.joinedRoomVersions()
+	assert.True(t, slices.IsSorted(versions))
+	assert.Contains(t, versions, gomatrixserverlib.RoomVersionV12)
+	assert.NotContains(t, versions, gomatrixserverlib.RoomVersionV1, "a version of another event format")
+	assert.NotContains(t, versions, gomatrixserverlib.RoomVersionStateDAGs)
+
+	c.config.Rooms.UnstableStateDAGs = true
+	assert.Contains(t, c.joinedRoomVersions(), gomatrixserverlib.RoomVersionStateDAGs)
 }

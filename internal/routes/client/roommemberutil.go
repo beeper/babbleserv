@@ -2,11 +2,14 @@ package client
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
+	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/hlog"
@@ -133,9 +136,34 @@ func membershipTemplateEvent(
 	return util.MembershipTemplateEvent(userID, roomID, membership, resp.Event, resp.RoomVersion)
 }
 
-// As Synapse does, a server failing to give a usable template is a bad gateway
+// joinedRoomVersions are the room versions this server joins rooms of, which a make_knock offers
+func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
+	var versions []gomatrixserverlib.RoomVersion
+	for version := range gomatrixserverlib.RoomVersions() {
+		if c.config.JoinsRoomVersion(string(version)) {
+			versions = append(versions, version)
+		}
+	}
+	slices.Sort(versions)
+	return versions
+}
+
+// As Synapse does, a server refusing to give a template is passed on, and a server failing to give a
+// usable one is a bad gateway
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, errIncompatibleRoomVersion) {
+	var httpErr gomatrix.HTTPError
+	if errors.As(err, &httpErr) {
+		var respErr mautrix.RespError
+		if httpErr.Code >= 400 && httpErr.Code < 500 && json.Unmarshal(httpErr.Contents, &respErr) == nil && respErr.ErrCode != "" {
+			util.ResponseJSON(w, r, httpErr.Code, map[string]string{"errcode": respErr.ErrCode, "error": respErr.Err})
+			return
+		}
+		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
+			"errcode": util.MUnknown.ErrCode,
+			"error":   err.Error(),
+		})
+		return
+	} else if errors.Is(err, errIncompatibleRoomVersion) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
 		return
 	} else if errors.Is(err, errInvalidMembershipTemplate) {

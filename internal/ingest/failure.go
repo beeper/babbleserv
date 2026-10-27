@@ -96,10 +96,21 @@ func rejectedFailure(err error) *types.IngestFailure {
 	return &types.IngestFailure{Status: util.ErrorStatus(respErr), ErrCode: respErr.ErrCode, Message: err.Error()}
 }
 
-func tooLargeFailure(events, limit int) *types.IngestFailure {
+// incompleteStateDAGFailure is a join to a state DAG room that no server served a state DAG for that
+// connects the join to the create event, as the MSC requires
+func incompleteStateDAGFailure() *types.IngestFailure {
+	return &types.IngestFailure{
+		Status:  http.StatusBadGateway,
+		ErrCode: mautrix.MUnknown.ErrCode,
+		Message: "No server in the room served a state DAG connecting the join to the room's create event",
+	}
+}
+
+// tooLargeFailure is a join refused for the events the resident gives with it, of what is given
+func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,
 		ErrCode: mautrix.MTooLarge.ErrCode,
-		Message: fmt.Sprintf("the room's state and auth chain have %d events, this server joins rooms of at most %d", events, limit),
+		Message: fmt.Sprintf("the room's %s %d events, this server joins rooms of at most %d", what, events, limit),
 	}
 }

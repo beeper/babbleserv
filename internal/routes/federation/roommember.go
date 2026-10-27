@@ -1,11 +1,13 @@
 package federation
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -108,32 +110,23 @@ func (f *FederationRoutes) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	f.makeMembershipEventForOtherServer(w, r, event.MembershipJoin, true)
 }
 
-// The send_join response of a state DAG room (MSC4242), whose state DAG replaces the state before the
-// join, its auth chain and the servers in the room
-type respSendJoinStateDAG struct {
-	Origin   string         `json:"origin"`
-	Event    *types.Event   `json:"event"`
-	StateDAG []*types.Event `json:"state_dag"`
-}
-
 // https://spec.matrix.org/v1.11/server-server-api/#put_matrixfederationv2send_joinroomideventid
 func (f *FederationRoutes) SendJoin(w http.ResponseWriter, r *http.Request) {
 	f.sendMembershipEventFromOtherServer(w, r, event.MembershipJoin, membershipResponse{
-		// A state DAG too large to serve refuses the join before it is sent, rather than leave the
-		// joiner joined here alone
-		beforeSend: func(room *types.Room) error {
+		// A state DAG too large to serve with the join refuses the join before it is sent, rather
+		// than leave the joiner joined here alone. A join stored already counts in it, so is answered
+		// again as the first was.
+		beforeSend: func(room *types.Room, ev *types.Event) error {
 			if !util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
 				return nil
+			} else if stored, err := f.db.Rooms.GetStoredEventIDs(r.Context(), []id.EventID{ev.ID}); err != nil || len(stored) > 0 {
+				return err
 			}
 			return f.db.Rooms.CheckServedStateDAG(r.Context(), room.ID)
 		},
 		afterSend: func(room *types.Room, ev *types.Event) (any, error) {
 			if util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
-				stateDAG, err := f.db.Rooms.GetServedStateDAG(r.Context(), room.ID)
-				if err != nil {
-					return nil, err
-				}
-				return respSendJoinStateDAG{Origin: f.config.ServerName, Event: ev, StateDAG: stateDAG}, nil
+				return stateDAGJoinResponse{f: f, room: room, ev: ev}, nil
 			}
 			// The state before the join. A join stored before without state, as a prev event's,
 			// takes the room's current state.
@@ -150,6 +143,58 @@ func (f *FederationRoutes) SendJoin(w http.ResponseWriter, r *http.Request) {
 			}{stateWithAuthChain.AuthChain, stateWithAuthChain.StateEvents}, nil
 		},
 	})
+}
+
+// stateDAGJoinResponse is the send_join response of a state DAG room (MSC4242), whose state DAG
+// replaces the state before the join, its auth chain and the servers in the room:
+// {origin, event, state_dag}. It is written as the state DAG is read, a page a transaction, as a large
+// room's is far more than one transaction reads or a response should hold whole.
+type stateDAGJoinResponse struct {
+	f    *FederationRoutes
+	room *types.Room
+	ev   *types.Event
+}
+
+// write streams the response. Should reading the state DAG fail part way, the body is left
+// unfinished, so the joining server takes it for a failed request and sends the join again.
+func (resp stateDAGJoinResponse) write(w http.ResponseWriter, r *http.Request) {
+	log := hlog.FromRequest(r)
+	head, err := json.Marshal(struct {
+		Origin string       `json:"origin"`
+		Event  *types.Event `json:"event"`
+	}{resp.f.config.ServerName, resp.ev})
+	if err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	body := bufio.NewWriter(w)
+	body.Write(head[:len(head)-1])
+	body.WriteString(`,"state_dag":[`)
+	served := 0
+	err = resp.f.db.Rooms.StreamServedStateDAG(r.Context(), resp.room.ID, func(evs []*types.Event) error {
+		for _, ev := range evs {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				return err
+			} else if served > 0 {
+				body.WriteByte(',')
+			}
+			body.Write(b)
+			served++
+		}
+		return body.Flush()
+	})
+	if err != nil {
+		log.Err(err).Int("served", served).Msg("Failed to serve the state DAG of a join")
+		return
+	}
+	body.WriteString("]}")
+	if err := body.Flush(); err != nil {
+		log.Warn().Err(err).Msg("Failed to finish serving the state DAG of a join")
+	}
+	log.Debug().Int("state_dag", served).Msg("Served the state DAG of a join")
 }
 
 // https://spec.matrix.org/v1.14/server-server-api/#get_matrixfederationv1make_knockroomiduserid

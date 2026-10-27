@@ -52,8 +52,10 @@ type publishPlan struct {
 	preparedEvents
 	// Stored rejected events a remote join accepts, which its publish then un-rejects
 	readopted []*types.Event
-	// The remote join whose publish replaces every extremity
-	resetExtremities id.EventID
+	// The remote join whose publish replaces every extremity, and in a state DAG room the state
+	// extremities it replaces them with, see stateDAGJoinTips
+	resetExtremities      id.EventID
+	resetStateExtremities []id.EventID
 	// What else the publish writes: an alias, publication, a transaction ID or a lock refresh
 	extra func(fdb.Transaction, *types.Room) error
 }
@@ -567,6 +569,10 @@ func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan 
 	if plan.resetExtremities != "" {
 		s.r.events.TxnResetRoomExtremEventIDs(txn, room.ID, plan.resetExtremities)
 	}
+	if version, found := versions[plan.resetExtremities]; found && len(plan.resetStateExtremities) > 0 {
+		// At the join's version, so local events citing the extremities published last cite these
+		s.r.events.TxnResetRoomStateExtremEventIDs(txn, room.ID, plan.resetStateExtremities, version)
+	}
 	if plan.extra != nil {
 		if err := plan.extra(txn, room); err != nil {
 			return nil, err
@@ -695,7 +701,7 @@ func (s *eventSender) buildStateResolution(ctx context.Context, work resolveStat
 		RoomID:      s.roomID,
 		RoomVersion: work.roomVersion,
 	})
-	if err := s.buildAndStoreResolution(ctx, resolver, stateBatch, work.request.Contexts); err != nil {
+	if _, err := s.buildAndStoreResolution(ctx, resolver, stateBatch, work.request.Contexts); err != nil {
 		return fmt.Errorf("failed to resolve contexts: %w", err)
 	}
 	stateEvents, candidates := resolver.Stats()
@@ -710,16 +716,14 @@ func (s *eventSender) buildStateResolution(ctx context.Context, work resolveStat
 	return nil
 }
 
-func (s *eventSender) buildAndStoreResolution(ctx context.Context, resolver *eventsendutil.Resolver, stateBatch *state.Batch, contexts []types.StateHash) error {
+func (s *eventSender) buildAndStoreResolution(ctx context.Context, resolver *eventsendutil.Resolver, stateBatch *state.Batch, contexts []types.StateHash) (types.StateHash, error) {
 	result, request, err := resolver.ResolveContexts(contexts)
 	if err != nil {
-		return err
+		return types.StateHash{}, err
+	} else if request != nil {
+		return types.StateHash{}, errors.New("artifact job requested another resolution")
+	} else if err := stateBatch.Stage(ctx, s.r.config.Rooms.StateBudget.StagingBytes, slices.Concat(contexts, []types.StateHash{result})...); err != nil {
+		return types.StateHash{}, err
 	}
-	if request != nil {
-		return errors.New("artifact job requested another resolution")
-	}
-	if err := stateBatch.Stage(ctx, s.r.config.Rooms.StateBudget.StagingBytes, slices.Concat(contexts, []types.StateHash{result})...); err != nil {
-		return err
-	}
-	return stateBatch.StoreResolved(ctx, contexts, result)
+	return result, stateBatch.StoreResolved(ctx, contexts, result)
 }

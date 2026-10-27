@@ -39,6 +39,9 @@ type remoteJoin struct {
 	// The state before the join once staged, and the changes to it from the room's current state
 	boundary types.StateHash
 	diff     *boundaryChanges
+	// In a state DAG room, the tips of the state DAG the resident served with the join, see
+	// stateDAGJoinTips
+	tips []id.EventID
 	// Another join got this server into the room, so the join is sent as any federated event
 	asMember bool
 	// Stored already, so the send reports the stored outcome, see txnStoredJoinResult
@@ -72,20 +75,44 @@ func (r *RoomsDatabase) NewRemoteJoin(
 	userPushRules types.UserPushRulesMap,
 	userRoomContext types.UserRoomContextMap,
 ) (*RemoteJoin, error) {
+	return r.newRemoteJoin(ctx, &remoteJoin{ev: joinEv, stateIDs: stateIDs}, evs, pushContext{rules: userPushRules, rooms: userRoomContext})
+}
+
+// NewStateDAGRemoteJoin prepares the join of a local user to a state DAG room (MSC4242), a target of
+// the room's ingest job, once the job replayed the state DAG the resident served with it, whose tips
+// are given. The state before the join is the state after its prev state events. Its publish makes
+// the join and the tips it does not cite the room's state extremities, see stateDAGJoinTips, and
+// current state the state after them.
+func (r *RoomsDatabase) NewStateDAGRemoteJoin(
+	ctx context.Context,
+	joinEv *types.Event,
+	tips []id.EventID,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
+) (*RemoteJoin, error) {
+	if !joinEv.StateDAGs() {
+		return nil, fmt.Errorf("event %s is not of a state DAG room", joinEv.ID)
+	}
+	return r.newRemoteJoin(ctx, &remoteJoin{ev: joinEv, tips: tips}, nil, pushContext{rules: userPushRules, rooms: userRoomContext})
+}
+
+func (r *RoomsDatabase) newRemoteJoin(ctx context.Context, join *remoteJoin, evs []*types.Event, push pushContext) (*RemoteJoin, error) {
+	joinEv := join.ev
 	if joinEv.StateKey == nil || !isJoinEvent(joinEv) || !r.isLocalUser(id.UserID(*joinEv.StateKey)) {
 		return nil, fmt.Errorf("event %s is not a local user's join", joinEv.ID)
 	}
 	roomID := joinEv.RoomID
-	push := pushContext{rules: userPushRules, rooms: userRoomContext}
 	p := &federatedEventSender{
 		eventSender: r.newEventSender(roomID, push),
 		evs:         []*types.Event{joinEv},
-		given:       givenStates{beforeEvents: map[id.EventID][]id.EventID{joinEv.ID: stateIDs}},
 		fetched:     evs,
-		join:        &remoteJoin{ev: joinEv, stateIDs: stateIDs},
+		join:        join,
 		options: SendFederatedEventsOptions{
 			Targets: map[id.EventID]types.IngestTargetKind{joinEv.ID: types.IngestTargetJoin},
 		},
+	}
+	if !joinEv.StateDAGs() {
+		p.given = givenStates{beforeEvents: map[id.EventID][]id.EventID{joinEv.ID: join.stateIDs}}
 	}
 	p.build = p.executePreparationWork
 	log := r.getTxnLogContext(ctx, "RemoteJoin").
@@ -192,7 +219,17 @@ func (s *remoteJoinSender) prepare(ctx context.Context) (preparationOutcome, err
 }
 
 func (p *remoteJoinSender) prepareJoin(ctx context.Context) (preparationOutcome, error) {
-	if p.staging == nil || !p.staging.staged {
+	if p.join.ev.StateDAGs() {
+		// The room's job staged and replayed the state DAG the join cites, so there is nothing to
+		// check or stage first
+		room, err := util.DoReadTransaction(ctx, p.r.db, func(txn fdb.ReadTransaction) (*types.Room, error) {
+			return p.txnCheckRemoteJoinRoom(txn, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		p.join.room = room
+	} else if p.staging == nil || !p.staging.staged {
 		staging, err := p.checkRemoteJoin(ctx)
 		if err != nil {
 			return nil, err
@@ -287,6 +324,12 @@ func (s *remoteJoinSender) txnCheckRemoteJoinRoom(
 			if _, found := inState[ev.ID]; found && ev.Type == event.StateCreate && ev.StateKey != nil && *ev.StateKey == "" {
 				roomCreate = []*types.PartialEvent{&ev.PartialEvent}
 				break
+			}
+		}
+		// A state DAG room's create event is staged, the one its room ID names
+		if joinEv.StateDAGs() {
+			if createEv := s.r.events.TxnGetEvent(txn, joinEv.ImplicitCreateEventID()); createEv != nil {
+				roomCreate = []*types.PartialEvent{&createEv.PartialEvent}
 			}
 		}
 		room, err = s.r.newRoomFromEvents(s.roomID, roomCreate)

@@ -209,6 +209,17 @@ func (g *AuthGraph) Add(evs ...*types.Event) {
 	}
 }
 
+// AddCalculated makes pending stored events whose auth events were calculated since they were
+// stored, as a state DAG room's are once their state is known, replacing the unfinalized headers
+// stored for them: the graph writes their headers, finalized or not.
+func (g *AuthGraph) AddCalculated(evs ...*types.Event) {
+	for _, ev := range evs {
+		h := types.AuthHeader{AuthEventIDs: slices.Clone(ev.AuthEventIDs)}
+		g.headers[ev.ID], g.dirty[ev.ID] = h, h
+	}
+	g.Add(evs...)
+}
+
 // read keeps the headers loaded before a failure, so reading again loads only the rest.
 func (g *AuthGraph) read(ids []id.EventID) error {
 	var missing []id.EventID

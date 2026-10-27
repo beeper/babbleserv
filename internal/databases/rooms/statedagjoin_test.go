@@ -1,0 +1,89 @@
+package rooms
+
+import (
+	"maps"
+	"slices"
+	"testing"
+
+	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/types"
+)
+
+// stagedStateDAG holds state events of a state DAG room stored without state, each citing the events
+// after it in prev_state_events, and the room's create event, whose ID the room ID names
+func stagedStateDAG(dag map[id.EventID][]id.EventID) map[id.EventID]*types.Event {
+	evs := make(map[id.EventID]*types.Event, len(dag))
+	for eventID, prevStateEventIDs := range dag {
+		ev := stateDAGTestEvent(eventID, true, prevStateEventIDs...)
+		ev.RoomID, ev.RoomVersion = "!create", string(gomatrixserverlib.RoomVersionStateDAGs)
+		if eventID == "$create" {
+			ev.Type = event.StateCreate
+		}
+		evs[eventID] = ev
+	}
+	return evs
+}
+
+func walkStaged(t *testing.T, dag map[id.EventID]*types.Event, from ...id.EventID) *stateDAGWalk {
+	t.Helper()
+	walk, err := walkUnreplayed("!create", from, func(eventIDs []id.EventID) (map[id.EventID]*types.Event, error) {
+		assert.LessOrEqual(t, len(eventIDs), stateDAGWalkChunk)
+		found := make(map[id.EventID]*types.Event)
+		for _, eventID := range eventIDs {
+			found[eventID] = dag[eventID]
+		}
+		return found, nil
+	})
+	require.NoError(t, err)
+	return walk
+}
+
+// The walk of a join's state DAG goes back along prev_state_events, the implicit create event among
+// them, through the events stored without state, and finds what is missing on the way
+func TestWalkUnreplayed(t *testing.T) {
+	dag := stagedStateDAG(map[id.EventID][]id.EventID{
+		"$create": nil, "$power": {"$create"}, "$a": {"$power"}, "$b": {"$power"},
+		"$merge": {"$a", "$b"}, "$citesGap": {"$merge", "$withheld"}, "$replayed": {"$power"},
+		"$other": nil, "$outlier": {"$power"}, "$citesOther": {"$other", "$outlier"},
+	})
+	dag["$replayed"].BeforeState, dag["$replayed"].AfterState = types.StateHash{1}, types.StateHash{2}
+	dag["$other"].RoomID = "!other"
+	dag["$outlier"].Outlier = true
+
+	connected := walkStaged(t, dag, "$create", "$merge", "$replayed")
+	assert.Empty(t, connected.missing)
+	assert.ElementsMatch(t, []id.EventID{"$create", "$power", "$a", "$b", "$merge"}, slices.Collect(maps.Keys(connected.cites)),
+		"an event with state here ends the walk")
+	assert.Equal(t, []id.EventID{"$create", "$a", "$b"}, connected.cites["$merge"], "an event cites the create event implicitly")
+	assert.Empty(t, connected.cites["$create"])
+
+	gap := walkStaged(t, dag, "$citesGap", "$citesOther")
+	assert.ElementsMatch(t, []id.EventID{"$withheld", "$outlier"}, slices.Collect(maps.Keys(gap.missing)),
+		"an event not stored, or stored only as an outlier, is missing")
+	assert.NotContains(t, gap.cites, id.EventID("$other"), "another room's event ends the walk")
+}
+
+func TestReplayOrder(t *testing.T) {
+	walk := &stateDAGWalk{
+		cites: map[id.EventID][]id.EventID{
+			"$create": nil, "$power": {"$create"}, "$b": {"$create", "$power"}, "$a": {"$create", "$power", "$power"},
+			"$merge": {"$create", "$a", "$b"}, "$tip": {"$create", "$merge", "$replayed"},
+			"$citesMissing": {"$create", "$power", "$withheld"}, "$citesThat": {"$create", "$citesMissing"},
+			"$cycleA": {"$cycleB"}, "$cycleB": {"$cycleA"},
+		},
+		missing: map[id.EventID]struct{}{"$withheld": {}},
+	}
+	order, unreplayable := replayOrder(walk)
+	assert.Equal(t, []id.EventID{"$create", "$power", "$a", "$b", "$merge", "$tip"}, order,
+		"each after what it cites, the lowest event ID first of those ready")
+	assert.Equal(t, 4, unreplayable, "events reaching a missing one, and a cycle, are left out")
+
+	order, unreplayable = replayOrder(&stateDAGWalk{})
+	assert.Empty(t, order)
+	assert.Zero(t, unreplayable)
+}

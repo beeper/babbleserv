@@ -40,8 +40,10 @@ func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.Eve
 	return stored, nil
 }
 
-// GetEventIDsWithState returns those of the events stored in the room with state contexts
-func (r *RoomsDatabase) GetEventIDsWithState(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+// GetPrevStateEventIDsInPlace returns those of the events that an event of a state DAG room can be
+// judged citing in prev_state_events: stored in the room with state contexts, or stored in another
+// room, which the MSC's section 2 rejects citing
+func (r *RoomsDatabase) GetPrevStateEventIDsInPlace(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
 	withState := make(map[id.EventID]struct{})
 	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
 		if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
@@ -50,7 +52,7 @@ func (r *RoomsDatabase) GetEventIDsWithState(ctx context.Context, roomID id.Room
 			for _, eventID := range chunk {
 				if ev, err := eventsProvider.Get(eventID); err != nil {
 					return nil, err
-				} else if ev.HasStateIn(roomID) {
+				} else if ev.HasStateIn(roomID) || ev != nil && ev.RoomID != roomID {
 					withState[eventID] = struct{}{}
 				}
 			}
