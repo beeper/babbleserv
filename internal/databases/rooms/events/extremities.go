@@ -117,3 +117,36 @@ func OrderByVersion(eventIDs []id.EventID, versions []tuple.Versionstamp) []id.E
 	}
 	return ordered
 }
+
+// Room state DAG
+//
+
+func (e *EventsDirectory) keyForRoomStateDAG(roomID id.RoomID, version tuple.Versionstamp) fdb.Key {
+	key, err := e.roomStateDAG.PackWithVersionstamp(tuple.Tuple{roomID.String(), version})
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+// TxnAddRoomStateDAGEvent adds an accepted state event, published at version, to the room's state DAG
+func (e *EventsDirectory) TxnAddRoomStateDAGEvent(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID, version tuple.Versionstamp) {
+	txn.SetVersionstampedKey(e.keyForRoomStateDAG(roomID, version), []byte(eventID))
+}
+
+// TxnLookupRoomStateDAGEventIDs returns at most limit of the room's state DAG events, in the order
+// they were published, and whether it has more
+func (e *EventsDirectory) TxnLookupRoomStateDAGEventIDs(txn fdb.ReadTransaction, roomID id.RoomID, limit int) ([]id.EventID, bool, error) {
+	kvs, err := txn.GetRange(
+		e.roomStateDAG.Sub(roomID.String()),
+		fdb.RangeOptions{Limit: limit + 1, Mode: fdb.StreamingModeWantAll},
+	).GetSliceWithError()
+	if err != nil {
+		return nil, false, err
+	}
+	eventIDs := make([]id.EventID, 0, min(len(kvs), limit))
+	for _, kv := range kvs[:min(len(kvs), limit)] {
+		eventIDs = append(eventIDs, id.EventID(kv.Value))
+	}
+	return eventIDs, len(kvs) > limit, nil
+}

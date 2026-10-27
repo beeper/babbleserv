@@ -103,6 +103,14 @@ type EventsDirectory struct {
 	// value: Versionstamp the event was published at
 	roomStateExtremIDs subspace.Subspace
 
+	// A state DAG room's state DAG as other servers see it (MSC4242): every accepted state event,
+	// written as it is published, which send_join serves to joining servers. An event given contexts
+	// but never published has no row, so a joiner never adopts state no other server has.
+	//
+	// key: (RoomID, Versionstamp)
+	// value: EventID
+	roomStateDAG subspace.Subspace
+
 	// RoomID/related-event-ID/version to (eventID, relType)
 	//
 	// - paginate events relating to this event
@@ -157,6 +165,7 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 		roomVersionToState:    eventsDir.Sub("rch"),
 		roomExtremIDs:         eventsDir.Sub("rex"),
 		roomStateExtremIDs:    eventsDir.Sub("srx"),
+		roomStateDAG:          eventsDir.Sub("sdg"),
 		byRoomRelation:        eventsDir.Sub("rel"),
 		byRoomReaction:        eventsDir.Sub("rea"),
 		roomThreadVersionToID: eventsDir.Sub("rth"),

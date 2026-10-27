@@ -46,7 +46,8 @@ type RejectedEvent struct {
 // Store events handles writing out all the relevant event data into FoundationDB, assuming that all
 // events passed in are already authenticated and carry their state contexts. Each accepted event
 // clears the extremities it replaces, and in a state DAG room each accepted state event the state
-// extremities it cites. The caller then stores the room's current state with txnStoreRoomState.
+// extremities it cites and joins the state DAG served to joining servers. The caller then stores
+// the room's current state with txnStoreRoomState.
 func (r *RoomsDatabase) txnStoreEvents(
 	ctx context.Context,
 	txn fdb.Transaction,
@@ -170,6 +171,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 
 		if stateDAGs && entersStateDAG(ev) {
 			r.events.TxnSetRoomStateExtremEventID(txn, room.ID, ev.ID, version, ev.PrevStateEventIDs)
+			r.events.TxnAddRoomStateDAGEvent(txn, room.ID, ev.ID, version)
 		}
 	}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -95,10 +96,11 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 }
 
 var (
-	ErrAuthStage4            = errors.New("failed to auth event (step 4)")
-	ErrAuthStage5            = errors.New("failed to auth event (step 5)")
-	ErrEventDropped          = errors.New("event dropped")
-	ErrPrevEventsUnavailable = errors.New("state at prev events unavailable")
+	ErrAuthStage4                 = errors.New("failed to auth event (step 4)")
+	ErrAuthStage5                 = errors.New("failed to auth event (step 5)")
+	ErrEventDropped               = errors.New("event dropped")
+	ErrPrevEventsUnavailable      = errors.New("state at prev events unavailable")
+	ErrPrevStateEventsUnavailable = errors.New("state at prev state events unavailable")
 )
 
 // State another server gave where our state doesn't exist or is stale (we're (re)joining a room)
@@ -155,8 +157,8 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	room, err := r.GetRoom(ctx, roomID)
 	if err != nil {
 		return nil, err
-	} else if res, err := r.refuseStateDAGFederation(ctx, room, roomID, evs, given, options); res != nil || err != nil {
-		return res, err
+	} else if given != nil && isStateDAGSend(room, evs) {
+		return nil, fmt.Errorf("%w: %s", errStateDAGGivenStates, roomID)
 	} else if !isServerJoined(room) {
 		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
@@ -361,6 +363,9 @@ type federatedPreparation struct {
 	givenBefore map[id.EventID]types.StateHash
 	dropped     map[id.EventID]struct{}
 	rejected    map[id.EventID]struct{}
+	// A state DAG room (MSC4242), whose events cite no auth events and take the state after their
+	// prev state events
+	stateDAGs bool
 }
 
 func (p *federatedPreparation) newContextResolver() *eventsendutil.Resolver {
@@ -369,7 +374,8 @@ func (p *federatedPreparation) newContextResolver() *eventsendutil.Resolver {
 
 // txnPrepareFederated prepares an attempt's copies of federated events. Events are authorized
 // against their own auth events, step 4, the state before them, step 5, and the room's current
-// state, step 6.
+// state, step 6. A state DAG room's events cite no auth events, so they skip step 4, and only its
+// messages are held to step 6.
 func (s *federatedEventSender) txnPrepareFederated(
 	ctx context.Context,
 	txn fdb.ReadTransaction,
@@ -388,9 +394,13 @@ func (s *federatedEventSender) txnPrepareFederated(
 	} else if !joined && !join.inJoinMode() {
 		return nil, fmt.Errorf("%w: %s", ErrServerNotInRoom, s.roomID)
 	}
-	var extremities []id.EventID
+	stateDAGs := util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs)
+	var extremities, stateExtremities []id.EventID
 	if !join.inJoinMode() {
 		extremities = s.r.events.TxnLookupCurrentRoomExtremEventIDs(txn, s.roomID)
+		if stateDAGs {
+			stateExtremities = s.r.events.TxnLookupCurrentRoomStateExtremEventIDs(txn, s.roomID)
+		}
 	} else if join.diff == nil || room.CurrentState != join.diff.from {
 		return needsWork{work: joinStateWork{from: room.CurrentState}}, nil
 	}
@@ -407,6 +417,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 		eventsProvider.WillGet(ev.PrevEventIDs...)
 	}
 	eventsProvider.WillGet(extremities...)
+	eventsProvider.WillGet(stateExtremities...)
 
 	stored, err := s.r.txnGetStoredEventIDs(txn, util.EventsToIDs(evs))
 	if err != nil {
@@ -440,8 +451,9 @@ func (s *federatedEventSender) txnPrepareFederated(
 		txn:                  txn,
 		plan:                 plan,
 		// Batch events citing a fetched event that could not be evaluated are dropped with it
-		dropped:  maps.Clone(fetchedDropped),
-		rejected: make(map[id.EventID]struct{}),
+		dropped:   maps.Clone(fetchedDropped),
+		rejected:  make(map[id.EventID]struct{}),
+		stateDAGs: stateDAGs,
 	}
 	p.resolver = p.newContextResolver()
 	if p.dropped == nil {
@@ -461,6 +473,9 @@ func (s *federatedEventSender) txnPrepareFederated(
 			ev.IsDuplicate = true
 			if storedEv != nil {
 				ev.CopyOutcome(storedEv)
+				// Calculated in a state DAG room, so not given with the event, and resolutions read
+				// them from this copy
+				ev.AuthEventIDs = storedEv.AuthEventIDs
 			}
 			if ev.Rejected {
 				plan.rejected = append(plan.rejected, RejectedEvent{ev, types.ErrAlreadyExists})
@@ -473,6 +488,12 @@ func (s *federatedEventSender) txnPrepareFederated(
 			continue
 		}
 		ev.RoomVersion = room.Version
+		if stateDAGs {
+			// Calculated in step 5 from the state before the event, replacing any a local event was
+			// prepared with
+			ev.AuthEventIDs = nil
+			continue
+		}
 		drop, authErr, err := s.checkAuthEvents(ctx, eventsProvider, ev, p.dropped, false)
 		if err != nil {
 			return nil, err
@@ -543,7 +564,8 @@ func (s *federatedEventSender) txnPrepareFederated(
 	// Step 6: Passes authorization rules based on the current state of the room, otherwise it is
 	// “soft failed”. Pending extremities start from the room's stored extremities, none for a join in
 	// join mode, and advance as events are accepted. Current state is the state after them, resolved
-	// when there are several.
+	// when there are several. In a state DAG room it is the state after the pending state
+	// extremities instead, which only accepted state events advance.
 	pendingExtremities := extremities
 	current := stateSteps{current: room.CurrentState}
 	for _, ev := range plan.evs {
@@ -557,20 +579,23 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 		var replaced []id.EventID
 		if !join.inJoinMode() {
-			_, authErr, err := plan.txnAuthorizeAt(ctx, txn, current.current, ev)
-			if err != nil {
-				return nil, err
-			} else if authErr != nil {
-				evLog.Err(authErr).
-					Any("event", ev).
-					Msg("Soft failed to auth event (step 6)")
-				// Soft failed events keep their state, but stay out of room indices, extremities
-				// and current state
-				ev.SoftFailed = true
-				continue
+			if softFails(ev) {
+				_, authErr, err := plan.txnAuthorizeAt(ctx, txn, current.current, ev)
+				if err != nil {
+					return nil, err
+				} else if authErr != nil {
+					evLog.Err(authErr).
+						Any("event", ev).
+						Msg("Soft failed to auth event (step 6)")
+					// Soft failed events keep their state, but stay out of room indices, extremities
+					// and current state
+					ev.SoftFailed = true
+					continue
+				}
+				evLog.Trace().Msg("Event passed authorization step 6")
 			}
-			evLog.Trace().Msg("Event passed authorization step 6")
 
+			var err error
 			if replaced, err = plan.findReplacedExtremities(evLog, pendingExtremities, ev.PrevEventIDs); err != nil {
 				return nil, err
 			}
@@ -578,35 +603,48 @@ func (s *federatedEventSender) txnPrepareFederated(
 		pendingExtremities = advanceExtremities(pendingExtremities, replaced, ev.ID)
 		plan.replacedExtremities[ev.ID] = replaced
 
-		next := ev.AfterState
-		if len(pendingExtremities) > 1 {
-			var request *eventsendutil.ResolutionRequest
-			if next, request, err = p.resolver.Resolve(pendingExtremities); err != nil {
-				return nil, err
-			} else if request != nil {
-				return p.resolutionWork(request), nil
-			}
+		after := pendingExtremities
+		if stateDAGs {
+			stateExtremities = advanceStateExtremities(stateExtremities, ev)
+			after = stateExtremities
 		}
-		current.advance(ev.ID, next)
+		if !stateDAGs || entersStateDAG(ev) {
+			next := ev.AfterState
+			if len(after) > 1 {
+				var request *eventsendutil.ResolutionRequest
+				if next, request, err = p.resolver.Resolve(after); err != nil {
+					return nil, err
+				} else if request != nil {
+					return p.resolutionWork(request), nil
+				}
+			}
+			current.advance(ev.ID, next)
+		}
 		evLog.Debug().Msg("Event authorized for storage")
 	}
 
-	if len(pendingExtremities) > 1 {
+	if len(pendingExtremities) > 1 && !stateDAGs {
 		log.Warn().
 			Strs("extremity_event_ids", util.StringersToStrs(pendingExtremities)).
 			Msg("Room has several extremities, current state is resolved")
+	} else if len(stateExtremities) > 1 {
+		log.Debug().
+			Strs("state_extremity_event_ids", util.StringersToStrs(stateExtremities)).
+			Msg("Room has several state extremities, current state is resolved")
 	}
 	plan.stateSteps = current.steps
 	if len(s.options.Targets) > 0 {
 		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
-			return s.r.txnClearPublishedTargets(txn, plan.evs, s.options.Targets)
+			return s.r.txnClearPublishedTargets(txn, s.roomID, plan.evs, s.options.Targets)
 		}
 	}
 	return readyToPublish{plan: plan}, nil
 }
 
 // evaluate assigns an event its state and authorizes it against the state before it, step 5.
-// Returns false for an event dropped from the batch.
+// Returns false for an event dropped from the batch. In a state DAG room the state before an event
+// is the state after its prev state events, which must all have state here, and its auth events are
+// calculated from that state.
 func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.ResolutionRequest, error) {
 	log := zerolog.Ctx(p.ctx).With().
 		Stringer("event_id", ev.ID).
@@ -618,13 +656,19 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 	if !given {
 		// Resolving only a subset of the prev events would persist incomplete state. Leave the
 		// event unstored so it can be evaluated again when state at every prev event is available,
-		// from the sending server for prev events without state here.
+		// from the sending server for prev events without state here. In a state DAG room /send
+		// passes only PDUs whose prev state events have state here or are earlier in the batch, so
+		// this drops a membership sent to send_ endpoints citing others, never fetching state.
+		prevs, unavailable := ev.PrevEventIDs, ErrPrevEventsUnavailable
+		if p.stateDAGs {
+			prevs, unavailable = ev.PrevStateEventIDs, ErrPrevStateEventsUnavailable
+		}
 		var unknownPrevs []id.EventID
 		var err error
-		if knownPrevs, unknownPrevs, err = p.resolver.PartitionPrevs(ev.PrevEventIDs); err != nil {
+		if knownPrevs, unknownPrevs, err = p.resolver.PartitionPrevs(prevs); err != nil {
 			return false, nil, err
 		} else if len(unknownPrevs) > 0 {
-			p.drop(ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, ErrPrevEventsUnavailable, unknownPrevs))
+			p.drop(ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, unavailable, unknownPrevs))
 			return false, nil, nil
 		}
 	}
@@ -671,8 +715,13 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		return true, nil, nil
 	}
 
-	authState, authErr, err := p.plan.txnAuthorizeAt(p.ctx, p.txn, before, ev)
+	authState, err := p.plan.txnLookupAuthState(p.txn, before, ev)
 	if err != nil {
+		return false, nil, err
+	} else if p.stateDAGs {
+		ev.AuthEventIDs = events.AuthEventIDsFor(ev, authState)
+	}
+	if authErr, err := p.plan.authorize(p.ctx, authState, ev); err != nil {
 		return false, nil, err
 	} else if authErr != nil {
 		log.Err(authErr).

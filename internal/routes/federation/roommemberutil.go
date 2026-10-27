@@ -6,12 +6,10 @@ import (
 	"net/http"
 	"slices"
 
-	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -55,14 +53,9 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 		// membership. A rejected invite falls back to the invitee's server recording it locally.
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Not an active room on this server")
 		return
-	} else if util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
-		responseIncompatibleRoomVersion(w, r, room.Version, rooms.ErrStateDAGFederation.Error())
+	} else if checkRequestVersions && !slices.Contains(r.URL.Query()["ver"], room.Version) {
+		responseIncompatibleRoomVersion(w, r, room.Version, "Your homeserver does not support the room's version")
 		return
-	} else if checkRequestVersions {
-		if !slices.Contains(r.URL.Query()["ver"], room.Version) {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Room version not supported")
-			return
-		}
 	}
 
 	content := map[string]any{
@@ -118,11 +111,18 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	}{ev, ev.RoomVersion})
 }
 
+// membershipResponse is how a send_ endpoint answers once the event is sent, refusing it beforehand
+// with the error beforeSend returns
+type membershipResponse struct {
+	beforeSend func(room *types.Room) error
+	afterSend  func(room *types.Room, ev *types.Event) (any, error)
+}
+
 func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	w http.ResponseWriter,
 	r *http.Request,
 	membership event.Membership,
-	responseAfterSend func(roomID id.RoomID, eventID id.EventID) (any, error),
+	response membershipResponse,
 ) {
 	var ev types.Event
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
@@ -162,11 +162,14 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	} else if room == nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found")
 		return
-	} else if util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
-		responseIncompatibleRoomVersion(w, r, room.Version, rooms.ErrStateDAGFederation.Error())
-		return
 	}
 	ev.RoomVersion = room.Version
+	if response.beforeSend != nil {
+		if err := response.beforeSend(room); err != nil {
+			responseMembershipError(w, r, err)
+			return
+		}
+	}
 
 	// Veriy the event is signed by the requesting HS
 	verifyErr, err := util.VerifyEvent(r.Context(), &ev, f.keyStore)
@@ -196,15 +199,23 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		return
 	}
 
-	var response any = util.EmptyJSON
-	if responseAfterSend != nil {
-		response, err = responseAfterSend(roomID, ev.ID)
+	var resp any = util.EmptyJSON
+	if response.afterSend != nil {
+		resp, err = response.afterSend(room, &ev)
 		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
+			responseMembershipError(w, r, err)
 			return
 		}
 	}
-	util.ResponseJSON(w, r, http.StatusOK, response)
+	util.ResponseJSON(w, r, http.StatusOK, resp)
+}
+
+func responseMembershipError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, rooms.ErrStateDAGTooLarge) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MTooLarge, err.Error())
+		return
+	}
+	util.ResponseErrorUnknownJSON(w, r, err)
 }
 
 // responseIncompatibleRoomVersion refuses a request about a room of a version this server does not

@@ -16,7 +16,6 @@ const (
 type IngestJob struct {
 	RoomID      id.RoomID `msgpack:"-"`
 	RoomVersion string    `msgpack:"ver"`
-	Created     int64     `msgpack:"crt"`
 }
 
 // IngestTarget is an event a room's ingest job publishes once the state it needs is stored
@@ -30,8 +29,10 @@ type IngestTarget struct {
 	// A send_join was sent that the resident server may have accepted, so refusing a later one
 	// does not mean the join was refused
 	MayHaveLanded bool `msgpack:"mhl,omitempty"`
-	// Rounds whose work for the target failed, other than by the job ending
-	Failures int `msgpack:"fls,omitempty"`
+	// Rounds whose work for the target failed, other than by the job ending, and when the last did,
+	// which holds the target back for the job's retry pause
+	Failures int   `msgpack:"fls,omitempty"`
+	FailedAt int64 `msgpack:"fat,omitempty"`
 	// The bytes a PDU counts for in its room's queue, from when it was enqueued
 	Size int `msgpack:"sz,omitempty"`
 }
@@ -40,6 +41,10 @@ type IngestTarget struct {
 type IngestQueue struct {
 	PDUs  int64
 	Bytes int64
+}
+
+func (q IngestQueue) Add(other IngestQueue) IngestQueue {
+	return IngestQueue{PDUs: q.PDUs + other.PDUs, Bytes: q.Bytes + other.Bytes}
 }
 
 func (q IngestQueue) Full(maxPDUs int, maxBytes int64) bool {

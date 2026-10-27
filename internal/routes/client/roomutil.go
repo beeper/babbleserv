@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -74,9 +73,6 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 		return nil, &respErr, rejected[0].Error
 	}
 	ev := evs[0]
-	if ev.StateDAGs() {
-		return nil, &mautrix.MIncompatibleRoomVersion, fmt.Errorf("%w: %s", rooms.ErrStateDAGFederation, roomID)
-	}
 
 	inviteStateEvs, err := c.db.Rooms.RoomStrippedState(ctx, roomID)
 	if err != nil {

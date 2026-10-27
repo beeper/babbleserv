@@ -35,8 +35,10 @@ func getOtherServers(r *http.Request, roomID id.RoomID) []string {
 
 	// TODO: don't blindly use roomID server here - but use what? Alias?
 	// TODO: use invite sender!
-	roomIDBits := strings.SplitN(roomID.String(), ":", 2)
-	otherServers = append(otherServers, roomIDBits[len(roomIDBits)-1])
+	// A domainless room ID, as v12 rooms have, names no server
+	if _, server, found := strings.Cut(roomID.String(), ":"); found {
+		otherServers = append(otherServers, server)
+	}
 	return otherServers
 
 }

@@ -87,7 +87,7 @@ func TestRemoteMembershipErrors(t *testing.T) {
 		status  int
 		errcode string
 	}{
-		"state DAG room":        {fmt.Errorf("%w: !room", rooms.ErrStateDAGFederation), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
+		"state DAG room":        {fmt.Errorf("%w: !room", rooms.ErrStateDAGRemoteJoin), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
 		"template of a version": {fmt.Errorf("%w: 1", errIncompatibleRoomVersion), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
 		"failed by the job":     {&types.IngestFailure{Status: http.StatusForbidden, ErrCode: mautrix.MForbidden.ErrCode}, http.StatusForbidden, mautrix.MForbidden.ErrCode},
 		"invalid template":      {fmt.Errorf("%w from other", errInvalidMembershipTemplate), http.StatusBadGateway, mautrix.MUnknown.ErrCode},
@@ -99,4 +99,10 @@ func TestRemoteMembershipErrors(t *testing.T) {
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), name)
 		assert.Equal(t, test.errcode, body["errcode"], name)
 	}
+}
+
+func TestOtherServersSkipsDomainlessRoomIDs(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/join?server_name=a.example.com", nil)
+	assert.Equal(t, []string{"a.example.com", "b.example.com"}, getOtherServers(request, "!room:b.example.com"))
+	assert.Equal(t, []string{"a.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
 }

@@ -76,8 +76,7 @@ func (r *RoomsDatabase) txnEnsureIngestJob(txn fdb.Transaction, roomID id.RoomID
 	if err != nil || job != nil {
 		return err
 	}
-	job = &types.IngestJob{RoomVersion: roomVersion, Created: time.Now().UnixMilli()}
-	txn.Set(r.keyForIngestJob(roomID), job.ToMsgpack())
+	txn.Set(r.keyForIngestJob(roomID), (&types.IngestJob{RoomVersion: roomVersion}).ToMsgpack())
 	return nil
 }
 
@@ -85,15 +84,22 @@ func (r *RoomsDatabase) txnSetIngestTarget(txn fdb.Transaction, target *types.In
 	txn.Set(r.keyForIngestTarget(target.Event.RoomID, target.Event.ID), target.ToMsgpack())
 }
 
-// txnCountQueued adds a PDU target to its room's queue, or with sign -1 takes it out, as atomic adds
-// so that target writes do not conflict over the counters
-func (r *RoomsDatabase) txnCountQueued(txn fdb.Transaction, target *types.IngestTarget, sign int64) {
-	if target.Kind != types.IngestTargetPDU {
-		return
+// txnAddQueued adds to the room's queue counters, as atomic adds so that target writes do not
+// conflict over them
+func (r *RoomsDatabase) txnAddQueued(txn fdb.Transaction, roomID id.RoomID, delta types.IngestQueue) {
+	if delta.PDUs != 0 {
+		txn.Add(r.keyForIngestQueue(roomID, ingestQueuePDUs), counterDelta(delta.PDUs))
 	}
-	roomID := target.Event.RoomID
-	txn.Add(r.keyForIngestQueue(roomID, ingestQueuePDUs), counterDelta(sign))
-	txn.Add(r.keyForIngestQueue(roomID, ingestQueueBytes), counterDelta(sign*int64(target.Size)))
+	if delta.Bytes != 0 {
+		txn.Add(r.keyForIngestQueue(roomID, ingestQueueBytes), counterDelta(delta.Bytes))
+	}
+}
+
+func queuedBy(target *types.IngestTarget) types.IngestQueue {
+	if target.Kind != types.IngestTargetPDU {
+		return types.IngestQueue{}
+	}
+	return types.IngestQueue{PDUs: 1, Bytes: int64(target.Size)}
 }
 
 // FoundationDB adds little-endian two's complement integers
@@ -213,6 +219,7 @@ func (r *RoomsDatabase) EnqueueIngestPDUs(ctx context.Context, roomID id.RoomID,
 			targets[i] = txn.Get(r.keyForIngestTarget(roomID, ev.ID))
 		}
 		now := time.Now().UnixMilli()
+		var queued types.IngestQueue
 		for i, ev := range evs {
 			if ev.RoomID != roomID || versions[i].MustGet() != nil || targets[i].MustGet() != nil {
 				continue
@@ -225,8 +232,9 @@ func (r *RoomsDatabase) EnqueueIngestPDUs(ctx context.Context, roomID id.RoomID,
 				Size:     len(ev.ToMsgpack()),
 			}
 			r.txnSetIngestTarget(txn, target)
-			r.txnCountQueued(txn, target, 1)
+			queued = queued.Add(queuedBy(target))
 		}
+		r.txnAddQueued(txn, roomID, queued)
 		return nil, nil
 	})
 	return err
@@ -326,13 +334,13 @@ func (r *RoomsDatabase) UpdateIngestTarget(
 // runner published.
 func (r *RoomsDatabase) FailIngestTarget(ctx context.Context, roomID id.RoomID, eventID id.EventID, failure *types.IngestFailure) (bool, error) {
 	return util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (bool, error) {
-		target, err := r.txnClearIngestTarget(txn, roomID, eventID)
-		if err != nil || target == nil {
+		cleared, err := r.txnClearIngestTargets(txn, roomID, []id.EventID{eventID})
+		if err != nil || len(cleared) == 0 {
 			return false, err
-		} else if target.Kind != types.IngestTargetJoin {
+		} else if cleared[0].Kind != types.IngestTargetJoin {
 			return true, nil
 		}
-		userID := joinUser(target)
+		userID := joinUser(cleared[0])
 		if join, err := r.txnGetIngestJoin(txn, roomID, userID); err != nil {
 			return false, err
 		} else if join != nil && join.EventID == eventID {
@@ -346,39 +354,69 @@ func (r *RoomsDatabase) FailIngestTarget(ctx context.Context, roomID id.RoomID, 
 // the iju of a join naming one
 func (r *RoomsDatabase) ClearIngestTargets(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) error {
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (types.Nil, error) {
-		for _, eventID := range eventIDs {
-			if err := r.txnClearDoneTarget(txn, roomID, eventID); err != nil {
-				return nil, err
-			}
-		}
-		return nil, nil
+		return nil, r.txnClearDoneTargets(txn, roomID, eventIDs)
 	})
 	return err
 }
 
-// txnClearIngestTarget removes a target if it still exists, returning it. The read is a normal one,
-// so two runners cannot both take the same PDU out of the room's queue.
-func (r *RoomsDatabase) txnClearIngestTarget(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) (*types.IngestTarget, error) {
-	target, err := r.txnGetIngestTarget(txn, roomID, eventID)
-	if err != nil || target == nil {
-		return nil, err
+// txnClearIngestTargets removes the targets that still exist, returning them, and takes the PDUs
+// among them out of the room's queue. The reads are normal ones, so two runners cannot both take the
+// same PDU out.
+func (r *RoomsDatabase) txnClearIngestTargets(txn fdb.Transaction, roomID id.RoomID, eventIDs []id.EventID) ([]*types.IngestTarget, error) {
+	futures := make([]fdb.FutureByteSlice, len(eventIDs))
+	for i, eventID := range eventIDs {
+		futures[i] = txn.Get(r.keyForIngestTarget(roomID, eventID))
 	}
-	txn.Clear(r.keyForIngestTarget(roomID, eventID))
-	r.txnCountQueued(txn, target, -1)
-	return target, nil
+	cleared := make([]*types.IngestTarget, 0, len(eventIDs))
+	var dequeued types.IngestQueue
+	for i, future := range futures {
+		b, err := future.Get()
+		if err != nil {
+			return nil, err
+		} else if b == nil {
+			continue
+		}
+		target, err := types.NewIngestTargetFromBytes(b, eventIDs[i])
+		if err != nil {
+			return nil, err
+		}
+		txn.Clear(r.keyForIngestTarget(roomID, eventIDs[i]))
+		dequeued = dequeued.Add(queuedBy(target))
+		cleared = append(cleared, target)
+	}
+	r.txnAddQueued(txn, roomID, types.IngestQueue{PDUs: -dequeued.PDUs, Bytes: -dequeued.Bytes})
+	return cleared, nil
 }
 
-// txnClearDoneTarget removes a target the job is done with, with the iju of a join naming it
-func (r *RoomsDatabase) txnClearDoneTarget(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) error {
-	target, err := r.txnClearIngestTarget(txn, roomID, eventID)
-	if err != nil || target == nil || target.Kind != types.IngestTargetJoin {
+// txnClearDoneTargets removes targets the job is done with, with the iju of a join naming one
+func (r *RoomsDatabase) txnClearDoneTargets(txn fdb.Transaction, roomID id.RoomID, eventIDs []id.EventID) error {
+	cleared, err := r.txnClearIngestTargets(txn, roomID, eventIDs)
+	if err != nil {
 		return err
 	}
-	userID := joinUser(target)
-	if join, err := r.txnGetIngestJoin(txn, roomID, userID); err != nil {
-		return err
-	} else if join != nil && join.EventID == eventID {
-		txn.Clear(r.keyForIngestJoin(roomID, userID))
+	type joinRead struct {
+		target *types.IngestTarget
+		join   fdb.FutureByteSlice
+	}
+	var joins []joinRead
+	for _, target := range cleared {
+		if target.Kind == types.IngestTargetJoin {
+			joins = append(joins, joinRead{target, txn.Get(r.keyForIngestJoin(roomID, joinUser(target)))})
+		}
+	}
+	for _, read := range joins {
+		b, err := read.join.Get()
+		if err != nil {
+			return err
+		} else if b == nil {
+			continue
+		}
+		join, err := types.NewIngestJoinFromBytes(b)
+		if err != nil {
+			return err
+		} else if join.EventID == read.target.Event.ID {
+			txn.Clear(r.keyForIngestJoin(roomID, joinUser(read.target)))
+		}
 	}
 	return nil
 }
@@ -388,15 +426,19 @@ func (r *RoomsDatabase) txnClearDoneTarget(txn fdb.Transaction, roomID id.RoomID
 // the job to fail or follow with a new join.
 func (r *RoomsDatabase) txnClearPublishedTargets(
 	txn fdb.Transaction,
+	roomID id.RoomID,
 	evs []*types.Event,
 	targets map[id.EventID]types.IngestTargetKind,
 ) error {
-	for _, target := range publishedTargets(evs, targets) {
-		if err := r.txnClearDoneTarget(txn, target.Event.RoomID, target.Event.ID); err != nil {
-			return err
-		}
+	return r.txnClearDoneTargets(txn, roomID, targetIDs(publishedTargets(evs, targets)))
+}
+
+func targetIDs(targets []*types.IngestTarget) []id.EventID {
+	ids := make([]id.EventID, len(targets))
+	for i, target := range targets {
+		ids[i] = target.Event.ID
 	}
-	return nil
+	return ids
 }
 
 func publishedTargets(evs []*types.Event, targets map[id.EventID]types.IngestTargetKind) []*types.IngestTarget {

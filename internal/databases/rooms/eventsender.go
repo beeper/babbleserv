@@ -301,8 +301,13 @@ func (p *preparedEvents) txnAuthorizeAt(
 	if authState, err = p.txnLookupAuthState(txn, at, ev); err != nil {
 		return nil, nil, err
 	}
-	authErr, err = events.NewTxnAuthEventsProvider(ctx, p.eventsProvider, authState).IsEventAllowed(ev)
+	authErr, err = p.authorize(ctx, authState, ev)
 	return authState, authErr, err
+}
+
+// authorize authorizes an event against auth state looked up with txnLookupAuthState
+func (p *preparedEvents) authorize(ctx context.Context, authState types.StateMap, ev *types.Event) (authErr, err error) {
+	return events.NewTxnAuthEventsProvider(ctx, p.eventsProvider, authState).IsEventAllowed(ev)
 }
 
 // txnApplyEvent gives an authorized event its state contexts, a state event moving state on from

@@ -33,6 +33,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 		Enqueued:      1234,
 		MayHaveLanded: true,
 		Failures:      2,
+		FailedAt:      5678,
 		Size:          321,
 	}
 	decoded, err := NewIngestTargetFromBytes(target.ToMsgpack(), ev.ID)
@@ -42,6 +43,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 	assert.Equal(t, target.Enqueued, decoded.Enqueued)
 	assert.True(t, decoded.MayHaveLanded)
 	assert.Equal(t, 2, decoded.Failures)
+	assert.Equal(t, int64(5678), decoded.FailedAt)
 	assert.Equal(t, 321, decoded.Size)
 	assert.Equal(t, ev.ID, decoded.Event.ID, "the ID comes from the key")
 	assert.Equal(t, ev.Type, decoded.Event.Type)
@@ -54,7 +56,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 }
 
 func TestIngestJobAndJoinRoundTrip(t *testing.T) {
-	job := &IngestJob{RoomVersion: "11", Created: 1}
+	job := &IngestJob{RoomVersion: "11"}
 	decodedJob, err := NewIngestJobFromBytes(job.ToMsgpack(), "!room:example.com")
 	require.NoError(t, err)
 	job.RoomID = "!room:example.com"

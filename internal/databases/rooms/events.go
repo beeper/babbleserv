@@ -40,6 +40,28 @@ func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.Eve
 	return stored, nil
 }
 
+// GetEventIDsWithState returns those of the events stored in the room with state contexts
+func (r *RoomsDatabase) GetEventIDsWithState(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+	withState := make(map[id.EventID]struct{})
+	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
+		if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
+			eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+			eventsProvider.WillGet(chunk...)
+			for _, eventID := range chunk {
+				if ev, err := eventsProvider.Get(eventID); err != nil {
+					return nil, err
+				} else if ev.HasStateIn(roomID) {
+					withState[eventID] = struct{}{}
+				}
+			}
+			return nil, nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return withState, nil
+}
+
 // MissingEventsRequest is what a get_missing_events request for a federated batch names
 type MissingEventsRequest struct {
 	// The prev events neither in the batch nor stored as room events that the batch events not
