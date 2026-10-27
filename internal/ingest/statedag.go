@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 
@@ -18,44 +19,22 @@ import (
 
 // stateDAGStrategy runs jobs of state DAG rooms (MSC4242): each join replays here the state DAG the
 // resident serves with it, oldest first, and the PDUs publish as federated sends in chunks, those
-// citing events without state here dropped until state DAG gap fills, so that no target the job
-// cannot fill holds the room's job
+// citing state events without state here, or prev events not stored, after their gap fill
 type stateDAGStrategy struct{}
 
 func (stateDAGStrategy) collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error) {
-	joins, pdus := splitTargets(targets)
-	joined := false
-	if len(joins) > 0 && len(pdus) > 0 {
-		var err error
-		if joined, err = run.jobs.db.Rooms.IsServerJoined(ctx, run.roomID, run.jobs.config.ServerName); err != nil {
-			return nil, err
-		}
-	}
-	return stateDAGWorks(run, joins, sortTargetsTopologically(pdus), joined), nil
+	return collectWorks(ctx, run, targets, stateDAGWorkKinds(run))
 }
 
-// stateDAGWorks are the units of work publishing a round's targets, the PDUs in topological order,
-// ordered as legacyWorks orders them: while this server is not in the room the joins alone, else
-// the PDUs ahead of the joins but for those citing a pending join, or a PDU citing one, which go
-// after them
-func stateDAGWorks(run *jobRun, joins, pdus []*types.IngestTarget, joined bool) []ingestWork {
-	works := make([]ingestWork, 0, len(joins)+2)
-	joinWorks := make([]ingestWork, len(joins))
-	for i, target := range joins {
-		joinWorks[i] = &stateDAGJoin{joinWork: joinWork{run: run, target: target}}
+func stateDAGWorkKinds(run *jobRun) workKinds {
+	return workKinds{
+		join: func(target *types.IngestTarget) ingestWork {
+			return &stateDAGJoin{joinWork: joinWork{run: run, target: target}}
+		},
+		pdus: func(pdus []*types.IngestTarget, gap bool) ingestWork {
+			return &stateDAGPDUs{run: run, pdus: pdus, gap: gap}
+		},
 	}
-	if len(joins) > 0 && !joined {
-		return joinWorks
-	}
-	beforeJoins, afterJoins := splitCitingJoins(pdus, joins)
-	for _, chunk := range chunkPDUs(beforeJoins, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &stateDAGPDUs{run: run, pdus: chunk})
-	}
-	works = append(works, joinWorks...)
-	for _, chunk := range chunkPDUs(afterJoins, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &stateDAGPDUs{run: run, pdus: chunk})
-	}
-	return works
 }
 
 func sortTargetsTopologically(targets []*types.IngestTarget) []*types.IngestTarget {
@@ -68,17 +47,28 @@ func sortTargetsTopologically(targets []*types.IngestTarget) []*types.IngestTarg
 	return targetsOf(rooms.SortEventsTopologically(evs), byID)
 }
 
+// Most tips of a served state DAG a join publishes as state extremities beside it, each a row its
+// publish writes: past it the room is not joined
+const maxStateDAGJoinTips = 1000
+
 // stateDAGJoin is a join to a state DAG room. Phase A sends the stored join event in a send_join and
 // stages the state DAG its response streams, until a server's connects the join to the create event.
-// Phase B replays it, giving its events state here, then builds the state before the join.
+// Phase B replays it, giving its events state here, then builds the state before the join. A join to
+// a room this server got into meanwhile is a member's: the events its prev state events reach that
+// have no state here fill a gap, replayed and published ahead of it, while the tips of the state DAG
+// are left to arrive as PDUs.
 type stateDAGJoin struct {
 	joinWork
 	// Of the last response: its state DAG's events, and whether any of them cites each, which
-	// leaves the tips uncited; the events it gave, and those verified; its name and alias events
+	// leaves the tips uncited; the events it gave, and those verified; its name and alias events;
+	// the events not staged, the join and those citing it or another not staged
 	served   map[id.EventID]bool
 	received int
 	seen     map[id.EventID]struct{}
 	naming   []*types.Event
+	skipped  map[id.EventID]struct{}
+	// Whether this server was in the room as the join's state was built
+	member bool
 }
 
 func (w *stateDAGJoin) fetch(ctx context.Context) error {
@@ -86,23 +76,50 @@ func (w *stateDAGJoin) fetch(ctx context.Context) error {
 }
 
 func (w *stateDAGJoin) build(ctx context.Context) error {
-	tips := w.tips()
-	if err := w.run.jobs.db.Rooms.ReplayStateDAG(ctx, w.target.Event, tips); err != nil {
+	joinEv := w.target.Event
+	var err error
+	if w.member, err = w.run.jobs.db.Rooms.IsServerJoined(ctx, w.run.roomID, w.run.jobs.config.ServerName); err != nil {
 		return err
 	}
-	var err error
-	if w.join, err = w.run.jobs.db.NewStateDAGRemoteJoin(ctx, w.target.Event, tips); err != nil {
+	tips := w.tips()
+	from := joinEv.AuthDependencyIDs()
+	if !w.member {
+		if len(tips) > maxStateDAGJoinTips {
+			return w.run.fail(ctx, w.target, tooManyTipsFailure(len(tips), maxStateDAGJoinTips))
+		}
+		from = append(from, tips...)
+	}
+	if err := w.run.jobs.db.Rooms.ReplayStateDAG(ctx, w.run.roomID, rooms.StateDAGReplay{
+		RoomVersion: joinEv.RoomVersion,
+		From:        from,
+		Pending:     []id.EventID{joinEv.ID},
+		Publish:     w.member,
+	}); err != nil {
+		return err
+	}
+	if w.join, err = w.run.jobs.db.NewStateDAGRemoteJoin(ctx, joinEv, tips); err != nil {
 		return err
 	}
 	return w.joinWork.build(ctx)
 }
 
+// publish publishes the join, after, for a member's, the events it reaches that its replay gave
+// state, which no published event may cite before they publish
+func (w *stateDAGJoin) publish(ctx context.Context) error {
+	if w.member {
+		if err := w.run.publishStateDAG(ctx, nil, w.target.Event); err != nil {
+			return err
+		}
+	}
+	return w.joinWork.publish(ctx)
+}
+
 // sendJoin sends the stored join event to the target's servers until one serves a state DAG that
 // connects the join to the create event, staging what each serves, as the MSC requires. A send that
 // may have landed is sent again, across the servers, until the join times out, and a server refusing
-// one that may have landed has the target replaced with a fresh join. A server whose state DAG does
-// not connect the join, or that serves none, is not asked again: once no server is left the join
-// fails.
+// one that may have landed has the target replaced with a fresh join, unless a server answered it,
+// so accepted it. A server whose state DAG does not connect the join, or that serves none, is not
+// asked again: once no server is left the join fails.
 func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 	log := zerolog.Ctx(ctx).With().Stringer("event_id", w.target.Event.ID).Logger()
 	incomplete := make(map[string]struct{})
@@ -120,6 +137,7 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 			return err
 		}
 		w.served, w.received, w.seen, w.naming = make(map[id.EventID]bool), 0, make(map[id.EventID]struct{}), nil
+		w.skipped = map[id.EventID]struct{}{w.target.Event.ID: {}}
 		var stageErr error
 		err = w.run.jobs.fetcher.SendJoinStateDAG(ctx, server, w.target.Event, func(raws []json.RawMessage) error {
 			stageErr = w.stage(ctx, raws)
@@ -133,6 +151,7 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 			return stageErr
 		case errors.Is(err, errBadStateDAGResponse):
 			log.Warn().Err(err).Str("server", server).Msg("Server answered the join with no state DAG")
+			w.answered = true
 			incomplete[server] = struct{}{}
 			continue
 		case err != nil:
@@ -143,6 +162,7 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 			}
 			continue
 		}
+		w.answered = true
 		util.ReportProgress(ctx)
 		missing, err := w.run.jobs.db.Rooms.MissingStateDAGEvents(ctx, w.target.Event)
 		if err != nil {
@@ -161,38 +181,21 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 }
 
 // stage verifies a chunk of the state DAG a send_join response serves and stages its state events,
-// skipping, before their signatures are checked, those stored already. It records what the state DAG
-// cites, for its tips, and names the room for BabbleBot's notices.
+// skipping, before their signatures are checked, those stored already. Events citing the join, or
+// one skipped so, are newer than it: they cannot have state before it publishes, so arrive as PDUs
+// rather than being staged. It records what the state DAG cites, for its tips, and names the room
+// for BabbleBot's notices.
 func (w *stateDAGJoin) stage(ctx context.Context, raws []json.RawMessage) error {
+	defer util.ReportProgress(ctx)
 	w.received += len(raws)
 	if limit := w.run.jobs.config.Rooms.Ingest.MaxJoinEvents; w.received > limit {
 		return tooLargeFailure("state DAG has over", limit, limit)
 	}
-	roomID := w.run.roomID
-	parsed := eventsInRoom(ctx, util.ParseRemoteEvents(ctx, raws, w.target.Event.RoomVersion), roomID)
-	// The join is the job's to publish, so is never staged, though a resident may serve it
-	parsed = slices.DeleteFunc(parsed, func(ev *types.Event) bool {
-		eventID, err := util.GetEventReferenceHash(ev)
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Msg("Skipping served state DAG event without a reference hash")
-			return true
-		}
-		ev.ID = eventID
-		return eventID == w.target.Event.ID
-	})
-	stored, err := w.run.jobs.db.Rooms.GetStoredEventIDs(ctx, util.EventsToIDs(parsed))
+	parsed := w.skipNewerThanJoin(parseStateDAGEvents(ctx, raws, w.target.Event.RoomVersion, w.run.roomID))
+	staged, stored, err := w.run.stageUnstored(ctx, parsed, w.seen)
 	if err != nil {
 		return err
 	}
-	unstored := slices.DeleteFunc(slices.Clone(parsed), func(ev *types.Event) bool {
-		_, found := stored[ev.ID]
-		return found
-	})
-	verified, err := util.VerifyParsedRemoteEvents(ctx, unstored, w.run.jobs.keyStore, w.seen)
-	if err != nil {
-		return err
-	}
-	staged := slices.DeleteFunc(verified, func(ev *types.Event) bool { return ev.StateKey == nil })
 	kept := make(map[id.EventID]*types.Event, len(parsed))
 	for _, ev := range staged {
 		kept[ev.ID] = ev
@@ -209,7 +212,23 @@ func (w *stateDAGJoin) stage(ctx context.Context, raws []json.RawMessage) error 
 		}
 	}
 	w.run.setRoomName(roomDisplayName(w.naming))
-	return w.run.jobs.db.Rooms.StageStateDAGEvents(ctx, roomID, staged)
+	return nil
+}
+
+// skipNewerThanJoin leaves out of served events, in the topological order they are served in, the
+// join and those citing it or another left out
+func (w *stateDAGJoin) skipNewerThanJoin(evs []*types.Event) []*types.Event {
+	return slices.DeleteFunc(evs, func(ev *types.Event) bool {
+		_, skipped := w.skipped[ev.ID]
+		if skipped || slices.ContainsFunc(ev.PrevStateEventIDs, func(prevID id.EventID) bool {
+			_, found := w.skipped[prevID]
+			return found
+		}) {
+			w.skipped[ev.ID] = struct{}{}
+			return true
+		}
+		return false
+	})
 }
 
 // cite records a served state DAG event and the events it cites
@@ -233,49 +252,124 @@ func (w *stateDAGJoin) tips() []id.EventID {
 	return tips
 }
 
-// stateDAGPDUs are PDUs of a state DAG room sent here while it had a job. Phase C sends those whose
-// prev state events are in place here or among them, see Jobs.SplitConnected, as /send does, and
-// drops the rest until state DAG gap fills. In a room this server is not in, every PDU is sent, to be
-// kept as an outlier membership or dropped.
+// parseStateDAGEvents parses state DAG events another server served, giving each its ID, without
+// those of other rooms or that cannot be parsed
+func parseStateDAGEvents(ctx context.Context, raws []json.RawMessage, roomVersion string, roomID id.RoomID) []*types.Event {
+	return slices.DeleteFunc(eventsInRoom(ctx, util.ParseRemoteEvents(ctx, raws, roomVersion), roomID), func(ev *types.Event) bool {
+		eventID, err := util.GetEventReferenceHash(ev)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Skipping served state DAG event without a reference hash")
+			return true
+		}
+		ev.ID = eventID
+		return false
+	})
+}
+
+// stageUnstored verifies the served state DAG's state events not stored here, skipping before their
+// signatures are checked those that are, as verifying is the expensive part, and stages them. Returns
+// those staged and which of the events were stored already.
+func (run *jobRun) stageUnstored(ctx context.Context, evs []*types.Event, seen map[id.EventID]struct{}) ([]*types.Event, map[id.EventID]struct{}, error) {
+	stored, err := run.jobs.db.Rooms.GetStoredEventIDs(ctx, util.EventsToIDs(evs))
+	if err != nil {
+		return nil, nil, err
+	}
+	unstored := slices.DeleteFunc(slices.Clone(evs), func(ev *types.Event) bool {
+		_, found := stored[ev.ID]
+		return found || ev.StateKey == nil
+	})
+	staged, err := util.VerifyParsedRemoteEvents(ctx, unstored, run.jobs.keyStore, seen)
+	if err != nil {
+		return nil, nil, err
+	} else if err := run.jobs.db.Rooms.StageStateDAGEvents(ctx, run.roomID, staged); err != nil {
+		return nil, nil, err
+	}
+	return staged, stored, nil
+}
+
+// stateDAGPDUs are PDUs of a state DAG room sent here while it had a job, or citing events it does
+// not have. In a room this server is in, phase A pulls for those with a gap the prev events missing
+// here, whose PDUs it makes targets too, then the state DAG events missing, which it stages, phase B
+// replays these, and phase C publishes them ahead of the PDUs. A PDU no server fills the state DAG
+// gap of fails; one whose gap a server failed to answer for, and the PDUs citing it, are held back
+// for a later round while the rest publish. In a room this server is not in, every PDU is sent, to
+// be kept as an outlier membership or dropped.
 type stateDAGPDUs struct {
 	run  *jobRun
 	pdus []*types.IngestTarget
+	gap  bool
+	// Whether this server is in the room, which a gap fill needs
+	joined     bool
+	unanswered map[id.EventID]struct{}
+	errs       []error
 }
 
 func (w *stateDAGPDUs) targets() []*types.IngestTarget {
 	return w.pdus
 }
 
-func (w *stateDAGPDUs) fetch(context.Context) error {
-	return nil
-}
-
-func (w *stateDAGPDUs) build(context.Context) error {
-	return nil
-}
-
-func (w *stateDAGPDUs) publish(ctx context.Context) error {
-	sent, gaps := w.pdus, []*types.IngestTarget(nil)
-	if joined, err := w.run.jobs.db.Rooms.IsServerJoined(ctx, w.run.roomID, w.run.jobs.config.ServerName); err != nil {
-		return err
-	} else if joined {
-		if sent, gaps, err = w.run.jobs.splitConnectedTargets(ctx, w.pdus); err != nil {
-			return err
-		}
-	}
-	if len(sent) > 0 {
-		if err := w.run.sendPDUs(ctx, nil, nil, sent); err != nil {
-			return err
-		}
-	}
-	if len(gaps) == 0 {
+func (w *stateDAGPDUs) fetch(ctx context.Context) error {
+	if !w.gap {
 		return nil
 	}
-	for _, target := range gaps {
-		zerolog.Ctx(ctx).Warn().
-			Stringer("event_id", target.Event.ID).
-			Strs("prev_state_event_ids", util.StringersToStrs(target.Event.PrevStateEventIDs)).
-			Msg("Dropping state DAG PDU target citing events without state here")
+	db := w.run.jobs.db
+	var err error
+	if w.joined, err = db.Rooms.IsServerJoined(ctx, w.run.roomID, w.run.jobs.config.ServerName); err != nil || !w.joined {
+		return err
 	}
-	return w.run.jobs.db.Rooms.ClearIngestTargets(ctx, w.run.roomID, targetIDs(gaps))
+	roomServers, err := db.Rooms.RoomServers(ctx, w.run.roomID)
+	if err != nil {
+		return err
+	} else if err := w.pullPrevEvents(ctx); err != nil {
+		return err
+	}
+	return w.fillStateDAG(ctx, roomServers)
+}
+
+// pullPrevEvents pulls the prev events missing here of the PDUs sent here, from their origins, and
+// makes them PDU targets too, marked pulled: their own prev events missing are not pulled, so that
+// the pulls stay bounded. Prev events still missing leave the PDU citing them a room extremity.
+func (w *stateDAGPDUs) pullPrevEvents(ctx context.Context) error {
+	pulled, err := w.run.jobs.fetcher.PrevEvents(ctx, w.run.roomID, w.run.roomVersion, w.pdus)
+	if err != nil || len(pulled) == 0 {
+		return err
+	} else if err := w.run.jobs.db.Rooms.EnqueuePulledIngestPDUs(ctx, w.run.roomID, pulled); err != nil {
+		return err
+	}
+	zerolog.Ctx(ctx).Info().Int("pulled", len(pulled)).Msg("Pulled prev events missing here")
+	w.pdus = sortTargetsTopologically(append(w.pdus, pulled...))
+	return nil
+}
+
+func (w *stateDAGPDUs) build(ctx context.Context) error {
+	if !w.gap || !w.joined {
+		return nil
+	}
+	sent, _ := holdUnanswered(w.pdus, w.unanswered)
+	var from []id.EventID
+	for _, target := range sent {
+		from = append(from, target.Event.AuthDependencyIDs()...)
+	}
+	return w.run.jobs.db.Rooms.ReplayStateDAG(ctx, w.run.roomID, rooms.StateDAGReplay{
+		RoomVersion: w.run.roomVersion,
+		From:        from,
+		Pending:     targetIDs(sent),
+		Publish:     true,
+	})
+}
+
+// publish sends the PDUs, with the events their gap fill replayed, but for those whose gap a server
+// failed to answer for and those citing them, which stay targets, failing the work for a later round
+// to ask again
+func (w *stateDAGPDUs) publish(ctx context.Context) error {
+	sent, held := holdUnanswered(w.pdus, w.unanswered)
+	if !w.gap || !w.joined {
+		return w.run.sendPDUs(ctx, nil, nil, sent)
+	} else if err := w.run.publishStateDAG(ctx, sent); err != nil {
+		return err
+	} else if len(held) == 0 {
+		return nil
+	}
+	w.pdus = held
+	return fmt.Errorf("no server gave the state DAG events %d PDUs cite: %w", len(held), errors.Join(w.errs...))
 }

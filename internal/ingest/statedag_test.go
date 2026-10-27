@@ -22,30 +22,32 @@ func TestStateDAGWorksRunJoinsOldestFirst(t *testing.T) {
 		testTarget(types.IngestTargetJoin, "$join2", 3),
 		testTarget(types.IngestTargetPDU, "$pdu", 2),
 		testTarget(types.IngestTargetJoin, "$join1", 1),
+		testTarget(types.IngestTargetPDU, "$gap", 2),
 	})
 	citesJoin := testTarget(types.IngestTargetPDU, "$citesJoin", 4)
 	citesJoin.Event.PrevStateEventIDs = []id.EventID{"$join1"}
 	citesThat := testTarget(types.IngestTargetPDU, "$citesThat", 5)
 	citesThat.Event.PrevEventIDs = []id.EventID{"$citesJoin"}
-	pdus = append([]*types.IngestTarget{citesThat, citesJoin}, pdus...)
-	for _, target := range append(slices.Clone(joins), pdus...) {
+	for _, target := range slices.Concat(joins, pdus, []*types.IngestTarget{citesJoin, citesThat}) {
 		target.Event.RoomVersion = string(gomatrixserverlib.RoomVersionStateDAGs)
 	}
-	pdus = sortTargetsTopologically(pdus)
+	connected, gaps := pdus[1:], sortTargetsTopologically([]*types.IngestTarget{citesThat, citesJoin, pdus[0]})
 
-	run := &jobRun{}
-	works := stateDAGWorks(run, joins, pdus, false)
+	kinds := stateDAGWorkKinds(&jobRun{})
+	works := roundWorks(kinds, joins, connected, gaps, false)
 	require.Len(t, works, 2, "while this server is not in the room, PDUs wait for its joins")
 	assert.Equal(t, []id.EventID{"$join1"}, targetIDs(works[0].targets()), "oldest first")
 	assert.IsType(t, &stateDAGJoin{}, works[0])
 
-	works = stateDAGWorks(run, joins, pdus, true)
-	require.Len(t, works, 4)
-	assert.Equal(t, []id.EventID{"$pdu"}, targetIDs(works[0].targets()), "in a room this server is in, PDUs go first")
-	assert.IsType(t, &stateDAGPDUs{}, works[0])
-	assert.Equal(t, []id.EventID{"$join1"}, targetIDs(works[1].targets()))
-	assert.Equal(t, []id.EventID{"$join2"}, targetIDs(works[2].targets()))
-	assert.Equal(t, []id.EventID{"$citesJoin", "$citesThat"}, targetIDs(works[3].targets()),
+	works = roundWorks(kinds, joins, connected, gaps, true)
+	require.Len(t, works, 5)
+	assert.Equal(t, []id.EventID{"$pdu"}, targetIDs(works[0].targets()), "in a room this server is in, connected PDUs go first")
+	assert.False(t, works[0].(*stateDAGPDUs).gap)
+	assert.Equal(t, []id.EventID{"$gap"}, targetIDs(works[1].targets()), "then those with a gap")
+	assert.True(t, works[1].(*stateDAGPDUs).gap)
+	assert.Equal(t, []id.EventID{"$join1"}, targetIDs(works[2].targets()))
+	assert.Equal(t, []id.EventID{"$join2"}, targetIDs(works[3].targets()))
+	assert.Equal(t, []id.EventID{"$citesJoin", "$citesThat"}, targetIDs(works[4].targets()),
 		"PDUs citing a pending join, or one citing it, go after the joins, in topological order")
 }
 

@@ -62,6 +62,12 @@ type ingestConfig struct {
 	// state DAG room (MSC4242) the state DAG
 	// Default: 1000000
 	MaxJoinEvents int `yaml:"maxJoinEvents"`
+	// Most state events a state DAG room's gap fill fetches for a PDU, counting each request naming
+	// it, and that one run of the room's job fetches in all, past which the PDU fails or the run's
+	// gap fills stop until it runs again
+	// Default: 10000 and 100000
+	MaxGapEvents       int `yaml:"maxGapEvents"`
+	MaxGapEventsPerRun int `yaml:"maxGapEventsPerRun"`
 	// Most PDUs, and their bytes, a room's job holds queued before /send waits for it to publish
 	// some rather than queue more
 	// Default: 2000 and 50000000
@@ -290,6 +296,12 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 	if cfg.Rooms.Ingest.MaxJoinEvents <= 0 {
 		cfg.Rooms.Ingest.MaxJoinEvents = 1_000_000
+	}
+	if cfg.Rooms.Ingest.MaxGapEvents <= 0 {
+		cfg.Rooms.Ingest.MaxGapEvents = 10_000
+	}
+	if cfg.Rooms.Ingest.MaxGapEventsPerRun <= 0 {
+		cfg.Rooms.Ingest.MaxGapEventsPerRun = 100_000
 	}
 	if cfg.Federation.MaxServedStateDAG <= 0 {
 		cfg.Federation.MaxServedStateDAG = 1_000_000

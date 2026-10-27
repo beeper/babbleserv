@@ -97,6 +97,11 @@ func TestRemoteMembershipErrors(t *testing.T) {
 			http.StatusForbidden, mautrix.MForbidden.ErrCode,
 		},
 		"failed make_join": {gomatrix.HTTPError{Code: http.StatusInternalServerError}, http.StatusBadGateway, mautrix.MUnknown.ErrCode},
+		"unreachable make_join": {
+			fmt.Errorf("%w via other: %w", errMakeRequestFailed, errors.New("connection refused")),
+			http.StatusBadGateway, mautrix.MUnknown.ErrCode,
+		},
+		"database failure": {errors.New("transaction too old"), http.StatusInternalServerError, mautrix.MUnknown.ErrCode},
 	} {
 		w := httptest.NewRecorder()
 		responseRemoteMembershipError(w, httptest.NewRequest(http.MethodPost, "/join", nil), test.err)
@@ -105,6 +110,16 @@ func TestRemoteMembershipErrors(t *testing.T) {
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), name)
 		assert.Equal(t, test.errcode, body["errcode"], name)
 	}
+}
+
+func TestRemoteMembershipErrorKeepsTheRoomVersion(t *testing.T) {
+	w := httptest.NewRecorder()
+	responseRemoteMembershipError(w, httptest.NewRequest(http.MethodPost, "/join", nil), gomatrix.HTTPError{
+		Code:     http.StatusBadRequest,
+		Contents: []byte(`{"errcode":"M_INCOMPATIBLE_ROOM_VERSION","error":"unsupported","room_version":"org.matrix.msc4242.12"}`),
+	})
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.JSONEq(t, `{"errcode":"M_INCOMPATIBLE_ROOM_VERSION","error":"unsupported","room_version":"org.matrix.msc4242.12"}`, w.Body.String())
 }
 
 func TestOtherServersSkipsDomainlessRoomIDs(t *testing.T) {

@@ -183,11 +183,12 @@ func (e *EventsDirectory) keyForAuthEventIDs(eventID id.EventID) fdb.Key {
 // TxnStoreEventRows writes events stored for the first time and returns the version this transaction
 // gives each: its body, an unfinalized auth header, its version unless it is an outlier, and with
 // indexed its entry in the index of all events. A member event stored before as an outlier keeps its
-// auth header, which an auth graph may have finalized as another event's auth event.
+// auth header, which an auth graph may have finalized as another event's auth event, as does an
+// unpublished event a replay gave state, which is stored published.
 func (e *EventsDirectory) TxnStoreEventRows(txn fdb.Transaction, indexed bool, evs ...*types.Event) map[id.EventID]tuple.Versionstamp {
 	storedHeaders := make(map[id.EventID]fdb.FutureByteSlice)
 	for _, ev := range evs {
-		if ev.Type == event.StateMember {
+		if ev.Type == event.StateMember && !ev.Unpublished {
 			storedHeaders[ev.ID] = txn.Get(e.keyForAuthEventIDs(ev.ID))
 		}
 	}
@@ -195,10 +196,15 @@ func (e *EventsDirectory) TxnStoreEventRows(txn fdb.Transaction, indexed bool, e
 	for i, ev := range evs {
 		version := tuple.IncompleteVersionstamp(uint16(i))
 		versions[ev.ID] = version
-		txn.Set(e.KeyForEventID(ev.ID), ev.ToMsgpack())
-		if header, found := storedHeaders[ev.ID]; !found || len(header.MustGet()) == 0 {
+		body := ev
+		if ev.Unpublished {
+			published := *ev
+			published.Unpublished = false
+			body = &published
+		} else if header, found := storedHeaders[ev.ID]; !found || len(header.MustGet()) == 0 {
 			txn.Set(e.keyForAuthEventIDs(ev.ID), packAuthHeader(types.AuthHeader{AuthEventIDs: ev.AuthEventIDs}))
 		}
+		txn.Set(e.KeyForEventID(ev.ID), body.ToMsgpack())
 		if indexed {
 			txn.SetVersionstampedKey(e.KeyForVersion(version), types.EventTupToBytes(ev.EventTup()))
 		}

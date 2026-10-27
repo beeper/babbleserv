@@ -195,6 +195,7 @@ func (j *Jobs) runJob(ctx context.Context, roomID id.RoomID, roomLock lock.Lock)
 		roomID:    roomID,
 		lock:      roomLock,
 		cancel:    cancel,
+		gapBudget: j.config.Rooms.Ingest.MaxGapEventsPerRun,
 		refreshed: time.Now(),
 		notices:   make(map[id.EventID]*time.Timer),
 	}
@@ -233,6 +234,9 @@ type jobRun struct {
 	roomVersion string
 	lock        lock.Lock
 	cancel      context.CancelCauseFunc
+	// The round's targets, and the state DAG events the run's gap fills may fetch still
+	targets   map[id.EventID]struct{}
+	gapBudget int
 
 	mu        sync.Mutex
 	refreshed time.Time
@@ -319,6 +323,10 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 		return run.failAll(ctx, targets, failureFromError(err))
 	}
 	run.scheduleJoinNotices(targets)
+	run.targets = make(map[id.EventID]struct{}, len(targets))
+	for _, target := range targets {
+		run.targets[target.Event.ID] = struct{}{}
+	}
 	works, err := strategy.collect(ctx, run, targets)
 	if err != nil {
 		return err

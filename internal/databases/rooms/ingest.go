@@ -205,31 +205,49 @@ func (r *RoomsDatabase) WatchIngestJoin(ctx context.Context, roomID id.RoomID, u
 // EnqueueIngestPDUs writes PDUs from origin as targets of the room's job, other than those stored
 // or targets already, and counts them in the room's queue
 func (r *RoomsDatabase) EnqueueIngestPDUs(ctx context.Context, roomID id.RoomID, origin string, evs []*types.Event) error {
-	if len(evs) == 0 {
+	now := time.Now().UnixMilli()
+	targets := make([]*types.IngestTarget, len(evs))
+	for i, ev := range evs {
+		targets[i] = &types.IngestTarget{
+			Kind:     types.IngestTargetPDU,
+			Event:    ev,
+			Servers:  []string{origin},
+			Enqueued: now,
+			Size:     len(ev.ToMsgpack()),
+		}
+	}
+	return r.enqueueIngestPDUs(ctx, roomID, targets)
+}
+
+// EnqueuePulledIngestPDUs writes PDU targets the room's job pulled, as EnqueueIngestPDUs writes those
+// sent here
+func (r *RoomsDatabase) EnqueuePulledIngestPDUs(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
+	for _, target := range targets {
+		if target.Kind != types.IngestTargetPDU || !target.Pulled {
+			return fmt.Errorf("target %s is not a pulled PDU", target.Event.ID)
+		}
+	}
+	return r.enqueueIngestPDUs(ctx, roomID, targets)
+}
+
+func (r *RoomsDatabase) enqueueIngestPDUs(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
+	if len(targets) == 0 {
 		return nil
 	}
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (types.Nil, error) {
-		if err := r.txnEnsureIngestJob(txn, roomID, evs[0].RoomVersion); err != nil {
+		if err := r.txnEnsureIngestJob(txn, roomID, targets[0].Event.RoomVersion); err != nil {
 			return nil, err
 		}
-		versions := make([]fdb.FutureByteSlice, len(evs))
-		targets := make([]fdb.FutureByteSlice, len(evs))
-		for i, ev := range evs {
-			versions[i] = txn.Get(r.events.KeyForIDToVersion(ev.ID))
-			targets[i] = txn.Get(r.keyForIngestTarget(roomID, ev.ID))
+		versions := make([]fdb.FutureByteSlice, len(targets))
+		existing := make([]fdb.FutureByteSlice, len(targets))
+		for i, target := range targets {
+			versions[i] = txn.Get(r.events.KeyForIDToVersion(target.Event.ID))
+			existing[i] = txn.Get(r.keyForIngestTarget(roomID, target.Event.ID))
 		}
-		now := time.Now().UnixMilli()
 		var queued types.IngestQueue
-		for i, ev := range evs {
-			if ev.RoomID != roomID || versions[i].MustGet() != nil || targets[i].MustGet() != nil {
+		for i, target := range targets {
+			if target.Event.RoomID != roomID || versions[i].MustGet() != nil || existing[i].MustGet() != nil {
 				continue
-			}
-			target := &types.IngestTarget{
-				Kind:     types.IngestTargetPDU,
-				Event:    ev,
-				Servers:  []string{origin},
-				Enqueued: now,
-				Size:     len(ev.ToMsgpack()),
 			}
 			r.txnSetIngestTarget(txn, target)
 			queued = queued.Add(queuedBy(target))
@@ -469,10 +487,11 @@ func (r *RoomsDatabase) ReplaceIngestJoin(ctx context.Context, old *types.Ingest
 		}
 		txn.Clear(r.keyForIngestTarget(roomID, old.Event.ID))
 		r.txnSetIngestTarget(txn, &types.IngestTarget{
-			Kind:     types.IngestTargetJoin,
-			Event:    joinEv,
-			Servers:  servers,
-			Enqueued: old.Enqueued,
+			Kind:         types.IngestTargetJoin,
+			Event:        joinEv,
+			Servers:      servers,
+			Enqueued:     old.Enqueued,
+			Replacements: old.Replacements + 1,
 		})
 		txn.Set(r.keyForIngestJoin(roomID, userID), (&types.IngestJoin{EventID: joinEv.ID}).ToMsgpack())
 		return true, nil

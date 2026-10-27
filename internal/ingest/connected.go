@@ -13,15 +13,15 @@ import (
 // SplitConnected splits a room's events, in topological order, into those citing only events in
 // place here or earlier connected events, which publish with nothing fetched, and the rest, whose
 // gaps the room's job fills. Prev events are in place when stored, as are auth events. In a state
-// DAG room (MSC4242) only the prev state events, with the implicit create event, must be in place,
-// with state here or stored in another room, which the MSC's section 2 rejects citing: unknown prev
-// events only leave the event a room extremity.
-func (j *Jobs) SplitConnected(ctx context.Context, evs []*types.Event) (connected, rest []*types.Event, err error) {
+// DAG room (MSC4242) the prev state events, with the implicit create event, must be published here,
+// with state, or stored in another room, which the MSC's section 2 rejects citing, and the prev
+// events stored, unless the event was pulled for another's prev events, whose own are not pulled.
+func (j *Jobs) SplitConnected(ctx context.Context, evs []*types.Event, pulled map[id.EventID]struct{}) (connected, rest []*types.Event, err error) {
 	if len(evs) == 0 {
 		return nil, nil, nil
 	}
 	evs = rooms.SortEventsTopologically(evs)
-	storedIDs, judgedIDs := citedEventIDs(evs)
+	storedIDs, judgedIDs := citedEventIDs(evs, pulled)
 	stored, err := j.db.Rooms.GetStoredEventIDs(ctx, storedIDs)
 	if err != nil {
 		return nil, nil, err
@@ -30,19 +30,23 @@ func (j *Jobs) SplitConnected(ctx context.Context, evs []*types.Event) (connecte
 	if err != nil {
 		return nil, nil, err
 	}
-	connected, rest = splitConnected(evs, stored, judged)
+	connected, rest = splitConnected(evs, stored, judged, pulled)
 	return connected, rest, nil
 }
 
 // citedEventIDs returns, each once, the events the events cite that must be stored, and the prev
 // state events of state DAG events
-func citedEventIDs(evs []*types.Event) (stored, prevState []id.EventID) {
+func citedEventIDs(evs []*types.Event, pulled map[id.EventID]struct{}) (stored, prevState []id.EventID) {
 	for _, ev := range evs {
-		if ev.StateDAGs() {
-			prevState = append(prevState, ev.AuthDependencyIDs()...)
-		} else {
+		switch {
+		case !ev.StateDAGs():
 			stored = append(stored, ev.PrevEventIDs...)
 			stored = append(stored, ev.AuthDependencyIDs()...)
+		case isPulled(ev, pulled):
+			prevState = append(prevState, ev.AuthDependencyIDs()...)
+		default:
+			stored = append(stored, ev.PrevEventIDs...)
+			prevState = append(prevState, ev.AuthDependencyIDs()...)
 		}
 	}
 	slices.Sort(stored)
@@ -50,8 +54,13 @@ func citedEventIDs(evs []*types.Event) (stored, prevState []id.EventID) {
 	return slices.Compact(stored), slices.Compact(prevState)
 }
 
+func isPulled(ev *types.Event, pulled map[id.EventID]struct{}) bool {
+	_, found := pulled[ev.ID]
+	return found
+}
+
 // splitConnected splits events in topological order, keeping it in both parts
-func splitConnected(evs []*types.Event, stored, prevStateInPlace map[id.EventID]struct{}) (connected, rest []*types.Event) {
+func splitConnected(evs []*types.Event, stored, prevStateInPlace, pulled map[id.EventID]struct{}) (connected, rest []*types.Event) {
 	earlier := make(map[id.EventID]struct{}, len(evs))
 	missingFrom := func(inPlace map[id.EventID]struct{}) func(id.EventID) bool {
 		return func(eventID id.EventID) bool {
@@ -63,7 +72,8 @@ func splitConnected(evs []*types.Event, stored, prevStateInPlace map[id.EventID]
 	for _, ev := range evs {
 		var gap bool
 		if ev.StateDAGs() {
-			gap = slices.ContainsFunc(ev.AuthDependencyIDs(), missingFrom(prevStateInPlace))
+			gap = slices.ContainsFunc(ev.AuthDependencyIDs(), missingFrom(prevStateInPlace)) ||
+				!isPulled(ev, pulled) && slices.ContainsFunc(ev.PrevEventIDs, missingFrom(stored))
 		} else {
 			gap = slices.ContainsFunc(ev.PrevEventIDs, missingFrom(stored)) || slices.ContainsFunc(ev.AuthDependencyIDs(), missingFrom(stored))
 		}
@@ -81,11 +91,15 @@ func splitConnected(evs []*types.Event, stored, prevStateInPlace map[id.EventID]
 func (j *Jobs) splitConnectedTargets(ctx context.Context, pdus []*types.IngestTarget) (connected, gaps []*types.IngestTarget, err error) {
 	byID := make(map[id.EventID]*types.IngestTarget, len(pdus))
 	evs := make([]*types.Event, len(pdus))
+	pulled := make(map[id.EventID]struct{})
 	for i, target := range pdus {
 		byID[target.Event.ID] = target
 		evs[i] = target.Event
+		if target.Pulled {
+			pulled[target.Event.ID] = struct{}{}
+		}
 	}
-	connectedEvs, gapEvs, err := j.SplitConnected(ctx, evs)
+	connectedEvs, gapEvs, err := j.SplitConnected(ctx, evs, pulled)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -41,8 +41,9 @@ func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.Eve
 }
 
 // GetPrevStateEventIDsInPlace returns those of the events that an event of a state DAG room can be
-// judged citing in prev_state_events: stored in the room with state contexts, or stored in another
-// room, which the MSC's section 2 rejects citing
+// judged citing in prev_state_events: published in the room, with state contexts and not replayed by
+// its job without being published yet, or stored in another room, which the MSC's section 2 rejects
+// citing
 func (r *RoomsDatabase) GetPrevStateEventIDsInPlace(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
 	withState := make(map[id.EventID]struct{})
 	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
@@ -52,7 +53,7 @@ func (r *RoomsDatabase) GetPrevStateEventIDsInPlace(ctx context.Context, roomID 
 			for _, eventID := range chunk {
 				if ev, err := eventsProvider.Get(eventID); err != nil {
 					return nil, err
-				} else if ev.HasStateIn(roomID) || ev != nil && ev.RoomID != roomID {
+				} else if ev.HasStateIn(roomID) && !ev.Unpublished || ev != nil && ev.RoomID != roomID {
 					withState[eventID] = struct{}{}
 				}
 			}
@@ -199,6 +200,20 @@ func (r *RoomsDatabase) txnGetStoredEventIDs(txn fdb.ReadTransaction, eventIDs [
 		}
 	}
 	return stored, nil
+}
+
+// txnAnyHasState reports whether any of the events has state in the room, reading them normally
+func (r *RoomsDatabase) txnAnyHasState(ctx context.Context, txn fdb.ReadTransaction, roomID id.RoomID, eventIDs []id.EventID) (bool, error) {
+	eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+	eventsProvider.WillGet(eventIDs...)
+	for _, eventID := range eventIDs {
+		if ev, err := eventsProvider.Get(eventID); err != nil {
+			return false, err
+		} else if ev.HasStateIn(roomID) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *RoomsDatabase) GetEvent(ctx context.Context, eventID id.EventID) (*types.Event, error) {

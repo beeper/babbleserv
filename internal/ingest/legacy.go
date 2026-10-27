@@ -37,7 +37,13 @@ type joinWork struct {
 	run    *jobRun
 	target *types.IngestTarget
 	join   *databases.RemoteJoin
+	// A server answered a send_join of the join, so accepted it, as a state DAG resident serving no
+	// state DAG that connects it does
+	answered bool
 }
+
+// Fresh joins a refused join is replaced with, at most, from the user's first
+const maxJoinReplacements = 1
 
 func (w *joinWork) targets() []*types.IngestTarget {
 	return []*types.IngestTarget{w.target}
@@ -93,7 +99,8 @@ func (w *joinWork) mayLand(ctx context.Context) (*types.IngestTarget, error) {
 
 // sendFailed handles a send_join that got no response, before being the target as it was before
 // the send. A server refusing the join fails it, unless an earlier send may have landed, which
-// returns errResendRefused. Otherwise it pauses before the next attempt, failing the join once it
+// returns errResendRefused, or another server answered one, so accepted the join, which leaves the
+// join to the next attempt. Otherwise it pauses before the next attempt, failing the join once it
 // timed out.
 func (w *joinWork) sendFailed(ctx context.Context, before *types.IngestTarget, server string, attempt int, err error) error {
 	if ctx.Err() != nil {
@@ -107,7 +114,10 @@ func (w *joinWork) sendFailed(ctx context.Context, before *types.IngestTarget, s
 		Logger()
 	switch classifySendJoinError(err) {
 	case sendJoinRefused:
-		if !before.MayHaveLanded {
+		if w.answered {
+			log.Warn().Msg("Server refused a join another server accepted")
+			break
+		} else if !before.MayHaveLanded {
 			log.Warn().Msg("Server refused the join")
 			return w.run.fail(ctx, w.target, failureFromError(err))
 		}
@@ -124,6 +134,9 @@ func (w *joinWork) sendFailed(ctx context.Context, before *types.IngestTarget, s
 	}
 	if time.Now().After(time.UnixMilli(w.target.Enqueued).Add(w.run.jobs.config.Rooms.Ingest.JoinTimeout)) {
 		log.Warn().Msg("Giving up sending the join")
+		if w.answered {
+			return w.run.fail(ctx, w.target, incompleteStateDAGFailure())
+		}
 		return w.run.fail(ctx, w.target, unreachableFailure(err))
 	}
 	// Each attempt is bounded by the request's timeout, and JoinTimeout bounds them all
@@ -143,8 +156,13 @@ func sendJoinRetryPause(attempt int) time.Duration {
 	return pause/2 + rand.N(pause/2)
 }
 
-// replaceJoin replaces the target with a join from a fresh make_join, which the next round sends
+// replaceJoin replaces the target with a join from a fresh make_join, which the next round sends,
+// unless it replaced the user's first join already
 func (w *joinWork) replaceJoin(ctx context.Context, refusal error) error {
+	if w.target.Replacements >= maxJoinReplacements {
+		zerolog.Ctx(ctx).Warn().Int("replacements", w.target.Replacements).Msg("Not replacing a refused join again")
+		return w.run.fail(ctx, w.target, failureFromError(refusal))
+	}
 	userID := id.UserID(*w.target.Event.StateKey)
 	joinEv, server, err := w.run.jobs.makeJoin(ctx, w.run.roomID, w.run.roomVersion, userID, w.target.Servers)
 	if err != nil {

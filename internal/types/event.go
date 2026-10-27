@@ -57,6 +57,9 @@ type Event struct {
 	SoftFailed bool `msgpack:"sfd" json:"-"`
 	Outlier    bool `msgpack:"out" json:"-"`
 	Rejected   bool `msgpack:"rej" json:"-"`
+	// An accepted state event of a state DAG room that an ingest job's replay gave state, which the
+	// job publishes later: no published event cites one, see Jobs.SplitConnected
+	Unpublished bool `msgpack:"unp,omitempty" json:"-"`
 	// Internal indicator of whether the event has been redacted - needed? (content hash)
 	Redacted bool `msgpack:"red" json:"-"`
 
@@ -592,14 +595,15 @@ func (ev *Event) HasStateIn(roomID id.RoomID) bool {
 	return ev != nil && !ev.Outlier && ev.RoomID == roomID && !ev.AfterState.IsZero()
 }
 
-// ResetOutcome clears what authorizing the event decided: its rejection, soft failure and state.
+// ResetOutcome clears what authorizing the event decided: its rejection, soft failure and state, and
+// whether it awaits publication.
 func (ev *Event) ResetOutcome() {
-	ev.Rejected, ev.SoftFailed = false, false
+	ev.Rejected, ev.SoftFailed, ev.Unpublished = false, false, false
 	ev.BeforeState, ev.AfterState = StateHash{}, StateHash{}
 }
 
 // CopyOutcome gives the event what authorizing another copy of it decided.
 func (ev *Event) CopyOutcome(from *Event) {
-	ev.Rejected, ev.SoftFailed = from.Rejected, from.SoftFailed
+	ev.Rejected, ev.SoftFailed, ev.Unpublished = from.Rejected, from.SoftFailed, from.Unpublished
 	ev.BeforeState, ev.AfterState = from.BeforeState, from.AfterState
 }

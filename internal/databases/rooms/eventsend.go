@@ -102,6 +102,15 @@ func (r *RoomsDatabase) txnStoreEvents(
 		if ev.Rejected || ev.SoftFailed {
 			continue
 		}
+		if stateDAGs && entersStateDAG(ev) {
+			r.events.TxnSetRoomStateExtremEventID(txn, room.ID, ev.ID, version, ev.PrevStateEventIDs)
+			r.events.TxnAddRoomStateDAGEvent(txn, room.ID, ev.ID, version)
+		}
+		// Older state the room's ingest job replayed for a gap, which stays out of the timeline and
+		// the room extremities, as Synapse keeps the state events it fetches out of them
+		if ev.Unpublished {
+			continue
+		}
 
 		if ev.Depth > depth {
 			// Update room depth
@@ -167,11 +176,6 @@ func (r *RoomsDatabase) txnStoreEvents(
 		}
 		// Set this last, so rooms always have a last event
 		r.events.TxnSetRoomExtremEventID(txn, room.ID, ev.ID)
-
-		if stateDAGs && entersStateDAG(ev) {
-			r.events.TxnSetRoomStateExtremEventID(txn, room.ID, ev.ID, version, ev.PrevStateEventIDs)
-			r.events.TxnAddRoomStateDAGEvent(txn, room.ID, ev.ID, version)
-		}
 	}
 
 	if len(batchVersions) > 0 {

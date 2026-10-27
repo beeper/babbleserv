@@ -117,8 +117,8 @@ func TestLegacyWorksRunJoinsOldestFirst(t *testing.T) {
 	citesThat := testTarget(types.IngestTargetPDU, "$citesThat", 7)
 	citesThat.Event.PrevEventIDs = []id.EventID{"$citesJoin"}
 
-	run := &jobRun{}
-	works := legacyWorks(run, joins, pdus[1:], []*types.IngestTarget{pdus[0], citesJoin, citesThat}, true)
+	kinds := legacyWorkKinds(&jobRun{})
+	works := roundWorks(kinds, joins, pdus[1:], []*types.IngestTarget{pdus[0], citesJoin, citesThat}, true)
 	require.Len(t, works, 5)
 	assert.Equal(t, []id.EventID{"$pdu1", "$pdu2"}, targetIDs(works[0].targets()),
 		"in a room this server is in, connected PDUs go first, together")
@@ -131,10 +131,10 @@ func TestLegacyWorksRunJoinsOldestFirst(t *testing.T) {
 		"PDUs citing a pending join, or one citing it, go after the joins")
 	assert.True(t, works[4].(*legacyPDUs).gap)
 
-	works = legacyWorks(run, joins, nil, nil, false)
+	works = roundWorks(kinds, joins, nil, nil, false)
 	assert.Len(t, works, 2, "while this server is not in the room, PDUs wait for its joins")
 
-	works = legacyWorks(run, nil, pdus, nil, false)
+	works = roundWorks(kinds, nil, pdus, nil, false)
 	require.Len(t, works, 1, "a room's PDUs go once no join is left, joined or not")
 	assert.Len(t, works[0].targets(), 3)
 }
@@ -156,13 +156,13 @@ func TestSplitConnected(t *testing.T) {
 		testPDU("$missingAuth", []id.EventID{"$tip"}, "$create", "$outlier"),
 		testPDU("$merge", []id.EventID{"$tip", "$citesConnected"}, auth...),
 	})
-	connected, rest := splitConnected(evs, stored, nil)
+	connected, rest := splitConnected(evs, stored, nil, nil)
 	assert.Equal(t, []id.EventID{"$connected", "$citesConnected", "$merge"}, util.EventsToIDs(connected),
 		"citing stored events and earlier connected ones, in topological order")
 	assert.Equal(t, []id.EventID{"$gap", "$citesGap", "$missingAuth"}, util.EventsToIDs(rest),
 		"citing an unstored prev or auth event, or an event with a gap")
 
-	storedIDs, prevStateIDs := citedEventIDs(evs)
+	storedIDs, prevStateIDs := citedEventIDs(evs, nil)
 	assert.ElementsMatch(t,
 		[]id.EventID{"$citesConnected", "$connected", "$create", "$gap", "$member", "$missing", "$outlier", "$power", "$tip"},
 		storedIDs, "each cited event once")
@@ -176,30 +176,35 @@ func stateDAGTestPDU(eventID id.EventID, prevIDs []id.EventID, prevStateIDs ...i
 }
 
 // A state DAG event is connected once its prev state events, the create event among them, are in
-// place here or are earlier connected events, whether or not its prev events are stored
+// place here or are earlier connected events, and its prev events are stored or earlier connected
+// events, unless it was pulled for another's prev events
 func TestSplitConnectedStateDAG(t *testing.T) {
 	inPlace := map[id.EventID]struct{}{"$createhash": {}, "$tip": {}, "$state": {}, "$otherRoom": {}}
+	stored := map[id.EventID]struct{}{"$tip": {}, "$staged": {}}
 	evs := rooms.SortEventsTopologically([]*types.Event{
 		stateDAGTestPDU("$message", []id.EventID{"$tip"}, "$state"),
 		stateDAGTestPDU("$citesStaged", []id.EventID{"$tip"}, "$staged"),
 		stateDAGTestPDU("$citesStagedAsPrev", []id.EventID{"$staged"}, "$state"),
 		stateDAGTestPDU("$unknownPrev", []id.EventID{"$missing"}, "$state"),
+		stateDAGTestPDU("$pulledUnknownPrev", []id.EventID{"$missing"}, "$state"),
 		stateDAGTestPDU("$citesMessage", []id.EventID{"$message"}, "$message"),
 		stateDAGTestPDU("$citesOtherRoom", []id.EventID{"$tip"}, "$otherRoom"),
 		stateDAGTestPDU("$citesGap", []id.EventID{"$tip"}, "$citesStaged"),
 	})
-	connected, rest := splitConnected(evs, nil, inPlace)
-	assert.Equal(t, []id.EventID{"$message", "$citesStagedAsPrev", "$unknownPrev", "$citesMessage", "$citesOtherRoom"}, util.EventsToIDs(connected),
-		"prev events need not be stored, and an earlier connected event is in place")
-	assert.Equal(t, []id.EventID{"$citesStaged", "$citesGap"}, util.EventsToIDs(rest),
-		"citing a prev state event stored without state, or an event with a gap")
+	pulled := map[id.EventID]struct{}{"$pulledUnknownPrev": {}}
+	connected, rest := splitConnected(evs, stored, inPlace, pulled)
+	assert.Equal(t, []id.EventID{"$message", "$citesStagedAsPrev", "$pulledUnknownPrev", "$citesMessage", "$citesOtherRoom"}, util.EventsToIDs(connected),
+		"a prev event stored without state is in place as a prev event, and an earlier connected event is in place")
+	assert.Equal(t, []id.EventID{"$citesStaged", "$unknownPrev", "$citesGap"}, util.EventsToIDs(rest),
+		"citing a prev state event stored without state, an unknown prev event when sent here, or an event with a gap")
 
-	storedIDs, prevStateIDs := citedEventIDs(evs)
-	assert.Empty(t, storedIDs, "nothing a state DAG event cites must merely be stored")
+	storedIDs, prevStateIDs := citedEventIDs(evs, pulled)
+	assert.ElementsMatch(t, []id.EventID{"$tip", "$staged", "$missing", "$message"}, storedIDs,
+		"the prev events, but for those of a pulled event")
 	assert.ElementsMatch(t, []id.EventID{"$createhash", "$state", "$staged", "$message", "$otherRoom", "$citesStaged"}, prevStateIDs,
 		"the prev state events with the implicit create event")
 
-	connected, rest = splitConnected(evs[:1], nil, map[id.EventID]struct{}{"$state": {}})
+	connected, rest = splitConnected(evs[:1], stored, map[id.EventID]struct{}{"$state": {}}, nil)
 	assert.Empty(t, connected)
 	assert.Len(t, rest, 1, "the create event must be in place too")
 }
@@ -209,14 +214,14 @@ func TestSplitConnectedNeedsTheImplicitCreateEvent(t *testing.T) {
 	ev.RoomID, ev.RoomVersion = "!createhash", "12"
 	stored := map[id.EventID]struct{}{"$tip": {}, "$power": {}, "$member": {}}
 
-	connected, rest := splitConnected([]*types.Event{ev}, stored, nil)
+	connected, rest := splitConnected([]*types.Event{ev}, stored, nil, nil)
 	assert.Empty(t, connected)
 	assert.Len(t, rest, 1, "a v12 event cites its room's create event without listing it")
 
 	stored["$createhash"] = struct{}{}
-	connected, _ = splitConnected([]*types.Event{ev}, stored, nil)
+	connected, _ = splitConnected([]*types.Event{ev}, stored, nil, nil)
 	assert.Len(t, connected, 1)
-	storedIDs, _ := citedEventIDs([]*types.Event{ev})
+	storedIDs, _ := citedEventIDs([]*types.Event{ev}, nil)
 	assert.Contains(t, storedIDs, id.EventID("$createhash"))
 }
 

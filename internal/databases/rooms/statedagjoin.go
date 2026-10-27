@@ -58,26 +58,50 @@ func (r *RoomsDatabase) StageStateDAGEvents(ctx context.Context, roomID id.RoomI
 }
 
 // stateDAGWalk is what a walk back along prev_state_events reached of a state DAG room's state DAG
-// without contexts here: the events stored without, each with the events it cites, the create among
-// them, and the events missing, not stored or stored only as outliers. Events with contexts end the
-// walk, as do events of other rooms, which the MSC's section 2 rejects citing.
+// not published here: the events stored without contexts, and those replayed and not published yet
+// (types.Event.Unpublished), each with the events it cites, the create among them, the events missing,
+// not stored or stored only as outliers, and the pending events reached, which the room's job
+// publishes rather than replays. Published events end the walk, as do events of other rooms, which
+// the MSC's section 2 rejects citing.
 type stateDAGWalk struct {
-	cites   map[id.EventID][]id.EventID
-	missing map[id.EventID]struct{}
+	cites       map[id.EventID][]id.EventID
+	unpublished map[id.EventID]struct{}
+	missing     map[id.EventID]struct{}
+	pending     map[id.EventID]struct{}
+	// Of the events in cites, kept when asked for
+	evs map[id.EventID]*types.Event
 }
 
 func walkUnreplayed(
 	roomID id.RoomID,
-	fromIDs []id.EventID,
+	fromIDs, pendingIDs []id.EventID,
+	keepEvents bool,
 	read func([]id.EventID) (map[id.EventID]*types.Event, error),
 ) (*stateDAGWalk, error) {
-	walk := &stateDAGWalk{cites: make(map[id.EventID][]id.EventID), missing: make(map[id.EventID]struct{})}
+	walk := &stateDAGWalk{
+		cites:       make(map[id.EventID][]id.EventID),
+		unpublished: make(map[id.EventID]struct{}),
+		missing:     make(map[id.EventID]struct{}),
+		pending:     make(map[id.EventID]struct{}),
+	}
+	if keepEvents {
+		walk.evs = make(map[id.EventID]*types.Event)
+	}
+	pending := make(map[id.EventID]struct{}, len(pendingIDs))
+	for _, eventID := range pendingIDs {
+		pending[eventID] = struct{}{}
+	}
 	seen := make(map[id.EventID]struct{})
 	var frontier []id.EventID
 	visit := func(eventIDs []id.EventID) {
 		for _, eventID := range eventIDs {
-			if _, found := seen[eventID]; !found {
-				seen[eventID] = struct{}{}
+			if _, found := seen[eventID]; found {
+				continue
+			}
+			seen[eventID] = struct{}{}
+			if _, found := pending[eventID]; found {
+				walk.pending[eventID] = struct{}{}
+			} else {
 				frontier = append(frontier, eventID)
 			}
 		}
@@ -91,13 +115,21 @@ func walkUnreplayed(
 			return nil, err
 		}
 		for _, eventID := range chunk {
-			switch ev := evs[eventID]; {
+			ev := evs[eventID]
+			switch {
 			case ev == nil || ev.Outlier:
 				walk.missing[eventID] = struct{}{}
-			case ev.RoomID == roomID && !ev.HasStateIn(roomID):
-				walk.cites[eventID] = ev.AuthDependencyIDs()
-				visit(walk.cites[eventID])
+				continue
+			case ev.RoomID != roomID || ev.HasStateIn(roomID) && !ev.Unpublished:
+				continue
+			case ev.Unpublished:
+				walk.unpublished[eventID] = struct{}{}
 			}
+			walk.cites[eventID] = ev.AuthDependencyIDs()
+			if walk.evs != nil {
+				walk.evs[eventID] = ev
+			}
+			visit(walk.cites[eventID])
 		}
 	}
 	return walk, nil
@@ -111,7 +143,7 @@ func (r *RoomsDatabase) MissingStateDAGEvents(ctx context.Context, joinEv *types
 	if err != nil {
 		return nil, err
 	}
-	walk, err := walkUnreplayed(joinEv.RoomID, joinEv.AuthDependencyIDs(), read)
+	walk, err := walkUnreplayed(joinEv.RoomID, joinEv.AuthDependencyIDs(), nil, false, read)
 	if err != nil {
 		return nil, err
 	}
@@ -119,8 +151,8 @@ func (r *RoomsDatabase) MissingStateDAGEvents(ctx context.Context, joinEv *types
 }
 
 // replayOrder orders the events of a walk so each follows the events it cites among them, the lowest
-// event ID first of those ready (Kahn's algorithm). An event reaching one missing is left out, and
-// counted, as is one on a cycle, which events whose IDs hash what they cite cannot form.
+// event ID first of those ready (Kahn's algorithm). An event reaching one missing or pending is left
+// out, and counted, as is one on a cycle, which events whose IDs hash what they cite cannot form.
 func replayOrder(walk *stateDAGWalk) (order []id.EventID, unreplayable int) {
 	eventIDs := slices.Sorted(maps.Keys(walk.cites))
 	index := make(map[id.EventID]int, len(eventIDs))
@@ -135,6 +167,8 @@ func replayOrder(walk *stateDAGWalk) (order []id.EventID, unreplayable int) {
 				citedBy[j] = append(citedBy[j], i)
 				remaining[i]++
 			} else if _, missing := walk.missing[citedID]; missing {
+				remaining[i]++
+			} else if _, pending := walk.pending[citedID]; pending {
 				remaining[i]++
 			}
 		}
@@ -167,34 +201,41 @@ const (
 	replayTxnTime  = 2 * time.Second
 )
 
-// ReplayStateDAG gives contexts to the events of a state DAG room stored without that a join and the
-// tips of the state DAG served with it reach along prev_state_events (phase B of a state DAG join):
-// in topological order, each as step 5 gives a federated event its state, see txnReplayEvent, in
-// staging transactions. The events stay unpublished, as nothing touches the room record, its
-// extremities or its timeline, but its accepted state events join the room's state DAG that
-// send_join serves, as the resident server published them. A resolution beyond the inline budgets
-// runs as an artifact job between transactions. The contexts are the progress: a replay resumed
-// walks again and goes on. Events reaching one missing are left without, so a join citing one finds
-// its state unavailable, and a tip citing one stays no state extremity.
-func (r *RoomsDatabase) ReplayStateDAG(ctx context.Context, joinEv *types.Event, tips []id.EventID) error {
-	roomID := joinEv.RoomID
-	log := zerolog.Ctx(ctx).With().Stringer("room_id", roomID).Stringer("event_id", joinEv.ID).Logger()
+// StateDAGReplay is what ReplayStateDAG replays of a state DAG room
+type StateDAGReplay struct {
+	RoomVersion string
+	// The events the replay walks back from along prev_state_events, the implicit create among them
+	From []id.EventID
+	// Events the room's job publishes rather than replays, so events citing one are left without
+	// state: a join, or the PDUs a gap fill is for
+	Pending []id.EventID
+	// The job publishes the replayed events, in a room this server is in, so they stay Unpublished
+	// until then. Otherwise they are the history before a join, which its publish leaves unpublished,
+	// whose state events join the state DAG send_join serves, as the resident published them, and so
+	// does any replayed but unpublished event the replay reaches.
+	Publish bool
+}
+
+// ReplayStateDAG gives contexts to the events of a state DAG room stored without that the given
+// events reach along prev_state_events (phase B of a state DAG join or gap fill): in topological
+// order, each as step 5 gives a federated event its state, see txnReplayEvent, in staging
+// transactions. Nothing touches the room record, its extremities or its timeline. A resolution beyond
+// the inline budgets runs as an artifact job between transactions. The contexts are the progress: a
+// replay resumed walks again and goes on. Events reaching one missing or pending are left without,
+// so a join citing one finds its state unavailable, and a tip citing one stays no state extremity.
+func (r *RoomsDatabase) ReplayStateDAG(ctx context.Context, roomID id.RoomID, replay StateDAGReplay) error {
+	log := zerolog.Ctx(ctx).With().Stringer("room_id", roomID).Bool("publish", replay.Publish).Logger()
 	read, err := r.renewableEventReads(ctx, roomID)
 	if err != nil {
 		return err
 	}
-	walk, err := walkUnreplayed(roomID, slices.Concat(joinEv.AuthDependencyIDs(), tips), read)
+	walk, err := walkUnreplayed(roomID, replay.From, replay.Pending, false, read)
 	if err != nil {
 		return err
 	}
-	// The join is published, never replayed, should it be stored without state
-	if _, found := walk.cites[joinEv.ID]; found {
-		delete(walk.cites, joinEv.ID)
-		walk.missing[joinEv.ID] = struct{}{}
-	}
 	order, unreplayable := replayOrder(walk)
 	if unreplayable > 0 {
-		log.Warn().Int("events", unreplayable).Msg("State DAG events reach events missing here, leaving them without state")
+		log.Warn().Int("events", unreplayable).Msg("State DAG events reach events missing or not published here, leaving them without state")
 	}
 	start := time.Now()
 	sender := r.newEventSender(roomID, pushContext{})
@@ -202,7 +243,7 @@ func (r *RoomsDatabase) ReplayStateDAG(ctx context.Context, joinEv *types.Event,
 	var replayed, rejected, transactions int
 	for len(order) > 0 {
 		batch, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (*replayBatch, error) {
-			return r.txnReplay(ctx, txn, roomID, joinEv.RoomVersion, order, walk)
+			return r.txnReplay(ctx, txn, roomID, replay, order, walk)
 		})
 		if err != nil {
 			return fmt.Errorf("failed to replay the state DAG: %w", err)
@@ -216,7 +257,7 @@ func (r *RoomsDatabase) ReplayStateDAG(ctx context.Context, joinEv *types.Event,
 		work := resolveStateWork{
 			request:     batch.request,
 			inputs:      artifactInputs{stateBatch: r.state.NewBatch(roomID)},
-			roomVersion: joinEv.RoomVersion,
+			roomVersion: replay.RoomVersion,
 		}
 		if err := built.check(work); err != nil {
 			return err
@@ -225,12 +266,14 @@ func (r *RoomsDatabase) ReplayStateDAG(ctx context.Context, joinEv *types.Event,
 		}
 		built.add(work)
 	}
-	log.Info().
-		Int("replayed", replayed).
-		Int("rejected", rejected).
-		Int("transactions", transactions).
-		Dur("duration", time.Since(start)).
-		Msg("Replayed the state DAG of a join")
+	if replayed > 0 || transactions > 1 {
+		log.Info().
+			Int("replayed", replayed).
+			Int("rejected", rejected).
+			Int("transactions", transactions).
+			Dur("duration", time.Since(start)).
+			Msg("Replayed state DAG events")
+	}
 	return nil
 }
 
@@ -244,12 +287,13 @@ type replayBatch struct {
 // txnReplay replays events in order until the transaction holds the staging budget, ends a resolution
 // the next event needs beyond the inline budgets, or has run replayTxnTime. It reads the events with
 // normal reads and skips those with contexts, so a runner overlapping it conflicts with it rather
-// than replaying an event twice. Accepted state events join the room's state DAG in the order given.
+// than replaying an event twice. Accepted state events the job publishes are kept unpublished, the
+// others join the room's state DAG in the order given, as do unpublished events the replay reaches.
 func (r *RoomsDatabase) txnReplay(
 	ctx context.Context,
 	txn fdb.Transaction,
 	roomID id.RoomID,
-	roomVersion string,
+	replay StateDAGReplay,
 	order []id.EventID,
 	walk *stateDAGWalk,
 ) (*replayBatch, error) {
@@ -267,9 +311,11 @@ func (r *RoomsDatabase) txnReplay(
 		eventsProvider: eventsProvider,
 	}
 	sender := r.newEventSender(roomID, pushContext{})
-	resolver := sender.newResolver(txn, prepared, roomVersion)
+	resolver := sender.newResolver(txn, prepared, replay.RoomVersion)
 	budget := r.config.Rooms.StateBudget.StagingBytes
 	batch := &replayBatch{}
+	// The replayed events and, outside a publish, the unpublished ones the replay reached, in order
+	var adopted []*types.Event
 	eventBytes := 0
 	for _, eventID := range order {
 		ev, err := eventsProvider.GetRequired(eventID)
@@ -277,6 +323,11 @@ func (r *RoomsDatabase) txnReplay(
 			return nil, err
 		} else if ev.HasStateIn(roomID) {
 			batch.done++
+			if ev.Unpublished && !replay.Publish {
+				ev.Unpublished = false
+				adopted = append(adopted, ev)
+				eventBytes += len(ev.ToMsgpack())
+			}
 			continue
 		}
 		if batch.request, err = r.txnReplayEvent(ctx, txn, prepared, resolver, ev); err != nil {
@@ -285,6 +336,7 @@ func (r *RoomsDatabase) txnReplay(
 			break
 		}
 		prepared.evs = append(prepared.evs, ev)
+		adopted = append(adopted, ev)
 		batch.done++
 		if ev.Rejected {
 			batch.rejected++
@@ -295,12 +347,17 @@ func (r *RoomsDatabase) txnReplay(
 		}
 	}
 	batch.replayed = len(prepared.evs)
-	r.events.TxnAdoptEvents(txn, prepared.evs...)
+	for _, ev := range prepared.evs {
+		ev.Unpublished = replay.Publish && isAcceptedState(ev)
+	}
+	r.events.TxnAdoptEvents(txn, adopted...)
 	prepared.stateBatch.TxnWrite(txn, prepared.stateContexts()...)
 	prepared.authGraph.Write(txn)
-	for i, ev := range prepared.evs {
-		if isAcceptedState(ev) {
-			r.events.TxnAddRoomStateDAGEvent(txn, roomID, ev.ID, tuple.IncompleteVersionstamp(uint16(i)))
+	if !replay.Publish {
+		for i, ev := range adopted {
+			if isAcceptedState(ev) {
+				r.events.TxnAddRoomStateDAGEvent(txn, roomID, ev.ID, tuple.IncompleteVersionstamp(uint16(i)))
+			}
 		}
 	}
 	return batch, nil

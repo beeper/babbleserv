@@ -35,6 +35,11 @@ type IngestTarget struct {
 	FailedAt int64 `msgpack:"fat,omitempty"`
 	// The bytes a PDU counts for in its room's queue, from when it was enqueued
 	Size int `msgpack:"sz,omitempty"`
+	// Fresh joins from make_join this join replaced the user's first with, each a resident refused
+	Replacements int `msgpack:"rpl,omitempty"`
+	// A PDU pulled by get_missing_events for a target's unknown prev events rather than sent here,
+	// whose own prev events are not pulled, so that the pulls stay bounded
+	Pulled bool `msgpack:"pld,omitempty"`
 }
 
 // IngestQueue is what a room's job has queued of PDUs, which /send stops adding to while it is full

@@ -35,6 +35,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 		Failures:      2,
 		FailedAt:      5678,
 		Size:          321,
+		Pulled:        true,
 	}
 	decoded, err := NewIngestTargetFromBytes(target.ToMsgpack(), ev.ID)
 	require.NoError(t, err)
@@ -45,6 +46,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 	assert.Equal(t, 2, decoded.Failures)
 	assert.Equal(t, int64(5678), decoded.FailedAt)
 	assert.Equal(t, 321, decoded.Size)
+	assert.True(t, decoded.Pulled)
 	assert.Equal(t, ev.ID, decoded.Event.ID, "the ID comes from the key")
 	assert.Equal(t, ev.Type, decoded.Event.Type)
 	assert.Equal(t, ev.RoomVersion, decoded.Event.RoomVersion)

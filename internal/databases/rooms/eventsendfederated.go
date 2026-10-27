@@ -363,6 +363,9 @@ type federatedPreparation struct {
 	givenBefore map[id.EventID]types.StateHash
 	dropped     map[id.EventID]struct{}
 	rejected    map[id.EventID]struct{}
+	// Batch events stored without state, whose headers staging wrote citing nothing
+	stateless map[id.EventID]struct{}
+	batch     map[id.EventID]struct{}
 	// A state DAG room (MSC4242), whose events cite no auth events and take the state after their
 	// prev state events
 	stateDAGs bool
@@ -453,7 +456,12 @@ func (s *federatedEventSender) txnPrepareFederated(
 		// Batch events citing a fetched event that could not be evaluated are dropped with it
 		dropped:   maps.Clone(fetchedDropped),
 		rejected:  make(map[id.EventID]struct{}),
+		stateless: make(map[id.EventID]struct{}),
+		batch:     make(map[id.EventID]struct{}, len(evs)),
 		stateDAGs: stateDAGs,
+	}
+	for _, ev := range evs {
+		p.batch[ev.ID] = struct{}{}
 	}
 	p.resolver = p.newContextResolver()
 	if p.dropped == nil {
@@ -462,27 +470,37 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 	// Step 4: Passes authorization rules based on the event’s auth events, otherwise it is rejected.
 	for _, ev := range evs {
-		if _, found := stored[ev.ID]; found {
-			storedEv, err := storedEvents.Get(ev.ID)
-			if err != nil {
-				return nil, err
-			}
-			// Still evaluated in turn, as events later in the batch may cite it, and they see the
-			// outcome and state stored for it
-			log.Warn().Stringer("event_id", ev.ID).Msg("Received duplicate event we already know about")
-			ev.IsDuplicate = true
+		if _, found := stored[ev.ID]; !found {
+			plan.guard.unstored = append(plan.guard.unstored, ev.ID)
+		} else if storedEv, err := storedEvents.Get(ev.ID); err != nil {
+			return nil, err
+		} else if stateDAGs && storedEv != nil && !storedEv.HasStateIn(s.roomID) {
+			// Staged without state by a join or gap fill that could not replay it, so evaluated as
+			// new, as long as nothing gives it state meanwhile
+			plan.guard.stateless = append(plan.guard.stateless, ev.ID)
+			p.stateless[ev.ID] = struct{}{}
+		} else {
 			if storedEv != nil {
 				ev.CopyOutcome(storedEv)
 				// Calculated in a state DAG room, so not given with the event, and resolutions read
 				// them from this copy
 				ev.AuthEventIDs = storedEv.AuthEventIDs
 			}
+			if ev.Unpublished {
+				// Replayed by the room's ingest job, which publishes it now with the state the replay
+				// gave it, see txnStoreEvents
+				ev.RoomVersion = room.Version
+				continue
+			}
+			// Still evaluated in turn, as events later in the batch may cite it, and they see the
+			// outcome and state stored for it
+			log.Warn().Stringer("event_id", ev.ID).Msg("Received duplicate event we already know about")
+			ev.IsDuplicate = true
 			if ev.Rejected {
 				plan.rejected = append(plan.rejected, RejectedEvent{ev, types.ErrAlreadyExists})
 			}
 			continue
 		}
-		plan.guard.unstored = append(plan.guard.unstored, ev.ID)
 		if err := s.r.txnCheckEventBeforeStore(txn, s.roomID, ev); err != nil {
 			p.reject(ev, err)
 			continue
@@ -545,7 +563,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	for _, ev := range evs {
 		if _, dropped := p.dropped[ev.ID]; dropped {
 			continue
-		} else if ev.IsDuplicate {
+		} else if ev.IsDuplicate || ev.Unpublished {
 			plan.evs = append(plan.evs, ev)
 		} else if keep, request, err := p.evaluate(ev); err != nil {
 			return nil, err
@@ -573,9 +591,37 @@ func (s *federatedEventSender) txnPrepareFederated(
 	// extremities instead, which only accepted state events advance.
 	pendingExtremities := extremities
 	current := stateSteps{current: room.CurrentState}
+	// A run of events the room's job replayed is older state that stays out of the room's
+	// extremities and timeline. It joins the state extremities, and moves current state once, at its
+	// last event, ahead of the next event, which is authorized against it.
+	var replayed *types.Event
+	stepReplayed := func() (*eventsendutil.ResolutionRequest, error) {
+		if replayed == nil {
+			return nil, nil
+		}
+		next := replayed.AfterState
+		if len(stateExtremities) > 1 {
+			resolved, request, err := p.resolver.Resolve(stateExtremities)
+			if err != nil || request != nil {
+				return request, err
+			}
+			next = resolved
+		}
+		current.advance(replayed.ID, next)
+		replayed = nil
+		return nil, nil
+	}
 	for _, ev := range plan.evs {
 		if ev.IsDuplicate || ev.Rejected {
 			continue
+		} else if ev.Unpublished {
+			stateExtremities = advanceStateExtremities(stateExtremities, ev)
+			replayed = ev
+			continue
+		} else if request, err := stepReplayed(); err != nil {
+			return nil, err
+		} else if request != nil {
+			return p.resolutionWork(request), nil
 		}
 		evLog := log.With().
 			Stringer("event_id", ev.ID).
@@ -626,6 +672,11 @@ func (s *federatedEventSender) txnPrepareFederated(
 			current.advance(ev.ID, next)
 		}
 		evLog.Debug().Msg("Event authorized for storage")
+	}
+	if request, err := stepReplayed(); err != nil {
+		return nil, err
+	} else if request != nil {
+		return p.resolutionWork(request), nil
 	}
 
 	if len(pendingExtremities) > 1 && !stateDAGs {
@@ -684,6 +735,11 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		} else if len(unknownPrevs) > 0 {
 			p.drop(ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, unavailable, unknownPrevs))
 			return false, nil, nil
+		} else if unpublished, err := p.citedUnpublished(ev); err != nil {
+			return false, nil, err
+		} else if unpublished != "" {
+			p.drop(ev, fmt.Errorf("%w: %w: %s is not published yet", ErrEventDropped, unavailable, unpublished))
+			return false, nil, nil
 		}
 	}
 
@@ -727,6 +783,9 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		return false, nil, err
 	} else if p.stateDAGs {
 		ev.AuthEventIDs = events.AuthEventIDsFor(ev, authState)
+		if _, found := p.stateless[ev.ID]; found {
+			p.plan.authGraph.AddCalculated(ev)
+		}
 	}
 	if authErr, err := p.plan.authorize(p.ctx, authState, ev); err != nil {
 		return false, nil, err
@@ -763,6 +822,22 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		return false, nil, err
 	}
 	return true, nil, nil
+}
+
+// citedUnpublished returns a prev state event of a state DAG event that the room's ingest job replayed
+// but did not publish yet, unless the batch publishes it: no published event cites one, as its
+// publish adds it to the state extremities, see types.Event.Unpublished
+func (p *federatedPreparation) citedUnpublished(ev *types.Event) (id.EventID, error) {
+	for _, prevID := range ev.PrevStateEventIDs {
+		if _, found := p.batch[prevID]; found {
+			continue
+		} else if prev, err := p.plan.eventsProvider.Get(prevID); err != nil {
+			return "", err
+		} else if prev != nil && prev.Unpublished {
+			return prevID, nil
+		}
+	}
+	return "", nil
 }
 
 // authorizePrevStateEvents applies the MSC's section 2 to a state DAG event, so that one citing a

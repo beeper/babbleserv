@@ -78,6 +78,8 @@ var (
 	errInvalidMembershipTemplate = errors.New("invalid membership event template")
 	// A server answering make_* for a room of a version this server does not join
 	errIncompatibleRoomVersion = errors.New("room version not supported")
+	// A make_* request that got no answer from the server
+	errMakeRequestFailed = errors.New("make request failed")
 )
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
@@ -104,7 +106,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 		resp, err := getMakeResp(otherServer)
 		if err != nil {
 			serverLog.Warn().Err(err).Msg("Failed to make federated event via server")
-			requestErr = err
+			requestErr = fmt.Errorf("%w via %s: %w", errMakeRequestFailed, otherServer, err)
 			continue
 		} else if !c.config.JoinsRoomVersion(string(resp.RoomVersion)) {
 			serverLog.Warn().Str("room_version", string(resp.RoomVersion)).Msg("Server gave a template of a room version not supported")
@@ -148,14 +150,18 @@ func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
 	return versions
 }
 
-// As Synapse does, a server refusing to give a template is passed on, and a server failing to give a
-// usable one is a bad gateway
+// As Synapse does, a server refusing to give a template is passed on, with the room version of an
+// incompatible one, and a server failing to give a usable one is a bad gateway
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
 	var httpErr gomatrix.HTTPError
 	if errors.As(err, &httpErr) {
 		var respErr mautrix.RespError
 		if httpErr.Code >= 400 && httpErr.Code < 500 && json.Unmarshal(httpErr.Contents, &respErr) == nil && respErr.ErrCode != "" {
-			util.ResponseJSON(w, r, httpErr.Code, map[string]string{"errcode": respErr.ErrCode, "error": respErr.Err})
+			body := map[string]any{"errcode": respErr.ErrCode, "error": respErr.Err}
+			if roomVersion, ok := respErr.ExtraData["room_version"].(string); ok && respErr.ErrCode == mautrix.MIncompatibleRoomVersion.ErrCode {
+				body["room_version"] = roomVersion
+			}
+			util.ResponseJSON(w, r, httpErr.Code, body)
 			return
 		}
 		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
@@ -166,7 +172,7 @@ func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err
 	} else if errors.Is(err, errIncompatibleRoomVersion) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
 		return
-	} else if errors.Is(err, errInvalidMembershipTemplate) {
+	} else if errors.Is(err, errInvalidMembershipTemplate) || errors.Is(err, errMakeRequestFailed) {
 		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
 			"errcode": util.MUnknown.ErrCode,
 			"error":   err.Error(),

@@ -31,7 +31,12 @@ func stagedStateDAG(dag map[id.EventID][]id.EventID) map[id.EventID]*types.Event
 
 func walkStaged(t *testing.T, dag map[id.EventID]*types.Event, from ...id.EventID) *stateDAGWalk {
 	t.Helper()
-	walk, err := walkUnreplayed("!create", from, func(eventIDs []id.EventID) (map[id.EventID]*types.Event, error) {
+	return walkPending(t, dag, from, nil)
+}
+
+func walkPending(t *testing.T, dag map[id.EventID]*types.Event, from, pending []id.EventID) *stateDAGWalk {
+	t.Helper()
+	walk, err := walkUnreplayed("!create", from, pending, true, func(eventIDs []id.EventID) (map[id.EventID]*types.Event, error) {
 		assert.LessOrEqual(t, len(eventIDs), stateDAGWalkChunk)
 		found := make(map[id.EventID]*types.Event)
 		for _, eventID := range eventIDs {
@@ -66,6 +71,32 @@ func TestWalkUnreplayed(t *testing.T) {
 	assert.ElementsMatch(t, []id.EventID{"$withheld", "$outlier"}, slices.Collect(maps.Keys(gap.missing)),
 		"an event not stored, or stored only as an outlier, is missing")
 	assert.NotContains(t, gap.cites, id.EventID("$other"), "another room's event ends the walk")
+}
+
+// Events replayed and not published yet are walked through, as they publish ahead of what cites
+// them, while pending events, which the job publishes rather than replays, end the walk
+func TestWalkUnreplayedThroughUnpublished(t *testing.T) {
+	dag := stagedStateDAG(map[id.EventID][]id.EventID{
+		"$create": nil, "$power": {"$create"}, "$replayed": {"$power"}, "$staged": {"$replayed"},
+		"$citesTarget": {"$target"}, "$tip": {"$staged", "$citesTarget"},
+	})
+	for _, published := range []id.EventID{"$create", "$power"} {
+		dag[published].BeforeState, dag[published].AfterState = types.StateHash{1}, types.StateHash{2}
+	}
+	dag["$replayed"].BeforeState, dag["$replayed"].AfterState = types.StateHash{2}, types.StateHash{3}
+	dag["$replayed"].Unpublished = true
+
+	walk := walkPending(t, dag, []id.EventID{"$tip"}, []id.EventID{"$target"})
+	assert.ElementsMatch(t, []id.EventID{"$tip", "$staged", "$replayed", "$citesTarget"}, slices.Collect(maps.Keys(walk.cites)),
+		"a published event ends the walk")
+	assert.Equal(t, map[id.EventID]struct{}{"$replayed": {}}, walk.unpublished)
+	assert.Equal(t, map[id.EventID]struct{}{"$target": {}}, walk.pending)
+	assert.Empty(t, walk.missing, "a pending event is not missing")
+	assert.Same(t, dag["$staged"], walk.evs["$staged"])
+
+	order, unreplayable := replayOrder(walk)
+	assert.Equal(t, []id.EventID{"$replayed", "$staged"}, order, "an unpublished event orders with the rest, its replay skips it")
+	assert.Equal(t, 2, unreplayable, "events reaching a pending one wait for it")
 }
 
 func TestReplayOrder(t *testing.T) {

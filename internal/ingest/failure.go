@@ -114,3 +114,32 @@ func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 		Message: fmt.Sprintf("the room's %s %d events, this server joins rooms of at most %d", what, events, limit),
 	}
 }
+
+// tooManyTipsFailure is a join to a state DAG room whose state DAG has more forward extremities than
+// a join publishes beside it
+func tooManyTipsFailure(tips, limit int) *types.IngestFailure {
+	return &types.IngestFailure{
+		Status:  http.StatusRequestEntityTooLarge,
+		ErrCode: mautrix.MTooLarge.ErrCode,
+		Message: fmt.Sprintf("the room's state DAG has %d forward extremities, this server joins rooms with at most %d", tips, limit),
+	}
+}
+
+// unfilledGapFailure is a PDU of a state DAG room citing state events that no server served a path
+// from to the create event, as the MSC requires of the server sending it
+func unfilledGapFailure() *types.IngestFailure {
+	return &types.IngestFailure{
+		Status:  http.StatusBadGateway,
+		ErrCode: mautrix.MUnknown.ErrCode,
+		Message: "no server in the room served the state DAG events the event cites",
+	}
+}
+
+// tooLargeGapFailure is a PDU of a state DAG room whose gap fill fetched more than it may
+func tooLargeGapFailure(limit int) *types.IngestFailure {
+	return &types.IngestFailure{
+		Status:  http.StatusRequestEntityTooLarge,
+		ErrCode: mautrix.MTooLarge.ErrCode,
+		Message: fmt.Sprintf("the event's state DAG gap took over %d events", limit),
+	}
+}

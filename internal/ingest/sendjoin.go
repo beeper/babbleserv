@@ -27,11 +27,16 @@ const (
 	stateDAGChunkBytes  = 4 << 20
 )
 
+// Most bytes a send_join response's decoder reads for one value: an event, at most 64 KiB in its
+// canonical form, with room for other whitespace and escapes, or a token of a member skipped
+const maxStateDAGValueBytes = 1 << 20
+
 var (
 	errSendJoinStalled = errors.New("the send_join response stalled")
 	// A send_join response that is not the JSON of a state DAG room's, which sending the join again
 	// would not change
-	errBadStateDAGResponse = errors.New("the send_join response is not a state DAG")
+	errBadStateDAGResponse   = errors.New("the send_join response is not a state DAG")
+	errStateDAGValueTooLarge = fmt.Errorf("%w: a value is over %d bytes", errBadStateDAGResponse, maxStateDAGValueBytes)
 )
 
 // SendJoinStateDAG sends a join to a state DAG room (MSC4242) to a server, and hands each the state
@@ -88,22 +93,41 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// valueReader fails a read once more than limit bytes were read since it was reset, ahead of each
+// value a decoder reads, so that no one value grows the decoder's buffer past it
+type valueReader struct {
+	r           io.Reader
+	limit, read int
+}
+
+func (v *valueReader) Read(p []byte) (int, error) {
+	if v.read >= v.limit {
+		return 0, errStateDAGValueTooLarge
+	}
+	n, err := v.r.Read(p[:min(len(p), v.limit-v.read)])
+	v.read += n
+	return n, err
+}
+
 // decodeStateDAG reads a state DAG room's send_join response, {origin, event, state_dag}, as a
 // stream, handing each the state_dag's events in chunks of at most maxEvents and, past their first,
 // maxBytes. Other members are skipped, token by token. A response that is not such JSON fails with
-// errBadStateDAGResponse; an error each returns is returned as it is.
+// errBadStateDAGResponse, as does a value over maxStateDAGValueBytes; an error each returns is
+// returned as it is.
 func decodeStateDAG(r io.Reader, maxEvents, maxBytes int, each func([]json.RawMessage) error) error {
-	dec := json.NewDecoder(r)
+	values := &valueReader{r: r, limit: maxStateDAGValueBytes}
+	dec := json.NewDecoder(values)
 	if err := expectDelim(dec, '{'); err != nil {
 		return err
 	}
 	found := false
 	for dec.More() {
+		values.read = 0
 		key, err := dec.Token()
 		if err != nil {
 			return badStateDAG(err)
 		} else if key != "state_dag" {
-			if err := skipValue(dec); err != nil {
+			if err := skipValue(dec, values); err != nil {
 				return err
 			}
 			continue
@@ -114,6 +138,7 @@ func decodeStateDAG(r io.Reader, maxEvents, maxBytes int, each func([]json.RawMe
 		var chunk []json.RawMessage
 		size := 0
 		for dec.More() {
+			values.read = 0
 			var raw json.RawMessage
 			if err := dec.Decode(&raw); err != nil {
 				return badStateDAG(err)
@@ -152,9 +177,10 @@ func expectDelim(dec *json.Decoder, delim json.Delim) error {
 	return nil
 }
 
-// skipValue reads past the next value without holding it
-func skipValue(dec *json.Decoder) error {
+// skipValue reads past the next value without holding it, a token at a time
+func skipValue(dec *json.Decoder, values *valueReader) error {
 	for depth := 0; ; {
+		values.read = 0
 		token, err := dec.Token()
 		if err != nil {
 			return badStateDAG(err)

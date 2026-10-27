@@ -49,6 +49,30 @@ func strategyFor(roomVersion string) (strategy, error) {
 type legacyStrategy struct{}
 
 func (legacyStrategy) collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error) {
+	return collectWorks(ctx, run, targets, legacyWorkKinds(run))
+}
+
+func legacyWorkKinds(run *jobRun) workKinds {
+	return workKinds{
+		join: func(target *types.IngestTarget) ingestWork {
+			return &legacyJoin{joinWork{run: run, target: target}}
+		},
+		pdus: func(pdus []*types.IngestTarget, gap bool) ingestWork {
+			return &legacyPDUs{run: run, pdus: pdus, gap: gap}
+		},
+	}
+}
+
+// workKinds makes a room version's units of work of a round's targets: a join, or a chunk of PDUs,
+// connected or with gaps to fill
+type workKinds struct {
+	join func(*types.IngestTarget) ingestWork
+	pdus func(pdus []*types.IngestTarget, gap bool) ingestWork
+}
+
+// collectWorks groups a round's targets into units of work, see roundWorks, splitting the PDUs into
+// those connected and those with gaps while this server is in the room or no join is pending
+func collectWorks(ctx context.Context, run *jobRun, targets []*types.IngestTarget, kinds workKinds) ([]ingestWork, error) {
 	joins, pdus := splitTargets(targets)
 	joined := false
 	if len(joins) > 0 && len(pdus) > 0 {
@@ -64,7 +88,7 @@ func (legacyStrategy) collect(ctx context.Context, run *jobRun, targets []*types
 			return nil, err
 		}
 	}
-	return legacyWorks(run, joins, connected, gaps, joined), nil
+	return roundWorks(kinds, joins, connected, gaps, joined), nil
 }
 
 // Most PDUs, and their bytes, a federated send of a job's PDUs takes, as /send does
@@ -73,31 +97,31 @@ const (
 	maxPDUChunkBytes = 4 << 20
 )
 
-// legacyWorks are the units of work publishing a round's targets. While this server is not in the
+// roundWorks are the units of work publishing a round's targets. While this server is not in the
 // room, the PDUs wait for a later round without joins: one whose join was replaced or found gone
 // publishes nothing, and the PDUs would be dropped as a room's this server is not in. In a room it is
 // in, a member's join is a whole send_join, so the PDUs go first but for those citing a pending join,
 // whose gap fill would pull the join from another server: connected PDUs cite none with a gap, and
 // the PDUs with gaps fill them before the joins.
-func legacyWorks(run *jobRun, joins, connected, gaps []*types.IngestTarget, joined bool) []ingestWork {
+func roundWorks(kinds workKinds, joins, connected, gaps []*types.IngestTarget, joined bool) []ingestWork {
 	works := make([]ingestWork, 0, len(joins)+2)
 	joinWorks := make([]ingestWork, len(joins))
 	for i, target := range joins {
-		joinWorks[i] = &legacyJoin{joinWork{run: run, target: target}}
+		joinWorks[i] = kinds.join(target)
 	}
 	if len(joins) > 0 && !joined {
 		return joinWorks
 	}
 	for _, chunk := range chunkPDUs(connected, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &legacyPDUs{run: run, pdus: chunk})
+		works = append(works, kinds.pdus(chunk, false))
 	}
 	beforeJoins, afterJoins := splitCitingJoins(gaps, joins)
 	for _, chunk := range chunkPDUs(beforeJoins, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &legacyPDUs{run: run, pdus: chunk, gap: true})
+		works = append(works, kinds.pdus(chunk, true))
 	}
 	works = append(works, joinWorks...)
 	for _, chunk := range chunkPDUs(afterJoins, maxPDUChunk, maxPDUChunkBytes) {
-		works = append(works, &legacyPDUs{run: run, pdus: chunk, gap: true})
+		works = append(works, kinds.pdus(chunk, true))
 	}
 	return works
 }

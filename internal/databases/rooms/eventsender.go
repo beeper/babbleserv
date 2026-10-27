@@ -41,6 +41,8 @@ type sendGuard struct {
 	revision uint64
 	joined   bool
 	unstored []id.EventID
+	// Events stored without state, which the publish gives state as new events
+	stateless []id.EventID
 	// The room must have no ingest job, see SendFederatedEventsOptions.RefuseWhileIngesting
 	noIngestJob bool
 }
@@ -546,7 +548,7 @@ func (s *eventSender) stageAndPublish(ctx context.Context, plan *publishPlan) (*
 // remote join accepts, the events with the rows indexing them, the room's current state with every
 // row it moves, see txnStoreRoomState, and the plan's other writes.
 func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan *publishPlan) (*SendEventsResult, error) {
-	room, err := s.txnCheckGuard(txn, plan)
+	room, err := s.txnCheckGuard(ctx, txn, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -584,7 +586,7 @@ func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan 
 // txnCheckGuard returns the room a plan publishes to, failing with errGuardFailed unless the room is
 // as the plan was prepared for and none of the auth chains and headers its graph labelled changed
 // since.
-func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*types.Room, error) {
+func (s *eventSender) txnCheckGuard(ctx context.Context, txn fdb.Transaction, plan *publishPlan) (*types.Room, error) {
 	stored, err := roomOrNil(s.r.txnGetRoom(txn, plan.room.ID))
 	if err != nil {
 		return nil, err
@@ -606,6 +608,10 @@ func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*ty
 		return nil, err
 	} else if len(storedNow) > 0 {
 		return nil, errEventsStoredConcurrently
+	} else if given, err := s.r.txnAnyHasState(ctx, txn, plan.room.ID, plan.guard.stateless); err != nil {
+		return nil, err
+	} else if given {
+		return nil, fmt.Errorf("%w: given state", errEventsStoredConcurrently)
 	}
 	if unchanged, err := plan.authGraph.TxnLabelsUnchanged(txn); err != nil {
 		return nil, err
