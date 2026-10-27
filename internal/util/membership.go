@@ -46,5 +46,9 @@ func MembershipTemplateEvent(
 	}
 	ev.Timestamp = time.Now().UTC().UnixMilli()
 	ev.RoomVersion = string(roomVersion)
+	// Every other server drops a join signed over a template citing more than the cap
+	if err := ev.CheckStateDAGFormat(); err != nil {
+		return nil, err
+	}
 	return ev, nil
 }
