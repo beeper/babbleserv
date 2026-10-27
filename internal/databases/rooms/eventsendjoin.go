@@ -327,7 +327,7 @@ func (s *remoteJoinSender) checkRemoteJoinAuth(
 	responseEvs []*types.Event,
 ) ([]*types.Event, map[id.EventID]struct{}, error) {
 	// The join goes first so it is the copy checked when the response repeats it
-	evs := s.sortEventsTopologically(slices.Concat([]*types.Event{joinEv}, responseEvs))
+	evs := SortEventsTopologically(slices.Concat([]*types.Event{joinEv}, responseEvs))
 	dropped, rejectedAuth, err := s.checkOwnAuthEvents(ctx, reads, evs, joinEv)
 	if err != nil {
 		return nil, nil, err

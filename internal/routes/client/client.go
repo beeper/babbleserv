@@ -2,7 +2,6 @@ package client
 
 import (
 	"net/http"
-	"slices"
 	"sync"
 
 	"github.com/go-chi/chi/v5"
@@ -52,7 +51,7 @@ func NewClientRoutes(
 		Str("routes", "client").
 		Logger()
 
-	if !slices.Contains(supportedRoomVersions, cfg.Rooms.DefaultVersion) {
+	if _, found := cfg.RoomVersions()[cfg.Rooms.DefaultVersion]; !found {
 		panic("unsupported default room version: " + cfg.Rooms.DefaultVersion)
 	}
 
@@ -265,13 +264,15 @@ func (f *ClientRoutes) GetVersions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var supportedRoomVersions = []string{"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
-
 // https://spec.matrix.org/v1.11/client-server-api/#get_matrixclientv3capabilities
 func (f *ClientRoutes) GetCapabilities(w http.ResponseWriter, r *http.Request) {
-	available := make(map[string]mautrix.CapRoomVersionStability, len(supportedRoomVersions))
-	for _, roomVersion := range supportedRoomVersions {
-		available[roomVersion] = mautrix.CapRoomVersionStable
+	roomVersions := f.config.RoomVersions()
+	available := make(map[string]mautrix.CapRoomVersionStability, len(roomVersions))
+	for roomVersion, stable := range roomVersions {
+		available[roomVersion] = mautrix.CapRoomVersionUnstable
+		if stable {
+			available[roomVersion] = mautrix.CapRoomVersionStable
+		}
 	}
 	util.ResponseJSON(w, r, http.StatusOK, map[string]any{
 		"capabilities": mautrix.RespCapabilities{

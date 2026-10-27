@@ -139,7 +139,7 @@ func (r *RoomsDatabase) SendFederatedEvents(
 ) (*SendEventsResult, error) {
 	push := pushContext{rules: userPushRules, rooms: userRoomContext}
 	p := &federatedEventSender{eventSender: r.newEventSender(roomID, push), options: options}
-	evs = p.sortEventsTopologically(evs)
+	evs = SortEventsTopologically(evs)
 	p.evs = evs
 	log := r.getTxnLogContext(ctx, "SendFederatedEvents").
 		Str("room_id", roomID.String()).
@@ -152,9 +152,12 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	}
 	p.build = p.executePreparationWork
 
-	if joined, err := r.IsServerJoined(ctx, roomID, r.config.ServerName); err != nil {
+	room, err := r.GetRoom(ctx, roomID)
+	if err != nil {
 		return nil, err
-	} else if !joined {
+	} else if res, err := r.refuseStateDAGFederation(ctx, room, roomID, evs, given, options); res != nil || err != nil {
+		return res, err
+	} else if !isServerJoined(room) {
 		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
 
@@ -331,7 +334,7 @@ func (s *federatedEventSender) checkFetchedEvents(ctx context.Context) (*checked
 		return nil, err
 	}
 
-	unstored = s.sortEventsTopologically(unstored)
+	unstored = SortEventsTopologically(unstored)
 	reads, err := eventsendutil.NewArtifactReads(ctx, s.r.db, s.r.events, s.roomID, nil, nil)
 	if err != nil {
 		return nil, err
@@ -361,13 +364,7 @@ type federatedPreparation struct {
 }
 
 func (p *federatedPreparation) newContextResolver() *eventsendutil.Resolver {
-	return eventsendutil.NewResolver(p.txn, p.plan.eventsProvider, p.plan.authGraph, eventsendutil.ResolverOptions{
-		StateBatch:     p.plan.stateBatch,
-		RoomID:         p.roomID,
-		RoomVersion:    p.plan.room.Version,
-		MaxCandidates:  p.r.config.Rooms.StateBudget.InlineResolutionCandidates,
-		MaxStateTuples: p.r.config.Rooms.StateBudget.InlineResolutionStateTuples,
-	})
+	return p.newResolver(p.txn, &p.plan.preparedEvents, p.plan.room.Version)
 }
 
 // txnPrepareFederated prepares an attempt's copies of federated events. Events are authorized
@@ -578,7 +575,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 				return nil, err
 			}
 		}
-		pendingExtremities = s.advanceExtremities(pendingExtremities, replaced, ev.ID)
+		pendingExtremities = advanceExtremities(pendingExtremities, replaced, ev.ID)
 		plan.replacedExtremities[ev.ID] = replaced
 
 		next := ev.AfterState
@@ -602,7 +599,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	plan.stateSteps = current.steps
 	if len(s.options.Targets) > 0 {
 		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
-			return s.r.txnClearPublishedTargets(txn, plan.evs, s.options.Targets)
+			return s.r.txnClearPublishedTargets(txn, s.roomID, plan.evs, s.options.Targets)
 		}
 	}
 	return readyToPublish{plan: plan}, nil
@@ -666,6 +663,13 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		p.reject(ev, fmt.Errorf("%w: auth event %s was rejected", ErrAuthStage4, authEventID))
 		return true, nil, nil
 	}
+	// Batch events carry the outcome this attempt gave them, stored events their stored one
+	if authErr, err := util.AuthorizePrevStateEvents(ev, p.plan.eventsProvider.Get); err != nil {
+		return false, nil, err
+	} else if authErr != nil {
+		p.reject(ev, fmt.Errorf("%w: %w", ErrAuthStage5, authErr))
+		return true, nil, nil
+	}
 
 	authState, authErr, err := p.plan.txnAuthorizeAt(p.ctx, p.txn, before, ev)
 	if err != nil {
@@ -705,17 +709,8 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 	return true, nil, nil
 }
 
-// resolutionWork captures only the preparation inputs the job needs after this transaction ends.
 func (p *federatedPreparation) resolutionWork(request *eventsendutil.ResolutionRequest) needsWork {
-	return needsWork{work: resolveStateWork{
-		request: request,
-		inputs: artifactInputs{
-			stateBatch:     p.plan.stateBatch,
-			eventsProvider: p.plan.eventsProvider,
-			authGraph:      p.plan.authGraph,
-		},
-		roomVersion: p.plan.room.Version,
-	}}
+	return needsWork{work: p.plan.resolutionWork(request, p.plan.room.Version)}
 }
 
 // reject flags an event rejected, it is still stored, and records why
@@ -879,7 +874,7 @@ func (s *federatedEventSender) eventsToStage(
 			unique = append(unique, ev)
 		}
 	}
-	stored, err := s.r.storedEventIDs(ctx, util.EventsToIDs(unique))
+	stored, err := s.r.GetStoredEventIDs(ctx, util.EventsToIDs(unique))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1195,10 +1190,10 @@ func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 
 // Event ordering
 
-// sortEventsTopologically orders a batch so every event follows the batch events it cites as prev
+// SortEventsTopologically orders a batch so every event follows the batch events it cites as prev
 // or auth events, otherwise keeping the input order, and without later copies of an event. Events
 // on a cycle, which no valid batch has, follow the rest in input order.
-func (s *federatedEventSender) sortEventsTopologically(batch []*types.Event) []*types.Event {
+func SortEventsTopologically(batch []*types.Event) []*types.Event {
 	evs := make([]*types.Event, 0, len(batch))
 	indexes := make(map[id.EventID]int, len(batch))
 	for _, ev := range batch {
@@ -1267,7 +1262,7 @@ func (h *indexHeap) Pop() any {
 
 // advanceExtremities returns the pending extremities once an event is accepted: those it does not
 // replace, then the event.
-func (s *federatedEventSender) advanceExtremities(pendingExtremities, replaced []id.EventID, eventID id.EventID) []id.EventID {
+func advanceExtremities(pendingExtremities, replaced []id.EventID, eventID id.EventID) []id.EventID {
 	next := make([]id.EventID, 0, len(pendingExtremities)+1)
 	for _, extremityID := range pendingExtremities {
 		if extremityID != eventID && !slices.Contains(replaced, extremityID) {

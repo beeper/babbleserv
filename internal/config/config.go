@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,6 +36,9 @@ type stateBudgetConfig struct {
 	// Approximate bytes staged per transaction, leaving headroom for FoundationDB overhead
 	// Default: 5 MB
 	StagingBytes int `yaml:"stagingBytes"`
+	// Distinct contexts a state resolution run inline resolves, past which an artifact job runs it
+	// Default: 64
+	InlineResolutionContexts int `yaml:"inlineResolutionContexts"`
 	// Candidate events of a state resolution run inline, past which an artifact job runs it
 	// Default: 2000
 	InlineResolutionCandidates int `yaml:"inlineResolutionCandidates"`
@@ -57,6 +61,16 @@ type ingestConfig struct {
 	// Most state and auth chain events a join accepts from the resident server
 	// Default: 1000000
 	MaxJoinEvents int `yaml:"maxJoinEvents"`
+	// Most PDUs, and their bytes, a room's job holds queued before /send waits for it to publish
+	// some rather than queue more
+	// Default: 2000 and 50000000
+	MaxQueuedPDUs     int   `yaml:"maxQueuedPDUs"`
+	MaxQueuedPDUBytes int64 `yaml:"maxQueuedPDUBytes"`
+	// How long /send waits for a full queue before failing the transaction, which its sender sends
+	// again later. Shorter than the minute Synapse waits for a response, so a sender gone meanwhile
+	// leaves no request waiting.
+	// Default: 50s
+	QueueWait time.Duration `yaml:"queueWait"`
 }
 
 type babbleBotConfig struct {
@@ -84,6 +98,10 @@ type BabbleConfig struct {
 		Database       databaseConfig `yaml:"database"`
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
+
+		// Offer the unstable state DAG room version (MSC4242): advertise it, create rooms of it and
+		// take invites to them. Federation in its rooms is not supported yet.
+		UnstableStateDAGs bool `yaml:"unstableStateDAGs"`
 
 		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
 		// may go over this before being trimmed back down after the timeout below or sufficient
@@ -250,6 +268,9 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	if cfg.Rooms.StateBudget.StagingBytes <= 0 {
 		cfg.Rooms.StateBudget.StagingBytes = 5_000_000
 	}
+	if cfg.Rooms.StateBudget.InlineResolutionContexts <= 0 {
+		cfg.Rooms.StateBudget.InlineResolutionContexts = 64
+	}
 	if cfg.Rooms.StateBudget.InlineResolutionCandidates <= 0 {
 		cfg.Rooms.StateBudget.InlineResolutionCandidates = 2000
 	}
@@ -265,6 +286,15 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	if cfg.Rooms.Ingest.MaxJoinEvents <= 0 {
 		cfg.Rooms.Ingest.MaxJoinEvents = 1_000_000
 	}
+	if cfg.Rooms.Ingest.MaxQueuedPDUs <= 0 {
+		cfg.Rooms.Ingest.MaxQueuedPDUs = 2000
+	}
+	if cfg.Rooms.Ingest.MaxQueuedPDUBytes <= 0 {
+		cfg.Rooms.Ingest.MaxQueuedPDUBytes = 50_000_000
+	}
+	if cfg.Rooms.Ingest.QueueWait <= 0 {
+		cfg.Rooms.Ingest.QueueWait = 50 * time.Second
+	}
 	if cfg.BabbleBot.Localpart == "" {
 		cfg.BabbleBot.Localpart = "babblebot"
 	}
@@ -276,6 +306,29 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 
 	return cfg
+}
+
+var stableRoomVersions = []string{"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+
+// RoomVersions returns the room versions this server creates rooms of and takes invites to, each
+// with whether it is stable
+func (c *BabbleConfig) RoomVersions() map[string]bool {
+	versions := make(map[string]bool, len(stableRoomVersions)+1)
+	for _, version := range stableRoomVersions {
+		versions[version] = true
+	}
+	if c.Rooms.UnstableStateDAGs {
+		versions[string(gomatrixserverlib.RoomVersionStateDAGs)] = false
+	}
+	return versions
+}
+
+// JoinsRoomVersion reports whether this server joins rooms of a version and takes invites to them:
+// any gomatrixserverlib implements in the event format this server hashes, the unstable state DAG
+// version only once enabled
+func (c *BabbleConfig) JoinsRoomVersion(version string) bool {
+	impl, err := gomatrixserverlib.GetRoomVersion(gomatrixserverlib.RoomVersion(version))
+	return err == nil && impl.EventFormat() == gomatrixserverlib.EventFormatV2 && (!impl.StateDAGs() || c.Rooms.UnstableStateDAGs)
 }
 
 func (c *BabbleConfig) MustGetSigningKey(keyID string) ed25519.PrivateKey {

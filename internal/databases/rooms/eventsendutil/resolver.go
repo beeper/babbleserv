@@ -48,9 +48,9 @@ type Resolver struct {
 	stateBatch  *state.Batch
 	roomID      id.RoomID
 	roomVersion string
-	// A resolution with more candidate events, or an input of more state tuples, is left to an
-	// artifact job, unless zero
-	maxCandidates, maxStateTuples int
+	// A resolution of more contexts, with more candidate events, or with an input of more state
+	// tuples, is left to an artifact job, unless zero
+	maxContexts, maxCandidates, maxStateTuples int
 	// Candidate events read per transaction, all of them in one when zero
 	eventChunk int
 	// State events of the inputs and candidate events of the last resolution run
@@ -62,10 +62,10 @@ type Resolver struct {
 
 // ResolverOptions sets the state batch and limits for a resolution. Zero limits are unbounded.
 type ResolverOptions struct {
-	StateBatch                    *state.Batch
-	RoomID                        id.RoomID
-	RoomVersion                   string
-	MaxCandidates, MaxStateTuples int
+	StateBatch                                 *state.Batch
+	RoomID                                     id.RoomID
+	RoomVersion                                string
+	MaxContexts, MaxCandidates, MaxStateTuples int
 }
 
 func NewResolver(txn fdb.ReadTransaction, provider *events.TxnEventsProvider, graph *events.AuthGraph, options ResolverOptions) *Resolver {
@@ -78,6 +78,7 @@ func newResolver(reads resolutionReads, options ResolverOptions) *Resolver {
 		stateBatch:     options.StateBatch,
 		roomID:         options.RoomID,
 		roomVersion:    options.RoomVersion,
+		maxContexts:    options.MaxContexts,
 		maxCandidates:  options.MaxCandidates,
 		maxStateTuples: options.MaxStateTuples,
 		resolved:       make(map[string]resolution),
@@ -101,10 +102,13 @@ type ResolutionRequest struct {
 func (r *ResolutionRequest) Key() string { return contextSetKey(r.Contexts) }
 
 func (r *ResolutionRequest) String() string {
-	if r.StateTuples > 0 {
+	switch {
+	case r.StateTuples > 0:
 		return fmt.Sprintf("resolution of contexts %x of up to %d state tuples", r.Contexts, r.StateTuples)
+	case r.Candidates > 0:
+		return fmt.Sprintf("resolution of contexts %x with at least %d candidate events", r.Contexts, r.Candidates)
 	}
-	return fmt.Sprintf("resolution of contexts %x with at least %d candidate events", r.Contexts, r.Candidates)
+	return fmt.Sprintf("resolution of %d contexts %x", len(r.Contexts), r.Contexts)
 }
 
 func (cr *Resolver) getEvent(eventID id.EventID) (ev *types.Event, err error) {
@@ -199,8 +203,8 @@ func (cr *Resolver) afterStates(eventIDs []id.EventID) ([]types.StateHash, error
 }
 
 // resolveContexts takes the result an artifact job stored for resolving the contexts, or resolves
-// them here, see ResolveContexts. Distinct contexts always conflict, so a room version before state
-// resolution v2 fails before reading anything.
+// them here, see ResolveContexts, unless there are more than it resolves inline. Distinct contexts
+// always conflict, so a room version before state resolution v2 fails before reading anything.
 func (cr *Resolver) resolveContexts(contexts []types.StateHash) (types.StateHash, *ResolutionRequest, error) {
 	if err := stateres.CheckAlgorithm(cr.roomVersion); err != nil {
 		return types.StateHash{}, nil, err
@@ -209,8 +213,19 @@ func (cr *Resolver) resolveContexts(contexts []types.StateHash) (types.StateHash
 		return types.StateHash{}, nil, err
 	} else if found {
 		return result, nil, nil
+	} else if request := cr.checkContexts(contexts); request != nil {
+		return types.StateHash{}, request, nil
 	}
 	return cr.ResolveContexts(contexts)
+}
+
+// checkContexts requests a job for more contexts than the resolver compares inline, as a state DAG
+// event may cite any number of prev state events
+func (cr *Resolver) checkContexts(contexts []types.StateHash) *ResolutionRequest {
+	if cr.maxContexts > 0 && len(contexts) > cr.maxContexts {
+		return &ResolutionRequest{Contexts: contexts}
+	}
+	return nil
 }
 
 // ResolveContexts resolves the contexts from their conflicts and, when they have any, the auth

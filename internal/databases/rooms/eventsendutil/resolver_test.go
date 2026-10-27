@@ -84,3 +84,16 @@ func TestResolutionRequestsWorkBeforeReadingCandidateEvents(t *testing.T) {
 	assert.Equal(t, contexts, request.Contexts)
 	assert.Equal(t, 2, request.Candidates)
 }
+
+func TestResolutionOfManyContextsIsLeftToAJob(t *testing.T) {
+	contexts := []types.StateHash{{1}, {2}, {3}}
+	cr := NewResolver(nil, nil, nil, ResolverOptions{MaxContexts: 3})
+	assert.Nil(t, cr.checkContexts(contexts))
+	cr.maxContexts = 2
+	request := cr.checkContexts(contexts)
+	require.NotNil(t, request)
+	assert.Equal(t, contexts, request.Contexts)
+	assert.Equal(t, (&ResolutionRequest{Contexts: contexts, Candidates: 3}).Key(), request.Key(), "the job's stored result serves any limit")
+	cr.maxContexts = 0
+	assert.Nil(t, cr.checkContexts(contexts), "a job resolves any number of contexts")
+}

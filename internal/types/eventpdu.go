@@ -155,7 +155,7 @@ func (pdu EventPDU) JSON() []byte {
 }
 
 func (pdu EventPDU) AuthEventIDs() []string {
-	authIDs := pdu.ev.AuthDependencyIDs()
+	authIDs := pdu.ev.AuthEventIDsWithCreate()
 	eventIDs := make([]string, len(authIDs))
 	for i, eventID := range authIDs {
 		eventIDs[i] = eventID.String()
@@ -168,8 +168,8 @@ func (pdu EventPDU) ToHeaderedJSON() ([]byte, error) {
 }
 
 func (pdu EventPDU) PrevStateEventIDs() []string {
-	out := make([]string, len(pdu.ev.PrevState))
-	for i, eventID := range pdu.ev.PrevState {
+	out := make([]string, len(pdu.ev.PrevStateEventIDs))
+	for i, eventID := range pdu.ev.PrevStateEventIDs {
 		out[i] = eventID.String()
 	}
 	return out

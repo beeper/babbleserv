@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"fmt"
 	"maps"
 	"strings"
 	"testing"
@@ -345,4 +346,172 @@ func TestLocalEventJSONUnchanged(t *testing.T) {
 	b, err = json.Marshal(ev)
 	require.NoError(t, err)
 	assert.Equal(t, canonicalJSON(t, []byte(`{"sender":"@alice:example.com","state_key":"@alice:example.com","content":{"membership":"join","displayname":"\u003cAlice\u003e"},"origin_server_ts":1700000000000,"type":"m.room.member","unsigned":{"age":5,"transaction_id":"txn1"},"event_id":"$046Hn3SC7u516oyGua3qMmTghJX3lDVZoHDFcnNN-js"}`)), canonicalJSON(t, b))
+}
+
+const stateDAGsVersion = string(gomatrixserverlib.RoomVersionStateDAGs)
+
+func TestStateDAGEventJSON(t *testing.T) {
+	empty := ""
+	create := &types.Event{
+		PartialEvent: types.PartialEvent{Type: event.StateCreate, StateKey: &empty, Sender: "@alice:example.com", RoomID: "!abc"},
+		RoomVersion:  stateDAGsVersion,
+		PrevEventIDs: []id.EventID{},
+	}
+	b, err := json.Marshal(create)
+	require.NoError(t, err)
+	assert.Equal(t, `[]`, gjson.GetBytes(b, "prev_state_events").Raw)
+	assert.False(t, gjson.GetBytes(b, "auth_events").Exists())
+
+	member := &types.Event{
+		PartialEvent:      types.PartialEvent{Type: event.StateMember, StateKey: new("@alice:example.com"), RoomID: "!abc", Content: json.RawMessage(`{"membership":"join"}`)},
+		RoomVersion:       stateDAGsVersion,
+		PrevEventIDs:      []id.EventID{"$abc"},
+		PrevStateEventIDs: []id.EventID{"$abc"},
+		AuthEventIDs:      []id.EventID{"$calculated"},
+	}
+	b, err = json.Marshal(member)
+	require.NoError(t, err)
+	assert.Equal(t, `["$abc"]`, gjson.GetBytes(b, "prev_state_events").Raw)
+	assert.False(t, gjson.GetBytes(b, "auth_events").Exists(), "calculated auth events are never serialized")
+
+	parsed := &types.Event{RoomVersion: stateDAGsVersion}
+	require.NoError(t, json.Unmarshal(b, parsed))
+	assert.Equal(t, member.PrevStateEventIDs, parsed.PrevStateEventIDs)
+	assert.Nil(t, parsed.AuthEventIDs)
+	stored := types.MustNewEventFromBytes(member.ToMsgpack(), member.ID)
+	assert.Equal(t, member.PrevStateEventIDs, stored.PrevStateEventIDs)
+	assert.Equal(t, member.AuthEventIDs, stored.AuthEventIDs)
+
+	member.RoomVersion, member.PrevStateEventIDs = "12", nil
+	b, err = json.Marshal(member)
+	require.NoError(t, err)
+	assert.False(t, gjson.GetBytes(b, "prev_state_events").Exists())
+	assert.Equal(t, `["$calculated"]`, gjson.GetBytes(b, "auth_events").Raw)
+}
+
+func TestStateDAGEventFormatRefused(t *testing.T) {
+	valid := `{"type": "m.room.message", "room_id": "!abc", "sender": "@alice:example.com", "content": {},
+		"depth": 2, "prev_events": ["$prev"], "prev_state_events": ["$abc"], "origin_server_ts": 1234}`
+	tooMany := make([]string, types.MaxStateDAGPrevEvents+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("$event%d", i)
+	}
+	set := func(member, value string) func(string) (string, error) {
+		return func(pdu string) (string, error) { return sjson.SetRaw(pdu, member, value) }
+	}
+	tooManyJSON, err := json.Marshal(tooMany)
+	require.NoError(t, err)
+	refused := map[string]func(string) (string, error){
+		"auth_events":                       set("auth_events", `["$power"]`),
+		"empty auth_events":                 set("auth_events", `[]`),
+		"null auth_events":                  set("auth_events", `null`),
+		"no prev_state_events":              func(pdu string) (string, error) { return sjson.Delete(pdu, "prev_state_events") },
+		"null prev_state_events":            set("prev_state_events", `null`),
+		"string prev_state_events":          set("prev_state_events", `"$abc"`),
+		"object prev_state_events":          set("prev_state_events", `{"$abc": true}`),
+		"mixed prev_state_events":           set("prev_state_events", `["$abc", 1]`),
+		"null in prev_state_events":         set("prev_state_events", `["$abc", null]`),
+		"too many prev_events":              set("prev_events", string(tooManyJSON)),
+		"case variant of prev_state_events": set("Prev_State_Events", `[]`),
+	}
+	require.NoError(t, json.Unmarshal([]byte(valid), &types.Event{RoomVersion: stateDAGsVersion}))
+	for name, alter := range refused {
+		pdu, err := alter(valid)
+		require.NoError(t, err, name)
+		assert.Error(t, json.Unmarshal([]byte(pdu), &types.Event{RoomVersion: stateDAGsVersion}), name)
+
+		// Transaction PDUs are parsed before their room, and so their version, is known
+		ev := &types.Event{}
+		if err := json.Unmarshal([]byte(pdu), ev); err == nil {
+			ev.RoomVersion = stateDAGsVersion
+			assert.Error(t, ev.CheckStateDAGFormat(), name)
+		}
+	}
+
+	pdu, err := sjson.SetRaw(valid, "prev_state_events", string(tooManyJSON))
+	require.NoError(t, err)
+	ev := &types.Event{RoomVersion: stateDAGsVersion}
+	require.NoError(t, json.Unmarshal([]byte(pdu), ev), "the Synapse fork cites every state extremity")
+	assert.Len(t, ev.PrevStateEventIDs, types.MaxStateDAGPrevEvents+1)
+
+	pdu, err = sjson.SetRaw(valid, "prev_events", string(tooManyJSON))
+	require.NoError(t, err)
+	pdu, err = sjson.Set(pdu, "auth_events", []string{"$power"})
+	require.NoError(t, err)
+	assert.NoError(t, json.Unmarshal([]byte(pdu), &types.Event{RoomVersion: "12"}), "other versions take any number of prev events")
+}
+
+func TestStateDAGCreateFormatRefused(t *testing.T) {
+	create := `{"type": "m.room.create", "state_key": "", "sender": "@alice:example.com",
+		"content": {"room_version": "` + stateDAGsVersion + `"}, "origin_server_ts": 1234, "depth": 1,
+		"prev_events": [], "prev_state_events": [], "hashes": {"sha256": "hash"}, "signatures": {}}`
+	ev := &types.Event{}
+	require.NoError(t, json.Unmarshal([]byte(create), ev))
+	assert.Equal(t, stateDAGsVersion, ev.RoomVersion)
+	assert.Equal(t, []id.EventID{}, ev.PrevStateEventIDs)
+
+	withAuthEvents, err := sjson.Set(create, "auth_events", []string{})
+	require.NoError(t, err)
+	assert.Error(t, json.Unmarshal([]byte(withAuthEvents), &types.Event{}), "the version comes from the create content")
+}
+
+func TestStateDAGAuthDependencyIDs(t *testing.T) {
+	ev := &types.Event{
+		PartialEvent:      types.PartialEvent{RoomID: "!abc", Type: event.EventMessage},
+		RoomVersion:       stateDAGsVersion,
+		PrevStateEventIDs: []id.EventID{"$topic", "$name"},
+		AuthEventIDs:      []id.EventID{"$power"},
+	}
+	assert.Equal(t, []id.EventID{"$abc", "$topic", "$name"}, ev.AuthDependencyIDs())
+	assert.Equal(t, []id.EventID{"$abc", "$power"}, ev.AuthEventIDsWithCreate())
+	assert.Equal(t, []string{"$abc", "$power"}, ev.PDU().AuthEventIDs())
+	assert.Equal(t, []string{"$topic", "$name"}, ev.PDU().PrevStateEventIDs())
+
+	ev.PrevStateEventIDs = []id.EventID{"$abc"}
+	assert.Equal(t, []id.EventID{"$abc"}, ev.AuthDependencyIDs(), "the creator's join cites the create")
+}
+
+func TestEventFromProtoEventPrevStateEvents(t *testing.T) {
+	proto := gomatrixserverlib.ProtoEvent{
+		SenderID: "@alice:example.com", RoomID: "!abc", Type: "m.room.member", StateKey: new("@alice:example.com"),
+		PrevEvents: []any{"$prev"}, PrevStateEvents: &[]string{"$power", "$topic"}, Content: []byte(`{}`),
+	}
+	ev, err := types.EventFromProtoEvent(proto)
+	require.NoError(t, err)
+	assert.Equal(t, []id.EventID{"$power", "$topic"}, ev.PrevStateEventIDs)
+
+	proto.PrevStateEvents = nil
+	ev, err = types.EventFromProtoEvent(proto)
+	require.NoError(t, err)
+	assert.Nil(t, ev.PrevStateEventIDs)
+}
+
+// Versions without state DAGs take any prev_state_events or prev_state value, as Synapse ignores
+// them, and send it on as received so its hashes still match
+func TestPrevStateMembersHashAsSentWithoutStateDAGs(t *testing.T) {
+	message := `{"type": "m.room.message", "room_id": "!room:example.com", "sender": "@alice:example.com",
+		"content": {"body": "hi"}, "origin_server_ts": 1700000000000, "depth": 3, "prev_events": ["$prev"],
+		"auth_events": ["$power"], "signatures": {}}`
+	for _, member := range []string{"prev_state_events", "prev_state"} {
+		for _, value := range []string{`null`, `"x"`, `{"a": 1}`, `["$a", 1]`, `["$a", null]`, `[]`, `["$a", "$b"]`} {
+			name := member + " " + value
+			raw, err := sjson.SetRaw(message, member, value)
+			require.NoError(t, err)
+			eventID, pdu := hashedRemoteEvent(t, "11", raw)
+			ev := &types.Event{RoomVersion: "11"}
+			require.NoError(t, json.Unmarshal(pdu, ev), name)
+
+			hash, err := util.GetEventContentHash(ev)
+			require.NoError(t, err, name)
+			assert.Equal(t, gjson.GetBytes(pdu, "hashes.sha256").String(), hash, name)
+			refHash, err := util.GetEventReferenceHash(ev)
+			require.NoError(t, err, name)
+			assert.Equal(t, eventID, refHash, name)
+
+			stored := types.MustNewEventFromBytes(ev.ToMsgpack(), ev.ID)
+			b, err := json.Marshal(stored)
+			require.NoError(t, err, name)
+			assert.Equal(t, canonicalJSON(t, pdu), canonicalJSON(t, b), name)
+		}
+	}
 }

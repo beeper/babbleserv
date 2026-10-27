@@ -339,6 +339,32 @@ func (s *eventSender) txnNewStateBatch(
 	return s.r.state.NewBatch(s.roomID), authGraph
 }
 
+// newResolver resolves contexts in a preparation's transaction, leaving those over the inline
+// budgets to an artifact job
+func (s *eventSender) newResolver(txn fdb.ReadTransaction, p *preparedEvents, roomVersion string) *eventsendutil.Resolver {
+	return eventsendutil.NewResolver(txn, p.eventsProvider, p.authGraph, eventsendutil.ResolverOptions{
+		StateBatch:     p.stateBatch,
+		RoomID:         s.roomID,
+		RoomVersion:    roomVersion,
+		MaxContexts:    s.r.config.Rooms.StateBudget.InlineResolutionContexts,
+		MaxCandidates:  s.r.config.Rooms.StateBudget.InlineResolutionCandidates,
+		MaxStateTuples: s.r.config.Rooms.StateBudget.InlineResolutionStateTuples,
+	})
+}
+
+// resolutionWork captures only the preparation inputs the job needs after its transaction ends
+func (p *preparedEvents) resolutionWork(request *eventsendutil.ResolutionRequest, roomVersion string) resolveStateWork {
+	return resolveStateWork{
+		request: request,
+		inputs: artifactInputs{
+			stateBatch:     p.stateBatch,
+			eventsProvider: p.eventsProvider,
+			authGraph:      p.authGraph,
+		},
+		roomVersion: roomVersion,
+	}
+}
+
 // finalizeAcceptedState finalizes the auth graph headers of the accepted state events, which state
 // contexts may hold.
 func finalizeAcceptedState(authGraph *events.AuthGraph, evs ...*types.Event) error {

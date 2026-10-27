@@ -214,6 +214,8 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keyStore *KeyStore) (error, error) {
 	if _, err := spec.NewRoomID(ev.RoomID.String()); err != nil {
 		return err, nil
+	} else if err := ev.CheckStateDAGFormat(); err != nil {
+		return err, nil
 	} else if err := CheckEventSize(ev); err != nil {
 		return err, nil
 	}

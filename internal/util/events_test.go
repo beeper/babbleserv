@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -297,4 +298,102 @@ func TestVerifyRequestEventWithDuplicateKeys(t *testing.T) {
 	assert.True(t, verified.Redacted)
 	assert.JSONEq(t, `{"membership":"ban"}`, string(verified.Content))
 	assert.Equal(t, event.MembershipBan, verified.Membership())
+}
+
+// Builds an event as gomatrixserverlib's state DAG event builder does, and the same event as this
+// server builds it, which must hash and sign the same
+func TestStateDAGEventHashAndSignMatchBuilder(t *testing.T) {
+	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	roomVersion := gomatrixserverlib.MustGetRoomVersion(gomatrixserverlib.RoomVersionStateDAGs)
+	now := time.UnixMilli(1700000000000)
+	build := func(t *testing.T, proto gomatrixserverlib.ProtoEvent, ev *types.Event) {
+		built, err := roomVersion.NewEventBuilderFromProtoEvent(&proto).Build(now, "example.com", "ed25519:test", key)
+		require.NoError(t, err)
+		ev.RoomVersion, ev.Origin, ev.Timestamp = string(gomatrixserverlib.RoomVersionStateDAGs), "example.com", now.UnixMilli()
+		if ev.StateKey != nil {
+			ev.PrevState = []id.EventID{}
+		}
+		require.NoError(t, util.HashAndSignEvent(ev, "example.com", "ed25519:test", key))
+		assert.Equal(t, built.EventID(), ev.ID.String())
+		b, err := json.Marshal(ev)
+		require.NoError(t, err)
+		assert.JSONEq(t, string(built.JSON()), string(b))
+		assert.False(t, gjson.GetBytes(b, "auth_events").Exists())
+	}
+
+	empty := ""
+	create := &types.Event{
+		PartialEvent: types.PartialEvent{Type: event.StateCreate, StateKey: &empty, Sender: "@alice:example.com", Content: json.RawMessage(`{"room_version":"org.matrix.msc4242.12"}`)},
+		Depth:        1,
+		PrevEventIDs: []id.EventID{},
+	}
+	t.Run("create", func(t *testing.T) {
+		build(t, gomatrixserverlib.ProtoEvent{
+			SenderID: "@alice:example.com", Type: "m.room.create", StateKey: &empty, PrevEvents: []string{},
+			PrevStateEvents: &[]string{}, Depth: 1, Content: spec.RawJSON(create.Content),
+		}, create)
+	})
+	roomID := id.RoomID("!" + create.ID[1:])
+
+	t.Run("member", func(t *testing.T) {
+		build(t, gomatrixserverlib.ProtoEvent{
+			SenderID: "@alice:example.com", RoomID: roomID.String(), Type: "m.room.member", StateKey: new("@alice:example.com"),
+			PrevEvents: []string{create.ID.String()}, PrevStateEvents: &[]string{create.ID.String()}, Depth: 2,
+			Content: []byte(`{"membership":"join"}`),
+		}, &types.Event{
+			PartialEvent:      types.PartialEvent{RoomID: roomID, Type: event.StateMember, StateKey: new("@alice:example.com"), Sender: "@alice:example.com", Content: json.RawMessage(`{"membership":"join"}`)},
+			Depth:             2,
+			PrevEventIDs:      []id.EventID{create.ID},
+			PrevStateEventIDs: []id.EventID{create.ID},
+			AuthEventIDs:      []id.EventID{"$calculated"},
+		})
+	})
+
+	t.Run("message", func(t *testing.T) {
+		build(t, gomatrixserverlib.ProtoEvent{
+			SenderID: "@alice:example.com", RoomID: roomID.String(), Type: "m.room.message",
+			PrevEvents: []string{"$member"}, PrevStateEvents: &[]string{"$member", "$topic"}, Depth: 3,
+			Content: []byte(`{"body":"hi"}`),
+		}, &types.Event{
+			PartialEvent:      types.PartialEvent{RoomID: roomID, Type: event.EventMessage, Sender: "@alice:example.com", Content: json.RawMessage(`{"body":"hi"}`)},
+			Depth:             3,
+			PrevEventIDs:      []id.EventID{"$member"},
+			PrevStateEventIDs: []id.EventID{"$member", "$topic"},
+		})
+	})
+}
+
+func TestVerifyRemoteStateDAGEvents(t *testing.T) {
+	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	ev := &types.Event{
+		PartialEvent: types.PartialEvent{
+			RoomID: id.RoomID("!" + strings.Repeat("A", 43)), Sender: "@alice:example.com", Type: event.EventMessage,
+			Timestamp: time.Now().UnixMilli(), Content: json.RawMessage(`{"body":"hi"}`),
+		},
+		RoomVersion:       string(gomatrixserverlib.RoomVersionStateDAGs),
+		PrevEventIDs:      []id.EventID{"$prev"},
+		PrevStateEventIDs: []id.EventID{"$power"},
+	}
+	require.NoError(t, util.HashAndSignEvent(ev, "example.com", "ed25519:test", key))
+	valid, err := json.Marshal(ev)
+	require.NoError(t, err)
+	// The redaction algorithm drops auth_events, so the reference hash and signature still match
+	withAuthEvents, err := sjson.SetBytes(valid, "auth_events", []string{"$power"})
+	require.NoError(t, err)
+
+	keyStore := util.NewKeyStore(keysClient{key: key.Public().(ed25519.PublicKey)})
+	for name, pdu := range map[string][]byte{"valid": valid, "auth_events": withAuthEvents} {
+		remote := &types.Event{}
+		require.NoError(t, json.Unmarshal(pdu, remote), name)
+		remote.RoomVersion = ev.RoomVersion
+		verified, verifyErr, err := util.VerifyRemoteEvent(context.Background(), remote, keyStore)
+		require.NoError(t, err, name)
+		if name == "valid" {
+			require.NoError(t, verifyErr)
+			assert.Equal(t, ev.ID, verified.ID)
+			assert.False(t, verified.Redacted)
+		} else {
+			assert.Error(t, verifyErr, name)
+		}
+	}
 }

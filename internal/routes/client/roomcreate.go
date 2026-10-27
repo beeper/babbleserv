@@ -111,8 +111,14 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	if roomVersion == "" {
 		roomVersion = c.config.Rooms.DefaultVersion
 	}
-	if !slices.Contains(supportedRoomVersions, roomVersion) {
+	if _, found := c.config.RoomVersions()[roomVersion]; !found {
 		util.ResponseErrorJSON(w, r, mautrix.MUnsupportedRoomVersion)
+		return
+	} else if util.RoomVersionHas(roomVersion, gomatrixserverlib.IRoomVersion.StateDAGs) && slices.ContainsFunc(req.Invite, func(userID id.UserID) bool {
+		return userID.Homeserver() != c.config.ServerName
+	}) {
+		// Lifts once state DAG rooms federate, see rooms.ErrStateDAGFederation
+		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, "Inviting remote users to state DAG rooms is not supported yet")
 		return
 	}
 	createContent["room_version"] = roomVersion

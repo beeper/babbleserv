@@ -94,6 +94,15 @@ type EventsDirectory struct {
 	// value: empty
 	roomExtremIDs subspace.Subspace
 
+	// The tips of a state DAG room's state DAG (MSC4242), which local events cite in
+	// `prev_state_events` and whose states make up current state. Written only by publication: an
+	// accepted state event replaces the prev state events it cites, other events change nothing.
+	// Past the cap on `prev_state_events`, local events cite those published last.
+	//
+	// key: (RoomID, EventID)
+	// value: Versionstamp the event was published at
+	roomStateExtremIDs subspace.Subspace
+
 	// RoomID/related-event-ID/version to (eventID, relType)
 	//
 	// - paginate events relating to this event
@@ -147,6 +156,7 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 		roomVersionToTup:      eventsDir.Sub("rmv"),
 		roomVersionToState:    eventsDir.Sub("rch"),
 		roomExtremIDs:         eventsDir.Sub("rex"),
+		roomStateExtremIDs:    eventsDir.Sub("srx"),
 		byRoomRelation:        eventsDir.Sub("rel"),
 		byRoomReaction:        eventsDir.Sub("rea"),
 		roomThreadVersionToID: eventsDir.Sub("rth"),
@@ -306,6 +316,10 @@ func (e *EventsDirectory) roomExtremKeyToEventID(key fdb.Key) id.EventID {
 func (e *EventsDirectory) rangeForRoomExtrems(roomID id.RoomID) fdb.ExactRange {
 	return types.GetVersionRange(e.roomExtremIDs, types.ZeroVersionstamp, types.ZeroVersionstamp, roomID.String())
 	// return e.roomExtremIDs
+}
+
+func (e *EventsDirectory) keyForRoomStateExtrem(roomID id.RoomID, eventID id.EventID) fdb.Key {
+	return e.roomStateExtremIDs.Pack(tuple.Tuple{roomID.String(), eventID.String()})
 }
 
 // Room relations/reactions/threads

@@ -46,6 +46,9 @@ func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
 	} else if req.Event.RoomID != roomID {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Event room ID does not match the request")
 		return
+	} else if !f.config.JoinsRoomVersion(req.RoomVersion) {
+		responseIncompatibleRoomVersion(w, r, req.RoomVersion, "Room version not supported")
+		return
 	}
 
 	req.Event.RoomVersion = req.RoomVersion

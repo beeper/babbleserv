@@ -15,7 +15,7 @@ import (
 
 // Returns those of the events not stored as room events, which includes outliers
 func (r *RoomsDatabase) GetUnstoredEventIDs(ctx context.Context, eventIDs []id.EventID) ([]id.EventID, error) {
-	stored, err := r.storedEventIDs(ctx, eventIDs)
+	stored, err := r.GetStoredEventIDs(ctx, eventIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -25,8 +25,8 @@ func (r *RoomsDatabase) GetUnstoredEventIDs(ctx context.Context, eventIDs []id.E
 	}), nil
 }
 
-// storedEventIDs returns a map of event IDs already stored
-func (r *RoomsDatabase) storedEventIDs(ctx context.Context, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+// GetStoredEventIDs returns those of the events stored as room events, staged ones included
+func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
 	stored := make(map[id.EventID]struct{})
 	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
 		chunkStored, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (map[id.EventID]struct{}, error) {

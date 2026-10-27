@@ -2,12 +2,20 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix"
+
+	"github.com/beeper/babbleserv/internal/databases/rooms"
+	"github.com/beeper/babbleserv/internal/types"
 )
 
 // fakeWatch fires once its channel closes, with err
@@ -71,4 +79,24 @@ func TestWaitForChangeEndsWithTheContext(t *testing.T) {
 	cancel()
 	watch := newFakeWatch(nil)
 	assert.ErrorIs(t, waitForChange(ctx, watch, time.Hour), context.Canceled)
+}
+
+func TestRemoteMembershipErrors(t *testing.T) {
+	for name, test := range map[string]struct {
+		err     error
+		status  int
+		errcode string
+	}{
+		"state DAG room":        {fmt.Errorf("%w: !room", rooms.ErrStateDAGFederation), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
+		"template of a version": {fmt.Errorf("%w: 1", errIncompatibleRoomVersion), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
+		"failed by the job":     {&types.IngestFailure{Status: http.StatusForbidden, ErrCode: mautrix.MForbidden.ErrCode}, http.StatusForbidden, mautrix.MForbidden.ErrCode},
+		"invalid template":      {fmt.Errorf("%w from other", errInvalidMembershipTemplate), http.StatusBadGateway, mautrix.MUnknown.ErrCode},
+	} {
+		w := httptest.NewRecorder()
+		responseRemoteMembershipError(w, httptest.NewRequest(http.MethodPost, "/join", nil), test.err)
+		assert.Equal(t, test.status, w.Code, name)
+		var body map[string]string
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), name)
+		assert.Equal(t, test.errcode, body["errcode"], name)
+	}
 }

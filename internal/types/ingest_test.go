@@ -33,6 +33,8 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 		Enqueued:      1234,
 		MayHaveLanded: true,
 		Failures:      2,
+		FailedAt:      5678,
+		Size:          321,
 	}
 	decoded, err := NewIngestTargetFromBytes(target.ToMsgpack(), ev.ID)
 	require.NoError(t, err)
@@ -41,6 +43,8 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 	assert.Equal(t, target.Enqueued, decoded.Enqueued)
 	assert.True(t, decoded.MayHaveLanded)
 	assert.Equal(t, 2, decoded.Failures)
+	assert.Equal(t, int64(5678), decoded.FailedAt)
+	assert.Equal(t, 321, decoded.Size)
 	assert.Equal(t, ev.ID, decoded.Event.ID, "the ID comes from the key")
 	assert.Equal(t, ev.Type, decoded.Event.Type)
 	assert.Equal(t, ev.RoomVersion, decoded.Event.RoomVersion)
@@ -52,7 +56,7 @@ func TestIngestTargetRoundTrip(t *testing.T) {
 }
 
 func TestIngestJobAndJoinRoundTrip(t *testing.T) {
-	job := &IngestJob{RoomVersion: "11", Created: 1}
+	job := &IngestJob{RoomVersion: "11"}
 	decodedJob, err := NewIngestJobFromBytes(job.ToMsgpack(), "!room:example.com")
 	require.NoError(t, err)
 	job.RoomID = "!room:example.com"
@@ -66,4 +70,11 @@ func TestIngestJobAndJoinRoundTrip(t *testing.T) {
 	pending, err := NewIngestJoinFromBytes((&IngestJoin{EventID: "$join"}).ToMsgpack())
 	require.NoError(t, err)
 	assert.Nil(t, pending.Failure)
+}
+
+func TestIngestQueueFull(t *testing.T) {
+	assert.False(t, IngestQueue{}.Full(2000, 50_000_000))
+	assert.False(t, IngestQueue{PDUs: 1999, Bytes: 49_999_999}.Full(2000, 50_000_000))
+	assert.True(t, IngestQueue{PDUs: 2000}.Full(2000, 50_000_000), "full by count")
+	assert.True(t, IngestQueue{PDUs: 3, Bytes: 50_000_000}.Full(2000, 50_000_000), "full by bytes")
 }

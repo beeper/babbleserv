@@ -15,6 +15,7 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms/events"
+	"github.com/beeper/babbleserv/internal/databases/rooms/eventsendutil"
 	"github.com/beeper/babbleserv/internal/databases/rooms/state"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -148,9 +149,11 @@ func (s *localEventSender) txnPrepareLocal(ctx context.Context, txn fdb.ReadTran
 	if !created && !isServerJoined(room) {
 		return nil, fmt.Errorf("%w: %s", ErrServerNotInRoom, s.roomID)
 	}
-	prepared, err := s.txnPrepareLocalEvents(ctx, txn, room)
+	prepared, work, err := s.txnPrepareLocalEvents(ctx, txn, room, true)
 	if err != nil {
 		return nil, err
+	} else if work != nil {
+		return needsWork{work: work}, nil
 	} else if options.RequireAllEvents && len(prepared.rejected) > 0 {
 		return nil, &RequiredEventRejectedError{Event: prepared.rejected[0].Event, Err: prepared.rejected[0].Error}
 	}
@@ -197,28 +200,44 @@ func (r *RoomsDatabase) PrepareLocalEvents(ctx context.Context, roomID id.RoomID
 	s := &localEventSender{
 		eventSender: r.newEventSender(roomID, pushContext{}),
 		partialEvs:  partialEvs,
+		now:         time.Now().UTC(),
 	}
-	prepared, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*preparedEvents, error) {
-		room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
+	for built := make(builtArtifacts); ; {
+		var work preparationWork
+		prepared, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (*preparedEvents, error) {
+			room, err := r.txnGetOrCreateRoomForEvents(txn, roomID, partialEvs)
+			if err != nil {
+				return nil, err
+			}
+			var prepared *preparedEvents
+			prepared, work, err = s.txnPrepareLocalEvents(ctx, txn, room, false)
+			return prepared, err
+		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		} else if work == nil {
+			return prepared.evs, prepared.rejected, nil
+		} else if err := built.check(work); err != nil {
+			return nil, nil, err
+		} else if err := s.build(ctx, work); err != nil {
+			return nil, nil, err
 		}
-		s.now = time.Now().UTC()
-		return s.txnPrepareLocalEvents(ctx, txn, room)
-	})
-	if err != nil {
-		return nil, nil, err
+		built.add(work)
 	}
-	return prepared.evs, prepared.rejected, nil
 }
 
 // txnPrepareLocalEvents builds local events sent at now in a line, each authorized against the state
-// after the one before, from the room's current state.
+// after the one before, from the room's current state. In a state DAG room each cites the state
+// extremities as they stand after the events before it, and is authorized against the state after
+// them. When there are too many to cite, that is not current state, and the event must pass current
+// state too. A resolution too large to run here is returned as work instead. Unless publishing,
+// current state is only resolved when an event needs it.
 func (s *localEventSender) txnPrepareLocalEvents(
 	ctx context.Context,
 	txn fdb.ReadTransaction,
 	room *types.Room,
-) (*preparedEvents, error) {
+	publishing bool,
+) (*preparedEvents, preparationWork, error) {
 	eventsProvider := s.r.events.NewTxnEventsProvider(ctx, txn)
 	stateBatch, authGraph := s.txnNewStateBatch(txn, eventsProvider)
 	prepared := &preparedEvents{
@@ -237,7 +256,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	}
 	initialState, err := stateBatch.TxnLookupEntries(txn, room.CurrentState, slices.Collect(maps.Keys(lookupKeys)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup current auth state: %w", err)
+		return nil, nil, fmt.Errorf("failed to lookup current auth state: %w", err)
 	}
 	for _, entry := range initialState {
 		eventsProvider.WillGet(entry.EventID)
@@ -250,7 +269,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	}
 
 	// TODO: prev_events cannot be unlimited size, need to cap at the most
-	// recent(?) X event IDs
+	// recent(?) X event IDs, as state DAG rooms do
 
 	// Get the current last (dangling) room events for prev_events. This may
 	// be multiple events if federation is involved, due to forks in the DAG.
@@ -261,26 +280,54 @@ func (s *localEventSender) txnPrepareLocalEvents(
 
 	prevEventIDs := s.r.events.TxnLookupCurrentRoomExtremEventIDs(txn, room.ID)
 
+	stateDAGs := util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs)
+	var stateExtremities []id.EventID
+	var resolver *eventsendutil.Resolver
+	if stateDAGs {
+		stateExtremities = s.r.events.TxnLookupCurrentRoomStateExtremEventIDs(txn, room.ID)
+		eventsProvider.WillGet(stateExtremities...)
+		if len(prevEventIDs) > types.MaxStateDAGPrevEvents {
+			prevEventIDs = s.r.events.TxnOrderByStoredVersion(txn, prevEventIDs)
+		}
+		prevEventIDs = citedExtremities(prevEventIDs)
+		resolver = s.newResolver(txn, prepared, room.Version)
+	}
+
 	allowedEvs := make([]*types.Event, 0, len(s.partialEvs))
 	rejectedEvs := make([]RejectedEvent, 0)
 
 	keyID, key := s.r.config.MustGetActiveSigningKey()
 
-	// State after the events accepted so far, which is the state before the next
-	runningState := room.CurrentState
+	// The room's current state after the events accepted so far, the state before the next unless
+	// it cites only some of the state extremities. Zero while a resolution is put off.
+	steps := stateSteps{current: room.CurrentState}
 
 	for _, partialEv := range s.partialEvs {
 		ev := newLocalEvent(partialEv, room.Version, depth, prevEventIDs, s.now)
 
-		beforeState, err := prepared.txnLookupAuthState(txn, runningState, ev)
+		before := steps.current
+		var citesSome bool
+		if stateDAGs {
+			ev.PrevStateEventIDs = citedExtremities(stateExtremities)
+			citesSome = len(ev.PrevStateEventIDs) < len(stateExtremities)
+			if citesSome || before.IsZero() {
+				var request *eventsendutil.ResolutionRequest
+				if before, request, err = resolver.Resolve(ev.PrevStateEventIDs); err != nil || request != nil {
+					return nil, s.workFor(prepared, request, room), err
+				} else if !citesSome {
+					steps.current = before
+				}
+			}
+		}
+		beforeState, err := prepared.txnLookupAuthState(txn, before, ev)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if ev.Type == event.StateMember {
 			var senderMember *types.Event
 			if senderMemberID, found := beforeState[types.MemberStateTup(ev.Sender)]; found {
 				if senderMember, err = eventsProvider.GetRequired(senderMemberID); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
 			if err := s.checkBabbleProfileUpdateValid(ev, senderMember); err != nil {
@@ -321,8 +368,16 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			continue
 		}
 
+		// Holds by construction while events/srx holds only accepted state events
+		if authErr, err := util.AuthorizePrevStateEvents(ev, eventsProvider.Get); err != nil {
+			return nil, nil, err
+		} else if authErr != nil {
+			zerolog.Ctx(ctx).Err(authErr).Stringer("event_id", ev.ID).Msg("Local event cites invalid state extremities")
+			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, authErr})
+			continue
+		}
 		if authErr, err := events.NewTxnAuthEventsProvider(ctx, eventsProvider, beforeState).IsEventAllowed(ev); err != nil {
-			return nil, err
+			return nil, nil, err
 		} else if authErr != nil {
 			zerolog.Ctx(ctx).Err(authErr).
 				Stringer("event_id", ev.ID).
@@ -331,23 +386,55 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, authErr})
 			continue
 		}
+		// Other servers soft-fail a message current state refuses, such as one from a user banned on
+		// a branch it does not cite. State events are refused here too, though others would take them.
+		if citesSome {
+			if steps.current.IsZero() {
+				var request *eventsendutil.ResolutionRequest
+				if steps.current, request, err = resolver.Resolve(stateExtremities); err != nil || request != nil {
+					return nil, s.workFor(prepared, request, room), err
+				}
+			}
+			if _, authErr, err := prepared.txnAuthorizeAt(ctx, txn, steps.current, ev); err != nil {
+				return nil, nil, err
+			} else if authErr != nil {
+				zerolog.Ctx(ctx).Err(authErr).Stringer("event_id", ev.ID).Msg("Local event citing some state extremities fails current state")
+				rejectedEvs = append(rejectedEvs, RejectedEvent{ev, authErr})
+				continue
+			}
+		}
 
 		// The graph finalizes its auth header, and later events of the batch read it as auth state
 		authGraph.Add(ev)
 		eventsProvider.Add(ev)
-		if err := prepared.txnApplyEvent(txn, runningState, ev); errors.Is(err, state.ErrEntryTooLarge) {
+		if err := prepared.txnApplyEvent(txn, before, ev); errors.Is(err, state.ErrEntryTooLarge) {
 			rejectedEvs = append(rejectedEvs, RejectedEvent{ev, err})
 			continue
 		} else if err != nil {
-			return nil, err
+			return nil, nil, err
 		} else if err := s.r.txnPreProcessEventUnsigned(txn, eventsProvider, ev, prevStateEventID); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		// Event is allowed, use as next prev and bump depths
 		prevEventIDs = []id.EventID{ev.ID}
 		depth += 1
-		runningState = ev.AfterState
+		if !stateDAGs {
+			steps.advance(ev.ID, ev.AfterState)
+		} else if entersStateDAG(ev) {
+			stateExtremities = advanceStateExtremities(stateExtremities, ev)
+			next := ev.AfterState
+			if len(stateExtremities) > 1 {
+				next = types.StateHash{}
+				if publishing {
+					var request *eventsendutil.ResolutionRequest
+					if next, request, err = resolver.Resolve(stateExtremities); err != nil || request != nil {
+						return nil, s.workFor(prepared, request, room), err
+					}
+				}
+			}
+			steps.advance(ev.ID, next)
+		}
 		allowedEvs = append(allowedEvs, ev)
 
 		zerolog.Ctx(ctx).Debug().
@@ -357,8 +444,18 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	}
 
 	prepared.evs, prepared.rejected = allowedEvs, rejectedEvs
-	prepared.setLocalState(room.CurrentState)
-	return prepared, nil
+	if publishing {
+		prepared.stateSteps = steps.steps
+	}
+	prepared.setReplacedExtremities()
+	return prepared, nil, nil
+}
+
+func (s *localEventSender) workFor(prepared *preparedEvents, request *eventsendutil.ResolutionRequest, room *types.Room) preparationWork {
+	if request == nil {
+		return nil
+	}
+	return prepared.resolutionWork(request, room.Version)
 }
 
 func (s *localEventSender) checkBabbleProfileUpdateValid(ev, senderMember *types.Event) error {
@@ -389,14 +486,11 @@ func newLocalEvent(
 	}
 }
 
-func (p *preparedEvents) setLocalState(current types.StateHash) {
-	steps := stateSteps{current: current}
+func (p *preparedEvents) setReplacedExtremities() {
 	p.replacedExtremities = make(map[id.EventID][]id.EventID, len(p.evs))
 	for _, ev := range p.evs {
 		if !ev.IsDuplicate {
-			steps.advance(ev.ID, ev.AfterState)
 			p.replacedExtremities[ev.ID] = ev.PrevEventIDs
 		}
 	}
-	p.stateSteps = steps.steps
 }

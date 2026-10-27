@@ -34,6 +34,7 @@ notifier:
 rooms:
   enabled: true
   defaultVersion: 11
+  unstableStateDAGs: true
   # Small, so that Complement stages over several transactions and runs an artifact job for every
   # resolution with conflicts.
   stateBudget:

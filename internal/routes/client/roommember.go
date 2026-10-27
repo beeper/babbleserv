@@ -30,6 +30,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/databases/transient"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
@@ -415,6 +416,8 @@ func (c *ClientRoutes) remoteJoin(r *http.Request, roomID id.RoomID, userID id.U
 		})
 		if err != nil {
 			return err
+		} else if ev.StateDAGs() {
+			return fmt.Errorf("%w: %s", rooms.ErrStateDAGFederation, roomID)
 		}
 		joinServers := slices.Concat([]string{server}, slices.DeleteFunc(slices.Clone(servers), func(other string) bool {
 			return other == server || other == c.config.ServerName
@@ -515,6 +518,8 @@ func (c *ClientRoutes) remoteMembership(
 			return fmt.Errorf("%w: %w", errRemoteLeaveFailed, err)
 		}
 		return err
+	} else if membership != event.MembershipLeave && ev.StateDAGs() {
+		return fmt.Errorf("%w: %s", rooms.ErrStateDAGFederation, roomID)
 	}
 
 	ctx := hlog.FromRequest(r).With().
@@ -541,7 +546,10 @@ func (c *ClientRoutes) remoteMembership(
 
 func responseRemoteMembershipError(w http.ResponseWriter, r *http.Request, err error) {
 	var failure *types.IngestFailure
-	if errors.As(err, &failure) {
+	if errors.Is(err, rooms.ErrStateDAGFederation) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
+		return
+	} else if errors.As(err, &failure) {
 		hlog.FromRequest(r).Warn().
 			Int("status", failure.Status).
 			Str("errcode", failure.ErrCode).

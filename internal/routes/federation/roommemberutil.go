@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
@@ -53,6 +54,9 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 		// The matching send_ would be refused, as a room this server left takes no remote user's
 		// membership. A rejected invite falls back to the invitee's server recording it locally.
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Not an active room on this server")
+		return
+	} else if util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
+		responseIncompatibleRoomVersion(w, r, room.Version, rooms.ErrStateDAGFederation.Error())
 		return
 	} else if checkRequestVersions {
 		if !slices.Contains(r.URL.Query()["ver"], room.Version) {
@@ -158,6 +162,9 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	} else if room == nil {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Room not found")
 		return
+	} else if util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
+		responseIncompatibleRoomVersion(w, r, room.Version, rooms.ErrStateDAGFederation.Error())
+		return
 	}
 	ev.RoomVersion = room.Version
 
@@ -198,4 +205,14 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		}
 	}
 	util.ResponseJSON(w, r, http.StatusOK, response)
+}
+
+// responseIncompatibleRoomVersion refuses a request about a room of a version this server does not
+// federate, naming the version as the spec asks
+func responseIncompatibleRoomVersion(w http.ResponseWriter, r *http.Request, roomVersion, message string) {
+	util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+		"errcode":      mautrix.MIncompatibleRoomVersion.ErrCode,
+		"error":        message,
+		"room_version": roomVersion,
+	})
 }

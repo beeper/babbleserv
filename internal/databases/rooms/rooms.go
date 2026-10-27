@@ -83,9 +83,11 @@ type RoomsDatabase struct {
 	// ijb: RoomID -> types.IngestJob
 	// ijt: (RoomID, EventID) -> types.IngestTarget
 	// iju: (RoomID, UserID) -> types.IngestJoin
+	// ijq: (RoomID, "pdus" | "bytes") -> little-endian int64, the PDU targets queued
 	ingestJobs    subspace.Subspace
 	ingestTargets subspace.Subspace
 	ingestJoins   subspace.Subspace
+	ingestQueues  subspace.Subspace
 
 	// BabbleBot's direct message room with each local user
 	//
@@ -153,6 +155,7 @@ func NewRoomsDatabase(
 		ingestJobs:    roomsDir.Sub("ijb"),
 		ingestTargets: roomsDir.Sub("ijt"),
 		ingestJoins:   roomsDir.Sub("iju"),
+		ingestQueues:  roomsDir.Sub("ijq"),
 		botRooms:      roomsDir.Sub("bot"),
 
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),

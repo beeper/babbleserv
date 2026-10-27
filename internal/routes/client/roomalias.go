@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"maunium.net/go/mautrix"
 
@@ -70,8 +71,16 @@ func (c *ClientRoutes) CreateAlias(w http.ResponseWriter, r *http.Request) {
 	} else if req.RoomID == "" {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Missing RoomID")
 		return
-	} else if util.HomeserverForRoomID(req.RoomID) != c.config.ServerName {
-		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Refusing to set alias for nonlocal room")
+	} else if _, server, _ := strings.Cut(roomAlias.String(), ":"); server != c.config.ServerName {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Room alias must be local")
+		return
+	}
+	// A room ID names no server from room version 12, so a room is local when this server is in it
+	if joined, err := c.db.Rooms.IsServerJoined(r.Context(), req.RoomID, c.config.ServerName); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+		return
+	} else if !joined {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Refusing to set alias for a room this server is not in")
 		return
 	}
 

@@ -50,14 +50,17 @@ var errorToMeta = map[string]errorMeta{
 	mautrix.MInvalidUsername.ErrCode: {400, "Invalid username"},
 	mautrix.MUserInUse.ErrCode:       {400, "Username is already taken"},
 
-	mautrix.MUnsupportedRoomVersion.ErrCode: {400, "Room version not supported"},
-	mautrix.MRoomInUse.ErrCode:              {409, "Room alias taken"},
+	mautrix.MUnsupportedRoomVersion.ErrCode:  {400, "Room version not supported"},
+	mautrix.MIncompatibleRoomVersion.ErrCode: {400, "Room version not supported"},
+	mautrix.MRoomInUse.ErrCode:               {409, "Room alias taken"},
 
 	mautrix.MMissingToken.ErrCode: {401, ""},
 	mautrix.MUnknownToken.ErrCode: {401, ""},
 	MUnauthorized.ErrCode:         {401, ""},
 	mautrix.MForbidden.ErrCode:    {403, ""},
 	MUnprocessableContent.ErrCode: {422, ""},
+
+	mautrix.MLimitExceeded.ErrCode: {429, "Too many requests"},
 
 	mautrix.MNotFound.ErrCode:     {404, "Nothing found here"},
 	MCannotOverwriteMedia.ErrCode: {409, "Media ID already has content"},

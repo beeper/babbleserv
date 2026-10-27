@@ -10,6 +10,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/hlog"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -67,11 +68,16 @@ type federatedMakeResp struct {
 	RoomVersion gomatrixserverlib.RoomVersion
 }
 
-// A server answering make_* with a template this server cannot sign
-var errInvalidMembershipTemplate = errors.New("invalid membership event template")
+var (
+	// A server answering make_* with a template this server cannot sign
+	errInvalidMembershipTemplate = errors.New("invalid membership event template")
+	// A server answering make_* for a room of a version this server does not join
+	errIncompatibleRoomVersion = errors.New("room version not supported")
+)
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
-// none does, the error of the last server whose request failed is returned, or else an
+// none does, an errIncompatibleRoomVersion is returned if a server gave a room version this server
+// does not join, else the error of the last server whose request failed, or else an
 // errInvalidMembershipTemplate.
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
@@ -82,7 +88,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 ) (*types.Event, string, error) {
 	log := hlog.FromRequest(r)
 
-	var requestErr, templateErr error
+	var versionErr, requestErr, templateErr error
 	for _, otherServer := range otherServers {
 		serverLog := log.With().
 			Stringer("room_id", roomID).
@@ -94,6 +100,10 @@ func (c *ClientRoutes) makeFederatedEvent(
 		if err != nil {
 			serverLog.Warn().Err(err).Msg("Failed to make federated event via server")
 			requestErr = err
+			continue
+		} else if !c.config.JoinsRoomVersion(string(resp.RoomVersion)) {
+			serverLog.Warn().Str("room_version", string(resp.RoomVersion)).Msg("Server gave a template of a room version not supported")
+			versionErr = fmt.Errorf("%w: %s", errIncompatibleRoomVersion, resp.RoomVersion)
 			continue
 		}
 		ev, err := membershipTemplateEvent(middleware.GetRequestUserID(r), roomID, membership, resp)
@@ -109,7 +119,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 		serverLog.Debug().Msg("Making federated event via server")
 		return ev, otherServer, nil
 	}
-	return nil, "", cmp.Or(requestErr, templateErr)
+	return nil, "", cmp.Or(versionErr, requestErr, templateErr)
 }
 
 func membershipTemplateEvent(
@@ -123,7 +133,10 @@ func membershipTemplateEvent(
 
 // As Synapse does, a server failing to give a usable template is a bad gateway
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, errInvalidMembershipTemplate) {
+	if errors.Is(err, errIncompatibleRoomVersion) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
+		return
+	} else if errors.Is(err, errInvalidMembershipTemplate) {
 		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
 			"errcode": util.MUnknown.ErrCode,
 			"error":   err.Error(),
