@@ -356,7 +356,7 @@ func newPDURooms(ctx context.Context, db pduRoomLookups, serverName string, crea
 }
 
 // roomVersion returns the version of the PDU's room. A room without a record takes the version of
-// its create event, or for a leave of a local user, the version of the invite the leave answers.
+// its create event, or for a leave of a local user, the version of the invite or knock it ends.
 func (p *pduRooms) roomVersion(ev *types.Event) (string, error) {
 	room, found := p.rooms[ev.RoomID]
 	if !found {
@@ -384,7 +384,7 @@ func (p *pduRooms) roomVersion(ev *types.Event) (string, error) {
 		p.rooms[ev.RoomID] = room
 		return room.version, nil
 	}
-	return p.invitedVersion(ev)
+	return p.heldMembershipVersion(ev)
 }
 
 func (p *pduRooms) anyIngesting() bool {
@@ -396,7 +396,7 @@ func (p *pduRooms) anyIngesting() bool {
 	return false
 }
 
-func (p *pduRooms) invitedVersion(ev *types.Event) (string, error) {
+func (p *pduRooms) heldMembershipVersion(ev *types.Event) (string, error) {
 	if ev.Type != event.StateMember || ev.StateKey == nil || ev.Membership() != event.MembershipLeave {
 		return "", nil
 	}
@@ -405,8 +405,10 @@ func (p *pduRooms) invitedVersion(ev *types.Event) (string, error) {
 		return "", nil
 	}
 	membershipTup, membershipEv, err := p.db.GetCurrentMembershipAndEvent(p.ctx, targetUserID, ev.RoomID)
-	if err != nil || membershipTup == nil || membershipTup.Membership != event.MembershipInvite {
+	if err != nil || membershipTup == nil {
 		return "", err
+	} else if membershipTup.Membership != event.MembershipInvite && membershipTup.Membership != event.MembershipKnock {
+		return "", nil
 	}
 	return membershipEv.RoomVersion, nil
 }

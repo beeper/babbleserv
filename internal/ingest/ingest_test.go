@@ -302,6 +302,7 @@ func TestGapFillServers(t *testing.T) {
 	servers := gapFillServers([]string{"origin.example"}, many, "self.example")
 	assert.Len(t, servers, maxGapFillServers, "a large room's servers are not all asked")
 	assert.Equal(t, "origin.example", servers[0])
+	assert.Equal(t, many, gapFillServers(many, []string{"resident.example"}, "self.example"), "every origin is asked")
 }
 
 func TestHoldUnanswered(t *testing.T) {

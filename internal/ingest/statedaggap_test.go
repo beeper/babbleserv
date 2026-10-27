@@ -22,22 +22,27 @@ import (
 )
 
 type stateDAGRequestMade struct {
-	server    string
-	latestIDs []id.EventID
-	limit     int
+	server        string
+	latestIDs     []id.EventID
+	limit, staged int
 }
 
 // stateDAGServers serve a state DAG, of which this server publishes some events and stores others
-// without state, walking it as a babbleserv answers get_missing_events with the MSC's flag
+// without state, walking it as a babbleserv answers get_missing_events with the MSC's flag. Events
+// cited that it does not know are withheld.
 type stateDAGServers struct {
 	cites     map[id.EventID][]id.EventID
 	published map[id.EventID]bool
 	stored    map[id.EventID]bool
 	pdus      []*types.Event
+	// Other targets of the job, which the walk does not walk into
+	pending map[id.EventID]bool
 	// The most events a server answers with
 	maxEvents int
-	errs      map[string]error
-	requests  []stateDAGRequestMade
+	// State events a server gives with each response that nothing cites
+	junk     int
+	errs     map[string]error
+	requests []stateDAGRequestMade
 }
 
 func newStateDAGServers(cites map[id.EventID][]id.EventID, published ...id.EventID) *stateDAGServers {
@@ -67,8 +72,8 @@ func (s *stateDAGServers) pdu(eventID id.EventID, prevStateIDs ...id.EventID) *t
 	return ev
 }
 
-func (s *stateDAGServers) request(_ context.Context, server string, latestIDs []id.EventID, limit int) (int, error) {
-	s.requests = append(s.requests, stateDAGRequestMade{server, latestIDs, limit})
+func (s *stateDAGServers) request(_ context.Context, server string, latestIDs []id.EventID, limit, maxStaged int) (int, error) {
+	s.requests = append(s.requests, stateDAGRequestMade{server, latestIDs, limit, maxStaged})
 	if err := s.errs[server]; err != nil {
 		return 0, err
 	}
@@ -82,7 +87,9 @@ func (s *stateDAGServers) request(_ context.Context, server string, latestIDs []
 		var next []id.EventID
 		for _, eventID := range frontier {
 			for _, citedID := range s.cites[eventID] {
-				if _, seen := hops[citedID]; !seen && !s.published[citedID] {
+				if _, known := s.cites[citedID]; !known {
+					continue
+				} else if _, seen := hops[citedID]; !seen && !s.published[citedID] {
 					hops[citedID] = hop
 					next = append(next, citedID)
 				}
@@ -94,16 +101,20 @@ func (s *stateDAGServers) request(_ context.Context, server string, latestIDs []
 	slices.SortFunc(walked, func(a, b id.EventID) int { return cmp.Or(cmp.Compare(hops[a], hops[b]), cmp.Compare(a, b)) })
 	staged := 0
 	for _, eventID := range walked[:min(len(walked), limit, s.maxEvents)] {
-		if !s.stored[eventID] {
+		if !s.stored[eventID] && staged < maxStaged {
 			s.stored[eventID] = true
 			staged++
 		}
 	}
-	return staged, nil
+	return min(staged+s.junk, maxStaged), nil
 }
 
 func (s *stateDAGServers) walk(context.Context) (*rooms.StateDAGGap, error) {
-	gap := &rooms.StateDAGGap{Cites: make(map[id.EventID][]id.EventID), Missing: make(map[id.EventID]struct{})}
+	gap := &rooms.StateDAGGap{
+		Cites:   make(map[id.EventID][]id.EventID),
+		Missing: make(map[id.EventID]struct{}),
+		Pending: make(map[id.EventID]struct{}),
+	}
 	seen := make(map[id.EventID]bool)
 	var frontier []id.EventID
 	for _, ev := range s.pdus {
@@ -117,7 +128,10 @@ func (s *stateDAGServers) walk(context.Context) (*rooms.StateDAGGap, error) {
 			continue
 		}
 		seen[eventID] = true
-		if !s.stored[eventID] {
+		if s.pending[eventID] {
+			gap.Pending[eventID] = struct{}{}
+			continue
+		} else if !s.stored[eventID] {
 			gap.Missing[eventID] = struct{}{}
 			continue
 		}
@@ -236,14 +250,16 @@ func TestStateDAGFillOutcome(t *testing.T) {
 }
 
 // A PDU fails once the requests for it staged more than a PDU's gap fill may, and a run's gap fills
-// stop once they staged all it may
+// stop once they staged all it may. No request stages more than one past what they may.
 func TestStateDAGFillBounds(t *testing.T) {
 	servers := newStateDAGServers(chain(25), "$base")
 	servers.pdu("$pdu", "$s25")
 	fill := servers.fill(t, 15, unlimited(), "origin.example")
 	assert.Equal(t, []int{10, 20}, servers.limits(), "no request once past the bound")
+	assert.Equal(t, 6, servers.requests[1].staged, "the 5 the PDU may fetch still, and one to show the gap is larger")
 	failures, _ := fill.outcome()
 	assert.Equal(t, tooLargeGapFailure(15), failures["$pdu"])
+	assert.Equal(t, 16, fill.fetched["$pdu"])
 
 	servers = newStateDAGServers(chain(25), "$base")
 	servers.pdu("$pdu", "$s25")
@@ -328,4 +344,46 @@ func TestDecodeStateDAGBoundsEachValue(t *testing.T) {
 	chunks, err := decodeChunks(t, `{"origin":"`+half+`","state_dag":[{"event_id":"$0","content":{"body":"`+half+`"}},{"event_id":"$1"}]}`, 10, 1<<30)
 	require.NoError(t, err, "each value is bounded on its own")
 	assert.Equal(t, [][]string{{"$0", "$1"}}, chunks)
+}
+
+// Events a server gives that do not fill the gap, which it could give endlessly, count against the
+// bounds but give it no more requests
+func TestStateDAGFillIgnoresEventsOutsideTheGap(t *testing.T) {
+	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil}, "$base")
+	servers.pdu("$pdu", "$never")
+	servers.junk = 1
+	fill := servers.fill(t, 10_000, unlimited(), "origin.example")
+	assert.Len(t, servers.requests, 2, "the PDUs, then the frontier, both filling nothing")
+	assert.Equal(t, 2, fill.fetched["$pdu"])
+	failures, _ := fill.outcome()
+	assert.Equal(t, unfilledGapFailure(), failures["$pdu"])
+}
+
+// A server giving the gap an event at a time is asked a bounded number of rounds, then left
+func TestStateDAGFillBoundsTheRoundsAServerIsAsked(t *testing.T) {
+	servers := newStateDAGServers(chain(99), "$base")
+	servers.maxEvents = 1
+	servers.pdu("$pdu", "$s99")
+	fill := servers.fill(t, 1000, unlimited(), "origin.example")
+	assert.Len(t, servers.requests, stateDAGRounds(1000))
+	assert.Equal(t, 10, stateDAGRounds(1000), "7 growing the limit, 2 at 1,000, 1 from the frontier")
+	assert.NotEmpty(t, fill.open())
+	failures, held := fill.outcome()
+	assert.Equal(t, unfilledGapFailure(), failures["$pdu"])
+	assert.Empty(t, held)
+}
+
+// A PDU reaching another target of the job, through events served, is held back for it to publish
+// first, rather than taking the target for missing
+func TestStateDAGFillHoldsPDUsReachingOtherTargets(t *testing.T) {
+	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil, "$other": {"$base"}, "$served": {"$other"}}, "$base")
+	servers.pending = map[id.EventID]bool{"$other": true}
+	servers.pdu("$pdu", "$served")
+	servers.pdu("$citing", "$pdu")
+	servers.pdu("$connected", "$base")
+	fill := servers.fill(t, 10_000, unlimited(), "origin.example")
+	assert.Empty(t, fill.open(), "the other target is not missing")
+	failures, held := fill.outcome()
+	assert.Empty(t, failures)
+	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}, "$citing": {}}, held)
 }

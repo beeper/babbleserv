@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,11 @@ const (
 	// PDUs a get_missing_events request names. Synapse answers at most 20 events a request and pulls
 	// 10 for a PDU it fills the gap of, so each PDU named gets that many.
 	gapPDUsPerRequest = 2
+	// The limit of a get_missing_events request the spec has a server take when none is given
+	defaultMissingEventsLimit = 10
+	// The largest get_missing_events response read, room for maxStateDAGLimit events of the largest
+	// size a PDU may have: a server answering with more is taken to refuse
+	maxMissingEventsResponseBytes = maxStateDAGLimit * 64 << 10
 )
 
 // Fetcher pulls from other servers the events and state that a room's events need and this server
@@ -45,13 +51,17 @@ type Fetcher struct {
 	fedclient *federation.Client
 	// fedclient without its timeout on whole requests, for responses read as they arrive
 	streamClient *federation.Client
-	keyStore     *util.KeyStore
+	// fedclient reading responses of at most maxMissingEventsResponseBytes
+	gapClient *federation.Client
+	keyStore  *util.KeyStore
 }
 
 func NewFetcher(cfg config.BabbleConfig, db *databases.Databases, fedclient *federation.Client, keyStore *util.KeyStore) *Fetcher {
 	streamClient := *fedclient
 	streamClient.HTTP = &http.Client{Transport: fedclient.HTTP.Transport, CheckRedirect: fedclient.HTTP.CheckRedirect}
-	return &Fetcher{config: cfg, db: db, fedclient: fedclient, streamClient: &streamClient, keyStore: keyStore}
+	gapClient := *fedclient
+	gapClient.ResponseSizeLimit = maxMissingEventsResponseBytes
+	return &Fetcher{config: cfg, db: db, fedclient: fedclient, streamClient: &streamClient, gapClient: &gapClient, keyStore: keyStore}
 }
 
 // GapFill is what a gap fill pulled for PDUs citing events missing here
@@ -65,11 +75,11 @@ type GapFill struct {
 }
 
 // GapFill pulls the events missing between a joined room's extremities and the PDU targets citing
-// prev events missing here. Each PDU's origin is asked for its own PDUs' gaps, then the room's other
-// servers for the gaps still open, at most maxGapFillServers in all, and the state at the pulled
-// events' prev events that have none here is fetched from the server that pulled them. As Synapse
-// does, it never fetches the state at the PDUs' own prev events: their sender pushed them, so should
-// have what they cite. Fails only on errors of this server's own.
+// prev events missing here. Each PDU's origin is asked for its own PDUs' gaps, then the first
+// maxGapFillServers of the servers gapFillServers gives for the gaps still open, and the state at
+// the pulled events' prev events that have none here is fetched from the server that pulled them. As
+// Synapse does, it never fetches the state at the PDUs' own prev events: their sender pushed them, so
+// should have what they cite. Fails only on errors of this server's own.
 func (f *Fetcher) GapFill(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -162,14 +172,15 @@ func newGapPlan(targets []*types.IngestTarget, missingIDs []id.EventID) *gapPlan
 	return plan
 }
 
-// run asks each server for the open gaps of the PDUs it sent, then each for the gaps still open
+// run asks each server for the open gaps of the PDUs it sent, then the first maxGapFillServers for
+// the gaps still open
 func (p *gapPlan) run(ctx context.Context, servers []string, missingEvents missingEventsFunc) error {
 	for _, server := range servers {
 		if err := p.ask(ctx, server, true, missingEvents); err != nil {
 			return err
 		}
 	}
-	for _, server := range servers {
+	for _, server := range servers[:min(len(servers), maxGapFillServers)] {
 		if err := p.ask(ctx, server, false, missingEvents); err != nil {
 			return err
 		}
@@ -280,18 +291,19 @@ func (f *Fetcher) missingEvents(
 	defer cancel()
 	// Events from before this server's earliest timeline event, such as its join, are kept out of the
 	// timeline as Synapse does, and the state at them fetched instead
-	resp, err := f.fedclient.GetMissingEvents(ctx, &federation.ReqGetMissingEvents{
+	limit := cmp.Or(f.config.Federation.MaxFetchMissingEvents, defaultMissingEventsLimit)
+	resp, err := f.gapClient.GetMissingEvents(ctx, &federation.ReqGetMissingEvents{
 		ServerName:     server,
 		RoomID:         roomID,
 		EarliestEvents: earliestIDs,
 		LatestEvents:   latestIDs,
-		Limit:          f.config.Federation.MaxFetchMissingEvents,
+		Limit:          limit,
 		MinDepth:       int(minDepth),
 	})
 	if err != nil {
 		return nil, err
 	}
-	remoteEvs, err := util.VerifyRemoteEvents(ctx, resp.Events, roomVersion, f.keyStore, seenIDs)
+	remoteEvs, err := util.VerifyRemoteEvents(ctx, resp.Events[:min(len(resp.Events), limit)], roomVersion, f.keyStore, seenIDs)
 	if err != nil {
 		return nil, err
 	}

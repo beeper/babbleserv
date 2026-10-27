@@ -8,6 +8,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/matrix-org/gomatrixserverlib"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms/eventsendutil"
@@ -51,6 +52,32 @@ func advanceStateExtremities(extremities []id.EventID, ev *types.Event) []id.Eve
 // stored last. Depth would let a sender choose.
 func citedExtremities(extremities []id.EventID) []id.EventID {
 	return append([]id.EventID{}, extremities[max(len(extremities)-types.MaxStateDAGPrevEvents, 0):]...)
+}
+
+// citedPrevStateEvents returns the prev_state_events of a local event of a state DAG room: the
+// extremities citedExtremities gives, and the membership an out-of-band change supersedes, when
+// given and not among them, in place of the extremity stored first should they fill the cap. It
+// reports whether they are every extremity and nothing else, when the state before the event is
+// current state.
+func citedPrevStateEvents(extremities []id.EventID, superseded id.EventID) (cited []id.EventID, current bool) {
+	cited = citedExtremities(extremities)
+	if superseded == "" || slices.Contains(cited, superseded) {
+		return cited, len(cited) == len(extremities)
+	} else if len(cited) == types.MaxStateDAGPrevEvents {
+		cited = cited[1:]
+	}
+	return append(cited, superseded), false
+}
+
+// changesRemoteMembership reports whether a member event changes the membership of a user of a
+// server other than serverName, sent by someone else: an out-of-band change, should the target's
+// server not be in the room. A make_* template is the target's own event, sent back by its server.
+func changesRemoteMembership(ev *types.Event, serverName string) bool {
+	if ev.Type != event.StateMember || ev.StateKey == nil {
+		return false
+	}
+	target := id.UserID(*ev.StateKey)
+	return target != ev.Sender && target.Homeserver() != serverName
 }
 
 // ErrStateDAGTooLarge refuses a join to a state DAG room whose state DAG, with the join, would hold

@@ -382,19 +382,28 @@ func citesAny(ev *types.Event, eventIDs map[id.EventID]struct{}) bool {
 	return slices.ContainsFunc(ev.PrevEventIDs, cited) || slices.ContainsFunc(ev.AuthDependencyIDs(), cited)
 }
 
-// Most servers a gap fill asks
+// Most servers a gap fill asks beyond the PDUs' origins, and asks for the gaps of PDUs other servers
+// sent
 const maxGapFillServers = 5
 
-// gapFillServers are the servers a gap fill asks, in order: the PDUs' origins, then the room's
-// other servers, without this one, at most maxGapFillServers
+// gapFillServers are the servers a gap fill asks, in order, without this one: the PDUs' origins, each
+// of which has what its PDUs cite, then the room's other servers while fewer than maxGapFillServers
+// are asked, so that a large room's dead servers cannot stretch a fill over hours
 func gapFillServers(origins, roomServers []string, self string) []string {
-	servers := make([]string, 0, maxGapFillServers)
-	for _, server := range slices.Concat(origins, roomServers) {
-		if len(servers) == maxGapFillServers {
-			break
-		} else if server != self && !slices.Contains(servers, server) {
+	var servers []string
+	add := func(server string) {
+		if server != self && !slices.Contains(servers, server) {
 			servers = append(servers, server)
 		}
+	}
+	for _, server := range origins {
+		add(server)
+	}
+	for _, server := range roomServers {
+		if len(servers) >= maxGapFillServers {
+			break
+		}
+		add(server)
 	}
 	return servers
 }

@@ -60,3 +60,28 @@ func TestIngestQueueCounters(t *testing.T) {
 
 	assert.Zero(t, counterValue(nil), "a room without a queue")
 }
+
+// A gap fill's pulled PDUs are enqueued in transactions of bounded size
+func TestChunkIngestTargets(t *testing.T) {
+	sized := func(sizes ...int) []*types.IngestTarget {
+		targets := make([]*types.IngestTarget, len(sizes))
+		for i, size := range sizes {
+			targets[i] = &types.IngestTarget{Size: size}
+		}
+		return targets
+	}
+	chunkSizes := func(chunks [][]*types.IngestTarget) [][]int {
+		var sizes [][]int
+		for _, chunk := range chunks {
+			var chunkSizes []int
+			for _, target := range chunk {
+				chunkSizes = append(chunkSizes, target.Size)
+			}
+			sizes = append(sizes, chunkSizes)
+		}
+		return sizes
+	}
+	assert.Equal(t, [][]int{{40, 50}, {30, 60}, {100}}, chunkSizes(chunkIngestTargets(sized(40, 50, 30, 60, 100), 90)))
+	assert.Equal(t, [][]int{{200}, {10}}, chunkSizes(chunkIngestTargets(sized(200, 10), 90)), "a target over the bound has a chunk of its own")
+	assert.Empty(t, chunkIngestTargets(nil, 90))
+}

@@ -337,14 +337,7 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	outlierLeaveEv := &types.Event{
-		RoomVersion:  currentMemberEv.RoomVersion,
-		PartialEvent: *partialEv,
-		Local:        true,
-		PrevEventIDs: []id.EventID{currentMemberEv.ID},
-	}
-	outlierLeaveEv.Timestamp = time.Now().UTC().UnixMilli()
-
+	outlierLeaveEv := newOutlierLeave(partialEv, currentMemberEv, time.Now().UTC())
 	keyID, key := c.config.MustGetActiveSigningKey()
 	if err := util.HashAndSignEvent(outlierLeaveEv, c.config.ServerName, keyID, key); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
@@ -358,6 +351,23 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	}
 
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
+}
+
+// newOutlierLeave builds a local user's leave ending the invite or knock they hold in a room this
+// server is not in, after the held membership event. In a state DAG room it cites that event in
+// prev_state_events, as an out-of-band change does (MSC4242).
+func newOutlierLeave(partialEv *types.PartialEvent, held *types.Event, now time.Time) *types.Event {
+	ev := &types.Event{
+		RoomVersion:  held.RoomVersion,
+		PartialEvent: *partialEv,
+		Local:        true,
+		PrevEventIDs: []id.EventID{held.ID},
+	}
+	if held.StateDAGs() {
+		ev.PrevStateEventIDs = []id.EventID{held.ID}
+	}
+	ev.Timestamp = now.UnixMilli()
+	return ev
 }
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3roomsroomidban

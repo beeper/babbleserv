@@ -2,6 +2,7 @@ package rooms
 
 import (
 	"context"
+	"slices"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"maunium.net/go/mautrix/id"
@@ -21,19 +22,28 @@ import (
 type StateDAGGap struct {
 	// The events stored without state, or replayed and not published yet, each with the events it
 	// cites, the implicit create among them
-	Cites  map[id.EventID][]id.EventID
+	Cites map[id.EventID][]id.EventID
+	// Their bodies, when asked for
 	Events map[id.EventID]*types.Event
 	// Of those, the ones replayed and not published yet
 	Unpublished map[id.EventID]struct{}
 	// The events not stored, or stored only as outliers
 	Missing map[id.EventID]struct{}
+	// The pending events reached, the events given among them
+	Pending map[id.EventID]struct{}
 }
 
 // WalkStateDAGGap walks back along prev_state_events from events of a state DAG room that its job
 // publishes, unstored, through the events stored without state or replayed and not published yet,
-// to the published events. The events given are never walked into: those citing one publish after
-// it.
-func (r *RoomsDatabase) WalkStateDAGGap(ctx context.Context, roomID id.RoomID, evs []*types.Event) (*StateDAGGap, error) {
+// to the published events. Neither the events given nor the other pending ones, the job's other
+// targets, are walked into: those citing one publish after it.
+func (r *RoomsDatabase) WalkStateDAGGap(
+	ctx context.Context,
+	roomID id.RoomID,
+	evs []*types.Event,
+	pendingIDs []id.EventID,
+	keepEvents bool,
+) (*StateDAGGap, error) {
 	read, err := r.renewableEventReads(ctx, roomID)
 	if err != nil {
 		return nil, err
@@ -42,11 +52,11 @@ func (r *RoomsDatabase) WalkStateDAGGap(ctx context.Context, roomID id.RoomID, e
 	for _, ev := range evs {
 		fromIDs = append(fromIDs, ev.AuthDependencyIDs()...)
 	}
-	walk, err := walkUnreplayed(roomID, fromIDs, util.EventsToIDs(evs), true, read)
+	walk, err := walkUnreplayed(roomID, fromIDs, slices.Concat(util.EventsToIDs(evs), pendingIDs), keepEvents, read)
 	if err != nil {
 		return nil, err
 	}
-	return &StateDAGGap{Cites: walk.cites, Events: walk.evs, Unpublished: walk.unpublished, Missing: walk.missing}, nil
+	return &StateDAGGap{Cites: walk.cites, Events: walk.evs, Unpublished: walk.unpublished, Missing: walk.missing, Pending: walk.pending}, nil
 }
 
 // GetRoomStateExtremEventIDs returns a state DAG room's state extremities in the order they were

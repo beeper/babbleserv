@@ -14,6 +14,11 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
+// ErrRestrictedJoinUnsupported refuses the template of a restricted join to a state DAG room. Its
+// resident co-signs it in send_join, while this server would publish its own copy without that
+// signature, which other servers drop when it is part of the state DAG they fetch from here.
+var ErrRestrictedJoinUnsupported = errors.New("restricted joins to state DAG rooms are not supported")
+
 // MembershipTemplateEvent holds a make_* template to what was asked for and sets the membership
 // asked for, as Synapse does
 func MembershipTemplateEvent(
@@ -23,7 +28,8 @@ func MembershipTemplateEvent(
 	template gomatrixserverlib.ProtoEvent,
 	roomVersion gomatrixserverlib.RoomVersion,
 ) (*types.Event, error) {
-	if _, err := gomatrixserverlib.GetRoomVersion(roomVersion); err != nil {
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(roomVersion)
+	if err != nil {
 		return nil, err
 	}
 	ev, err := types.EventFromProtoEvent(template)
@@ -35,6 +41,8 @@ func MembershipTemplateEvent(
 	}
 	if !gjson.ParseBytes(ev.Content).IsObject() {
 		return nil, errors.New("content is not an object")
+	} else if membership == event.MembershipJoin && roomSpec.StateDAGs() && gjson.GetBytes(ev.Content, "join_authorised_via_users_server").Exists() {
+		return nil, ErrRestrictedJoinUnsupported
 	} else if ev.Content, err = sjson.SetBytes(ev.Content, "membership", membership); err != nil {
 		return nil, err
 	}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/databases/rooms/events"
 	"github.com/beeper/babbleserv/internal/databases/rooms/eventsendutil"
+	"github.com/beeper/babbleserv/internal/databases/rooms/servers"
 	"github.com/beeper/babbleserv/internal/databases/rooms/state"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -299,22 +300,36 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	keyID, key := s.r.config.MustGetActiveSigningKey()
 
 	// The room's current state after the events accepted so far, the state before the next unless
-	// it cites only some of the state extremities. Zero while a resolution is put off.
+	// it cites other than every state extremity. Zero while a resolution is put off.
 	steps := stateSteps{current: room.CurrentState}
+	currentState := func() (types.StateHash, *eventsendutil.ResolutionRequest, error) {
+		if steps.current.IsZero() {
+			current, request, err := resolver.Resolve(stateExtremities)
+			if err != nil || request != nil {
+				return types.StateHash{}, request, err
+			}
+			steps.current = current
+		}
+		return steps.current, nil, nil
+	}
 
 	for _, partialEv := range s.partialEvs {
 		ev := newLocalEvent(partialEv, room.Version, depth, prevEventIDs, s.now)
 
 		before := steps.current
-		var citesSome bool
+		var citesOther bool
 		if stateDAGs {
-			ev.PrevStateEventIDs = citedExtremities(stateExtremities)
-			citesSome = len(ev.PrevStateEventIDs) < len(stateExtremities)
-			if citesSome || before.IsZero() {
-				var request *eventsendutil.ResolutionRequest
+			superseded, request, err := s.txnSupersededMembership(txn, stateBatch, ev, currentState)
+			if err != nil || request != nil {
+				return nil, s.workFor(prepared, request, room), err
+			}
+			var citesCurrent bool
+			ev.PrevStateEventIDs, citesCurrent = citedPrevStateEvents(stateExtremities, superseded)
+			citesOther = !citesCurrent
+			if citesOther || before.IsZero() {
 				if before, request, err = resolver.Resolve(ev.PrevStateEventIDs); err != nil || request != nil {
 					return nil, s.workFor(prepared, request, room), err
-				} else if !citesSome {
+				} else if citesCurrent {
 					steps.current = before
 				}
 			}
@@ -371,7 +386,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			continue
 		}
 
-		// Holds by construction while events/srx holds only accepted state events
+		// Holds by construction while events/srx and current state hold only accepted state events
 		if authErr, err := util.AuthorizePrevStateEvents(ev, eventsProvider.Get); err != nil {
 			return nil, nil, err
 		} else if authErr != nil {
@@ -391,17 +406,14 @@ func (s *localEventSender) txnPrepareLocalEvents(
 		}
 		// Other servers soft-fail a message current state refuses, such as one from a user banned on
 		// a branch it does not cite. State events are refused here too, though others would take them.
-		if citesSome {
-			if steps.current.IsZero() {
-				var request *eventsendutil.ResolutionRequest
-				if steps.current, request, err = resolver.Resolve(stateExtremities); err != nil || request != nil {
-					return nil, s.workFor(prepared, request, room), err
-				}
-			}
-			if _, authErr, err := prepared.txnAuthorizeAt(ctx, txn, steps.current, ev); err != nil {
+		if citesOther {
+			current, request, err := currentState()
+			if err != nil || request != nil {
+				return nil, s.workFor(prepared, request, room), err
+			} else if _, authErr, err := prepared.txnAuthorizeAt(ctx, txn, current, ev); err != nil {
 				return nil, nil, err
 			} else if authErr != nil {
-				zerolog.Ctx(ctx).Err(authErr).Stringer("event_id", ev.ID).Msg("Local event citing some state extremities fails current state")
+				zerolog.Ctx(ctx).Err(authErr).Stringer("event_id", ev.ID).Msg("Local event citing other than every state extremity fails current state")
 				rejectedEvs = append(rejectedEvs, RejectedEvent{ev, authErr})
 				continue
 			}
@@ -452,6 +464,32 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	}
 	prepared.setReplacedExtremities()
 	return prepared, nil, nil
+}
+
+// txnSupersededMembership returns the target's membership in current state when a member event of a
+// state DAG room changes it out of band: the target's server is not in the room, so holds that
+// membership without the state DAG, and can tell the event supersedes it only should the event cite
+// it (MSC4242).
+func (s *localEventSender) txnSupersededMembership(
+	txn fdb.ReadTransaction,
+	stateBatch *state.Batch,
+	ev *types.Event,
+	currentState func() (types.StateHash, *eventsendutil.ResolutionRequest, error),
+) (id.EventID, *eventsendutil.ResolutionRequest, error) {
+	if !changesRemoteMembership(ev, s.r.config.ServerName) {
+		return "", nil, nil
+	}
+	target := id.UserID(*ev.StateKey)
+	if count, err := txn.Get(s.r.servers.KeyForJoinedCount(s.roomID, target.Homeserver())).Get(); err != nil || servers.JoinedCountOf(count) > 0 {
+		return "", nil, err
+	}
+	current, request, err := currentState()
+	if err != nil || request != nil || current.IsZero() {
+		return "", request, err
+	}
+	tup := types.MemberStateTup(target)
+	entries, err := stateBatch.TxnLookupEntries(txn, current, []types.StateTup{tup})
+	return entries[tup].EventID, nil, err
 }
 
 func (s *localEventSender) workFor(prepared *preparedEvents, request *eventsendutil.ResolutionRequest, room *types.Room) preparationWork {

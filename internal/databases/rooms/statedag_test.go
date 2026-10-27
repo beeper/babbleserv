@@ -77,6 +77,48 @@ func TestCitedExtremitiesAreThoseStoredLast(t *testing.T) {
 	assert.Equal(t, []id.EventID{}, citedExtremities(nil), "the create cites an empty list")
 }
 
+func TestCitedPrevStateEventsAddTheSupersededMembership(t *testing.T) {
+	var full []id.EventID
+	for i := range types.MaxStateDAGPrevEvents + 2 {
+		full = append(full, id.EventID(fmt.Sprintf("$%02d", i)))
+	}
+	for name, test := range map[string]struct {
+		extremities []id.EventID
+		superseded  id.EventID
+		cited       []id.EventID
+		current     bool
+	}{
+		"no membership cites every extremity":              {[]id.EventID{"$a", "$b"}, "", []id.EventID{"$a", "$b"}, true},
+		"over the cap with no membership cites some":       {full, "", full[2:], false},
+		"a membership that is an extremity adds nothing":   {[]id.EventID{"$a", "$invite"}, "$invite", []id.EventID{"$a", "$invite"}, true},
+		"a membership behind the extremities is added":     {[]id.EventID{"$topic"}, "$invite", []id.EventID{"$topic", "$invite"}, false},
+		"at the cap the extremity stored first makes room": {full[2:], "$invite", append(slices.Clone(full[3:]), "$invite"), false},
+		"over the cap the extremity stored first makes room": {
+			full, "$invite", append(slices.Clone(full[3:]), "$invite"), false,
+		},
+		"an extremity left out over the cap is added in place of the first": {
+			full, full[0], append(slices.Clone(full[3:]), full[0]), false,
+		},
+	} {
+		cited, current := citedPrevStateEvents(test.extremities, test.superseded)
+		assert.Equal(t, test.cited, cited, name)
+		assert.Equal(t, test.current, current, name)
+		assert.LessOrEqual(t, len(cited), types.MaxStateDAGPrevEvents, name)
+	}
+}
+
+func TestChangesRemoteMembership(t *testing.T) {
+	member := func(sender, target id.UserID) *types.Event {
+		ev := &types.Event{}
+		ev.Type, ev.Sender, ev.StateKey = event.StateMember, sender, new(target.String())
+		return ev
+	}
+	assert.True(t, changesRemoteMembership(member("@alice:here", "@dave:there"), "here"), "a kick or invite of another server's user")
+	assert.False(t, changesRemoteMembership(member("@dave:there", "@dave:there"), "here"), "a make_* template is the target's own")
+	assert.False(t, changesRemoteMembership(member("@alice:here", "@bob:here"), "here"), "a local user's membership")
+	assert.False(t, changesRemoteMembership(stateDAGTestEvent("$topic", true), "here"))
+}
+
 func TestOnlyMessagesSoftFailInStateDAGRooms(t *testing.T) {
 	message, state := stateDAGTestEvent("$message", false), stateDAGTestEvent("$topic", true)
 	for _, ev := range []*types.Event{message, state} {

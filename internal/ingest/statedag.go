@@ -192,7 +192,7 @@ func (w *stateDAGJoin) stage(ctx context.Context, raws []json.RawMessage) error 
 		return tooLargeFailure("state DAG has over", limit, limit)
 	}
 	parsed := w.skipNewerThanJoin(parseStateDAGEvents(ctx, raws, w.target.Event.RoomVersion, w.run.roomID))
-	staged, stored, err := w.run.stageUnstored(ctx, parsed, w.seen)
+	staged, stored, err := w.run.stageUnstored(ctx, parsed, w.seen, 0)
 	if err != nil {
 		return err
 	}
@@ -267,9 +267,15 @@ func parseStateDAGEvents(ctx context.Context, raws []json.RawMessage, roomVersio
 }
 
 // stageUnstored verifies the served state DAG's state events not stored here, skipping before their
-// signatures are checked those that are, as verifying is the expensive part, and stages them. Returns
-// those staged and which of the events were stored already.
-func (run *jobRun) stageUnstored(ctx context.Context, evs []*types.Event, seen map[id.EventID]struct{}) ([]*types.Event, map[id.EventID]struct{}, error) {
+// signatures are checked those that are, as verifying is the expensive part, and stages them, the
+// first maxStaged of them unless it is zero. Returns those staged and which of the events were stored
+// already.
+func (run *jobRun) stageUnstored(
+	ctx context.Context,
+	evs []*types.Event,
+	seen map[id.EventID]struct{},
+	maxStaged int,
+) ([]*types.Event, map[id.EventID]struct{}, error) {
 	stored, err := run.jobs.db.Rooms.GetStoredEventIDs(ctx, util.EventsToIDs(evs))
 	if err != nil {
 		return nil, nil, err
@@ -278,6 +284,9 @@ func (run *jobRun) stageUnstored(ctx context.Context, evs []*types.Event, seen m
 		_, found := stored[ev.ID]
 		return found || ev.StateKey == nil
 	})
+	if maxStaged > 0 {
+		unstored = unstored[:min(len(unstored), maxStaged)]
+	}
 	staged, err := util.VerifyParsedRemoteEvents(ctx, unstored, run.jobs.keyStore, seen)
 	if err != nil {
 		return nil, nil, err
@@ -291,17 +300,17 @@ func (run *jobRun) stageUnstored(ctx context.Context, evs []*types.Event, seen m
 // not have. In a room this server is in, phase A pulls for those with a gap the prev events missing
 // here, whose PDUs it makes targets too, then the state DAG events missing, which it stages, phase B
 // replays these, and phase C publishes them ahead of the PDUs. A PDU no server fills the state DAG
-// gap of fails; one whose gap a server failed to answer for, and the PDUs citing it, are held back
-// for a later round while the rest publish. In a room this server is not in, every PDU is sent, to
-// be kept as an outlier membership or dropped.
+// gap of fails; one whose gap a server failed to answer for, or that reaches another target of the
+// job, and the PDUs citing it, are held back for a later round while the rest publish. In a room
+// this server is not in, every PDU is sent, to be kept as an outlier membership or dropped.
 type stateDAGPDUs struct {
 	run  *jobRun
 	pdus []*types.IngestTarget
 	gap  bool
 	// Whether this server is in the room, which a gap fill needs
-	joined     bool
-	unanswered map[id.EventID]struct{}
-	errs       []error
+	joined bool
+	held   map[id.EventID]struct{}
+	errs   []error
 }
 
 func (w *stateDAGPDUs) targets() []*types.IngestTarget {
@@ -345,7 +354,7 @@ func (w *stateDAGPDUs) build(ctx context.Context) error {
 	if !w.gap || !w.joined {
 		return nil
 	}
-	sent, _ := holdUnanswered(w.pdus, w.unanswered)
+	sent, _ := holdUnanswered(w.pdus, w.held)
 	var from []id.EventID
 	for _, target := range sent {
 		from = append(from, target.Event.AuthDependencyIDs()...)
@@ -358,11 +367,10 @@ func (w *stateDAGPDUs) build(ctx context.Context) error {
 	})
 }
 
-// publish sends the PDUs, with the events their gap fill replayed, but for those whose gap a server
-// failed to answer for and those citing them, which stay targets, failing the work for a later round
-// to ask again
+// publish sends the PDUs, with the events their gap fill replayed, but for those held back and those
+// citing them, which stay targets, failing the work for a later round to ask again
 func (w *stateDAGPDUs) publish(ctx context.Context) error {
-	sent, held := holdUnanswered(w.pdus, w.unanswered)
+	sent, held := holdUnanswered(w.pdus, w.held)
 	if !w.gap || !w.joined {
 		return w.run.sendPDUs(ctx, nil, nil, sent)
 	} else if err := w.run.publishStateDAG(ctx, sent); err != nil {
@@ -371,5 +379,9 @@ func (w *stateDAGPDUs) publish(ctx context.Context) error {
 		return nil
 	}
 	w.pdus = held
-	return fmt.Errorf("no server gave the state DAG events %d PDUs cite: %w", len(held), errors.Join(w.errs...))
+	err := fmt.Errorf("the state DAG gaps of %d PDUs are not filled yet", len(held))
+	if len(w.errs) > 0 {
+		err = fmt.Errorf("%w: %w", err, errors.Join(w.errs...))
+	}
+	return err
 }

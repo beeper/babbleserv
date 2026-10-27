@@ -74,6 +74,29 @@ func TestGapPlanAsksEachOriginForItsOwnPDUs(t *testing.T) {
 	assert.Empty(t, plan.unanswered())
 }
 
+// However many origins a chunk's PDUs have, each is asked for its own, and only the first few for
+// the gaps of the others
+func TestGapPlanAsksEveryOrigin(t *testing.T) {
+	servers := &gapServers{}
+	var targets []*types.IngestTarget
+	var origins []string
+	for i := range maxGapFillServers + 2 {
+		origin := fmt.Sprintf("server%d.example", i)
+		origins = append(origins, origin)
+		targets = append(targets, gapTarget(id.EventID(fmt.Sprintf("$pdu%d", i)), origin, "$missing"))
+	}
+	plan := newGapPlan(targets, []id.EventID{"$missing"})
+	require.NoError(t, plan.run(context.Background(), gapFillServers(origins, nil, "self.example"), servers.missingEvents))
+
+	asked := make(map[string]int)
+	for _, req := range servers.requests {
+		asked[req.server]++
+	}
+	assert.Len(t, asked, maxGapFillServers+2, "every origin is asked")
+	assert.Equal(t, 1, asked[origins[maxGapFillServers]], "an origin past the first few is asked for its own PDU alone")
+	assert.Greater(t, asked[origins[0]], 1, "the first few are asked for the others' gaps too")
+}
+
 func TestGapPlanAsksOtherServersForGapsStillOpen(t *testing.T) {
 	servers := &gapServers{before: map[string]map[id.EventID][]id.EventID{
 		"b.example": {"$a": {"$beforeA"}},

@@ -317,16 +317,22 @@ func (r *RoomsDatabase) txnReplay(
 	// The replayed events and, outside a publish, the unpublished ones the replay reached, in order
 	var adopted []*types.Event
 	eventBytes := 0
+	full := func() bool {
+		return eventBytes+prepared.stateBatch.PendingBytes(prepared.stateContexts()...) >= budget || time.Since(start) > replayTxnTime
+	}
 	for _, eventID := range order {
 		ev, err := eventsProvider.GetRequired(eventID)
 		if err != nil {
 			return nil, err
 		} else if ev.HasStateIn(roomID) {
 			batch.done++
-			if ev.Unpublished && !replay.Publish {
-				ev.Unpublished = false
-				adopted = append(adopted, ev)
-				eventBytes += len(ev.ToMsgpack())
+			if !ev.Unpublished || replay.Publish {
+				continue
+			}
+			ev.Unpublished = false
+			adopted = append(adopted, ev)
+			if eventBytes += len(ev.ToMsgpack()); full() {
+				break
 			}
 			continue
 		}
@@ -341,8 +347,7 @@ func (r *RoomsDatabase) txnReplay(
 		if ev.Rejected {
 			batch.rejected++
 		}
-		eventBytes += len(ev.ToMsgpack()) + stagedEventOverhead
-		if eventBytes+prepared.stateBatch.PendingBytes(prepared.stateContexts()...) >= budget || time.Since(start) > replayTxnTime {
+		if eventBytes += len(ev.ToMsgpack()) + stagedEventOverhead; full() {
 			break
 		}
 	}
@@ -416,10 +421,16 @@ func (r *RoomsDatabase) txnReplayEvent(
 	}
 	if err := prepared.txnApplyEvent(txn, before, ev); errors.Is(err, state.ErrEntryTooLarge) {
 		reject(err)
+		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	return nil, nil
+	// As the pipeline gives a published state event the content it replaces, for sync
+	var prevStateEventID id.EventID
+	if ev.StateKey != nil {
+		prevStateEventID = authState[ev.StateTup()]
+	}
+	return nil, r.txnPreProcessEventUnsigned(txn, prepared.eventsProvider, ev, prevStateEventID)
 }
 
 // stateDAGJoinBefore is the state before a join to a state DAG room: the state after its prev state

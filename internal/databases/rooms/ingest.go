@@ -230,10 +230,36 @@ func (r *RoomsDatabase) EnqueuePulledIngestPDUs(ctx context.Context, roomID id.R
 	return r.enqueueIngestPDUs(ctx, roomID, targets)
 }
 
+// Most bytes of events an enqueue writes a transaction, well within FoundationDB's 10 MB
+const maxEnqueueBytes = 4 << 20
+
+// enqueueIngestPDUs writes the targets in transactions of at most maxEnqueueBytes, which a /send
+// transaction's PDUs fit in one of, while a gap fill may pull many more
 func (r *RoomsDatabase) enqueueIngestPDUs(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
-	if len(targets) == 0 {
-		return nil
+	for _, chunk := range chunkIngestTargets(targets, maxEnqueueBytes) {
+		if err := r.enqueueIngestPDUChunk(ctx, roomID, chunk); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// chunkIngestTargets splits targets in order into chunks of at most maxBytes past their first
+func chunkIngestTargets(targets []*types.IngestTarget, maxBytes int) [][]*types.IngestTarget {
+	var chunks [][]*types.IngestTarget
+	size := 0
+	for _, target := range targets {
+		if n := len(chunks); n == 0 || size+target.Size > maxBytes {
+			chunks = append(chunks, nil)
+			size = 0
+		}
+		chunks[len(chunks)-1] = append(chunks[len(chunks)-1], target)
+		size += target.Size
+	}
+	return chunks
+}
+
+func (r *RoomsDatabase) enqueueIngestPDUChunk(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (types.Nil, error) {
 		if err := r.txnEnsureIngestJob(txn, roomID, targets[0].Event.RoomVersion); err != nil {
 			return nil, err

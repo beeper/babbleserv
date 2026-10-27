@@ -207,9 +207,10 @@ func (r *RoomsDatabase) sendOutlierMemberships(
 }
 
 // isOutlierMembership reports whether a member event of a room this server is not in reaches a local
-// user who sees it outside the room: an invite of a local user, or the inviter's leave rescinding it.
-// A remote user's membership is never an outlier, as only local users have membership rows, so a
-// remote invitee's rejection is not taken: the invitee's server records it locally.
+// user who sees it outside the room: an invite of a local user, or a leave ending the membership the
+// user holds, see endsHeldMembership. A remote user's membership is never an outlier, as only local
+// users have membership rows, so a remote invitee's rejection is not taken: the invitee's server
+// records it locally.
 func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomID, ev *types.Event) (bool, error) {
 	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID {
 		return false, nil
@@ -226,16 +227,35 @@ func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomI
 			memberships, err := r.txnGetRoomUserMemberships(txn, roomID, []id.UserID{target})
 			if err != nil {
 				return false, err
-			} else if membership, found := memberships[target]; !found || membership.Membership != event.MembershipInvite {
+			} else if membership, found := memberships[target]; !found {
 				return false, nil
-			} else if invite := r.events.TxnGetEvent(txn, membership.EventID); invite == nil {
+			} else if held := r.events.TxnGetEvent(txn, membership.EventID); held == nil {
 				return false, nil
 			} else {
-				return ev.Sender == invite.Sender, nil
+				return endsHeldMembership(ev, held), nil
 			}
 		})
 	}
 	return false, nil
+}
+
+// endsHeldMembership reports whether another user's leave of a local user ends the membership the
+// user holds in a room this server is not in: the inviter rescinding an invite, or in a state DAG
+// room, a kick rejecting a knock, whose sender's power this server cannot check outside the room. In
+// a state DAG room the leave must cite the membership in prev_state_events: without the state DAG,
+// that is the only way to tell the leave supersedes it (MSC4242).
+func endsHeldMembership(leave, held *types.Event) bool {
+	stateDAGs := held.StateDAGs()
+	if stateDAGs && !slices.Contains(leave.PrevStateEventIDs, held.ID) {
+		return false
+	}
+	switch held.Membership() {
+	case event.MembershipInvite:
+		return leave.Sender == held.Sender
+	case event.MembershipKnock:
+		return stateDAGs && leave.Sender != held.Sender
+	}
+	return false
 }
 
 // givenStates is what a send keeps of the states the sending server gave

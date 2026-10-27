@@ -16,8 +16,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 // fakeWatch fires once its channel closes, with err
@@ -92,6 +95,11 @@ func TestRemoteMembershipErrors(t *testing.T) {
 		"template of a version": {fmt.Errorf("%w: 1", errIncompatibleRoomVersion), http.StatusBadRequest, mautrix.MIncompatibleRoomVersion.ErrCode},
 		"failed by the job":     {&types.IngestFailure{Status: http.StatusForbidden, ErrCode: mautrix.MForbidden.ErrCode}, http.StatusForbidden, mautrix.MForbidden.ErrCode},
 		"invalid template":      {fmt.Errorf("%w from other", errInvalidMembershipTemplate), http.StatusBadGateway, mautrix.MUnknown.ErrCode},
+		"no servers":            {errNoKnownServers, http.StatusNotFound, mautrix.MNotFound.ErrCode},
+		"restricted join to a state DAG room": {
+			fmt.Errorf("%w from other: %w", errInvalidMembershipTemplate, util.ErrRestrictedJoinUnsupported),
+			http.StatusForbidden, mautrix.MForbidden.ErrCode,
+		},
 		"refused make_join": {
 			gomatrix.HTTPError{Code: http.StatusForbidden, Contents: []byte(`{"errcode":"M_FORBIDDEN","error":"not invited"}`)},
 			http.StatusForbidden, mautrix.MForbidden.ErrCode,
@@ -128,6 +136,16 @@ func TestOtherServersSkipsDomainlessRoomIDs(t *testing.T) {
 	assert.Equal(t, []string{"a.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
 }
 
+func TestMakeFederatedEventWithoutServers(t *testing.T) {
+	_, _, err := (&ClientRoutes{}).makeFederatedEvent(httptest.NewRequest(http.MethodPost, "/knock", nil), "!room", event.MembershipKnock, nil, nil)
+	assert.ErrorIs(t, err, errNoKnownServers)
+}
+
+func TestOtherServersTakeVia(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/knock?via=a.example.com&server_name=c.example.com", nil)
+	assert.Equal(t, []string{"a.example.com", "c.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
+}
+
 func TestKnocksOfferTheVersionsThisServerJoins(t *testing.T) {
 	c := &ClientRoutes{}
 	versions := c.joinedRoomVersions()
@@ -138,4 +156,22 @@ func TestKnocksOfferTheVersionsThisServerJoins(t *testing.T) {
 
 	c.config.Rooms.UnstableStateDAGs = true
 	assert.Contains(t, c.joinedRoomVersions(), gomatrixserverlib.RoomVersionStateDAGs)
+}
+
+// Rejecting an invite or rescinding a knock without the room's servers cites the membership it ends
+func TestOutlierLeaveCitesTheHeldMembershipInStateDAGRooms(t *testing.T) {
+	now := time.UnixMilli(1700000000000)
+	partial := types.NewPartialEvent("!room:there", event.StateMember, new("@alice:here"), "@alice:here", map[string]any{"membership": "leave"})
+	for _, roomVersion := range []gomatrixserverlib.RoomVersion{gomatrixserverlib.RoomVersionV12, gomatrixserverlib.RoomVersionStateDAGs} {
+		held := &types.Event{ID: "$invite", RoomVersion: string(roomVersion)}
+		leave := newOutlierLeave(partial, held, now)
+		assert.Equal(t, string(roomVersion), leave.RoomVersion)
+		assert.Equal(t, []id.EventID{"$invite"}, leave.PrevEventIDs)
+		assert.Equal(t, now.UnixMilli(), leave.Timestamp)
+		if roomVersion == gomatrixserverlib.RoomVersionStateDAGs {
+			assert.Equal(t, []id.EventID{"$invite"}, leave.PrevStateEventIDs)
+		} else {
+			assert.Nil(t, leave.PrevStateEventIDs, "only a state DAG room has prev_state_events")
+		}
+	}
 }

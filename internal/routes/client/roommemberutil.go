@@ -33,8 +33,9 @@ func makeMembershipContent(membership event.Membership, reason string) map[strin
 }
 
 func getOtherServers(r *http.Request, roomID id.RoomID) []string {
-	// User provided ?server_name query
-	otherServers := r.URL.Query()["server_name"]
+	// User provided ?via query, or the ?server_name it replaced in spec 1.12
+	query := r.URL.Query()
+	otherServers := slices.Concat(query["via"], query["server_name"])
 
 	// TODO: don't blindly use roomID server here - but use what? Alias?
 	// TODO: use invite sender!
@@ -80,12 +81,14 @@ var (
 	errIncompatibleRoomVersion = errors.New("room version not supported")
 	// A make_* request that got no answer from the server
 	errMakeRequestFailed = errors.New("make request failed")
+	// A remote membership with no server to ask
+	errNoKnownServers = errors.New("no known servers")
 )
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
 // none does, an errIncompatibleRoomVersion is returned if a server gave a room version this server
 // does not join, else the error of the last server whose request failed, or else an
-// errInvalidMembershipTemplate.
+// errInvalidMembershipTemplate, or errNoKnownServers without servers.
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
 	roomID id.RoomID,
@@ -126,7 +129,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 		serverLog.Debug().Msg("Making federated event via server")
 		return ev, otherServer, nil
 	}
-	return nil, "", cmp.Or(versionErr, requestErr, templateErr)
+	return nil, "", cmp.Or(versionErr, requestErr, templateErr, errNoKnownServers)
 }
 
 func membershipTemplateEvent(
@@ -151,7 +154,8 @@ func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
 }
 
 // As Synapse does, a server refusing to give a template is passed on, with the room version of an
-// incompatible one, and a server failing to give a usable one is a bad gateway
+// incompatible one, and a server failing to give a usable one is a bad gateway. A restricted join to
+// a state DAG room is refused.
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
 	var httpErr gomatrix.HTTPError
 	if errors.As(err, &httpErr) {
@@ -171,6 +175,12 @@ func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err
 		return
 	} else if errors.Is(err, errIncompatibleRoomVersion) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
+		return
+	} else if errors.Is(err, errNoKnownServers) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "No known servers")
+		return
+	} else if errors.Is(err, util.ErrRestrictedJoinUnsupported) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, util.ErrRestrictedJoinUnsupported.Error())
 		return
 	} else if errors.Is(err, errInvalidMembershipTemplate) || errors.Is(err, errMakeRequestFailed) {
 		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
