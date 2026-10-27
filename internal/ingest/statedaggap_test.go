@@ -27,19 +27,17 @@ type stateDAGRequestMade struct {
 	limit, staged int
 }
 
-// stateDAGServers serve a state DAG, of which this server publishes some events and stores others
-// without state, walking it as a babbleserv answers get_missing_events with the MSC's flag. Events
-// cited that it does not know are withheld.
+// stateDAGServers answer get_missing_events as a babbleserv does with the MSC's flag, withholding
+// cited events they do not know
 type stateDAGServers struct {
 	cites     map[id.EventID][]id.EventID
 	published map[id.EventID]bool
 	stored    map[id.EventID]bool
 	pdus      []*types.Event
-	// Other targets of the job, which the walk does not walk into
-	pending map[id.EventID]bool
-	// The most events a server answers with
+	// Other targets of the job, which the walk stops at
+	pending   map[id.EventID]bool
 	maxEvents int
-	// State events a server gives with each response that nothing cites
+	// State events nothing cites, given with each response
 	junk     int
 	errs     map[string]error
 	requests []stateDAGRequestMade
@@ -53,7 +51,6 @@ func newStateDAGServers(cites map[id.EventID][]id.EventID, published ...id.Event
 	return s
 }
 
-// chain is a state DAG of n events, each citing the one before, the first citing $base
 func chain(n int) map[id.EventID][]id.EventID {
 	cites := map[id.EventID][]id.EventID{"$base": nil}
 	prev := id.EventID("$base")
@@ -197,8 +194,7 @@ func TestStateDAGFillSplitsLatestEvents(t *testing.T) {
 	assert.Empty(t, fill.open(), "the limit, which counts events in all, grows until the gaps are filled")
 }
 
-// A server capping its responses gives the events nearest the PDUs again, so the requests walk on
-// from the events reached that cite missing ones
+// A server capping its responses repeats the events nearest the PDUs, so requests walk on from the frontier
 func TestStateDAGFillWalksFromTheFrontier(t *testing.T) {
 	servers := newStateDAGServers(chain(25), "$base")
 	servers.maxEvents = 10
@@ -211,8 +207,7 @@ func TestStateDAGFillWalksFromTheFrontier(t *testing.T) {
 	assert.Empty(t, fill.open())
 }
 
-// A server with nothing more to give is left once the frontier gives nothing either, and the next
-// asked: a PDU's origin first, then the room's other servers
+// The PDU's origin is asked first, then the room's other servers, each left once its frontier gives nothing
 func TestStateDAGFillAsksTheNextServer(t *testing.T) {
 	servers := newStateDAGServers(chain(5), "$base")
 	servers.pdu("$pdu", "$s05")
@@ -249,8 +244,8 @@ func TestStateDAGFillOutcome(t *testing.T) {
 	assert.Equal(t, map[id.EventID]struct{}{"$withheld": {}, "$citesWithheld": {}}, held, "a server failed to answer, so asking again may fill it")
 }
 
-// A PDU fails once the requests for it staged more than a PDU's gap fill may, and a run's gap fills
-// stop once they staged all it may. No request stages more than one past what they may.
+// A PDU fails past its gap fill's staging bound and a run's fills stop past the run's; no request
+// stages more than one event past either
 func TestStateDAGFillBounds(t *testing.T) {
 	servers := newStateDAGServers(chain(25), "$base")
 	servers.pdu("$pdu", "$s25")
@@ -296,8 +291,7 @@ func TestPublishChunks(t *testing.T) {
 		"past its first event a chunk holds at most the bytes")
 }
 
-// The served events citing the join, or another left out so, are newer than the join and arrive as
-// PDUs instead of being staged
+// Events citing the join, directly or through skipped ones, arrive as PDUs instead of being staged
 func TestStateDAGJoinSkipsEventsNewerThanTheJoin(t *testing.T) {
 	w := &stateDAGJoin{skipped: map[id.EventID]struct{}{"$join": {}}}
 	served := []*types.Event{
@@ -313,8 +307,7 @@ func TestStateDAGJoinSkipsEventsNewerThanTheJoin(t *testing.T) {
 	assert.Len(t, w.skipped, 3)
 }
 
-// A server refusing a join another server answered, so accepted, neither fails nor replaces it: the
-// join is sent again after a pause
+// A refusal after another server accepted the join neither fails nor replaces it; it is resent after a pause
 func TestSendFailedAfterAServerAnswered(t *testing.T) {
 	var cfg config.BabbleConfig
 	cfg.Rooms.Ingest.JoinTimeout = time.Hour
@@ -348,8 +341,7 @@ func TestDecodeStateDAGBoundsEachValue(t *testing.T) {
 	assert.Equal(t, [][]string{{"$0", "$1"}}, chunks)
 }
 
-// Events a server gives that do not fill the gap, which it could give endlessly, count against the
-// bounds but give it no more requests
+// Events outside the gap, which a server could give endlessly, count against the bounds but earn no more requests
 func TestStateDAGFillIgnoresEventsOutsideTheGap(t *testing.T) {
 	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil}, "$base")
 	servers.pdu("$pdu", "$never")
@@ -361,9 +353,8 @@ func TestStateDAGFillIgnoresEventsOutsideTheGap(t *testing.T) {
 	assert.Equal(t, unfilledGapFailure(), failures["$pdu"])
 }
 
-// A server giving the gap an event at a time is asked a bounded number of rounds, then left. Still
-// giving it, the server may give the rest when asked again, so the PDU is held back rather than
-// failed, as Synapse caps its answers at 20 events.
+// A server giving the gap an event at a time is left after bounded rounds, and the PDU held back
+// rather than failed, as Synapse caps its answers at 20 events
 func TestStateDAGFillBoundsTheRoundsAServerIsAsked(t *testing.T) {
 	servers := newStateDAGServers(chain(99), "$base")
 	servers.maxEvents = 1
@@ -377,7 +368,6 @@ func TestStateDAGFillBoundsTheRoundsAServerIsAsked(t *testing.T) {
 	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}}, held)
 }
 
-// A fill past its time asks no more servers, holding back the PDUs whose gap is open
 func TestStateDAGFillHoldsPDUsPastItsTime(t *testing.T) {
 	servers := newStateDAGServers(chain(5), "$base")
 	servers.pdu("$pdu", "$s05")
@@ -392,7 +382,6 @@ func TestStateDAGFillHoldsPDUsPastItsTime(t *testing.T) {
 	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}}, held)
 }
 
-// A request walking from the frontier names at most 100 of its events, however many there are
 func TestStateDAGFillNamesPartOfALargeFrontier(t *testing.T) {
 	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil}, "$base")
 	servers.maxEvents = 1
@@ -414,8 +403,7 @@ func TestStateDAGFillNamesPartOfALargeFrontier(t *testing.T) {
 	assert.LessOrEqual(t, len(servers.requests)-frontierRequests, 2*stateDAGRounds(10_000), "each round names the open PDUs, 100 a request")
 }
 
-// A PDU reaching another target of the job, through events served, is held back for it to publish
-// first, rather than taking the target for missing
+// The PDU waits for the other target to publish first rather than taking it for missing
 func TestStateDAGFillHoldsPDUsReachingOtherTargets(t *testing.T) {
 	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil, "$other": {"$base"}, "$served": {"$other"}}, "$base")
 	servers.pending = map[id.EventID]bool{"$other": true}

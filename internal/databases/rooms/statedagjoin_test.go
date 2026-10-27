@@ -14,8 +14,7 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// stagedStateDAG holds state events of a state DAG room stored without state, each citing the events
-// after it in prev_state_events, and the room's create event, whose ID the room ID names
+// stagedStateDAG builds stateless state events citing the events they map to in prev_state_events
 func stagedStateDAG(dag map[id.EventID][]id.EventID) map[id.EventID]*types.Event {
 	evs := make(map[id.EventID]*types.Event, len(dag))
 	for eventID, prevStateEventIDs := range dag {
@@ -48,8 +47,7 @@ func walkPending(t *testing.T, dag map[id.EventID]*types.Event, from, pending []
 	return walk
 }
 
-// The walk of a join's state DAG goes back along prev_state_events, the implicit create event among
-// them, through the events stored without state, and finds what is missing on the way
+// The walk follows prev_state_events, the implicit create among them, and records what is missing
 func TestWalkUnreplayed(t *testing.T) {
 	dag := stagedStateDAG(map[id.EventID][]id.EventID{
 		"$create": nil, "$power": {"$create"}, "$a": {"$power"}, "$b": {"$power"},
@@ -73,8 +71,7 @@ func TestWalkUnreplayed(t *testing.T) {
 	assert.NotContains(t, gap.cites, id.EventID("$other"), "another room's event ends the walk")
 }
 
-// Events replayed and not published yet are walked through, as they publish ahead of what cites
-// them, while pending events, which the job publishes rather than replays, end the walk
+// Pending events, which the job publishes rather than replays, end the walk
 func TestWalkUnreplayedThroughUnpublished(t *testing.T) {
 	dag := stagedStateDAG(map[id.EventID][]id.EventID{
 		"$create": nil, "$power": {"$create"}, "$replayed": {"$power"}, "$staged": {"$replayed"},

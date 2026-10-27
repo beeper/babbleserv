@@ -20,9 +20,8 @@ const (
 
 var _ Worker = (*IngestJobWorker)(nil)
 
-// IngestJobWorker resumes rooms' ingest jobs whose runner stopped, as one in a process that crashed:
-// it scans the jobs at startup and every minute, and runs each whose lock is free. Each process
-// running workers scans, the job locks keep each job to one runner.
+// IngestJobWorker resumes ingest jobs whose runner stopped, as after a crash, scanning at startup and
+// every minute. Every process running workers scans; job locks keep each job to one runner.
 type IngestJobWorker struct {
 	log  zerolog.Logger
 	db   *databases.Databases

@@ -481,8 +481,7 @@ func TestEventFromProtoEventPrevStateEvents(t *testing.T) {
 	assert.Nil(t, ev.PrevStateEventIDs)
 }
 
-// Versions without state DAGs take any prev_state_events or prev_state value, as Synapse ignores
-// them, and send it on as received so its hashes still match
+// Synapse ignores these members outside state DAG rooms, so any value is sent on as received
 func TestPrevStateMembersHashAsSentWithoutStateDAGs(t *testing.T) {
 	message := `{"type": "m.room.message", "room_id": "!room:example.com", "sender": "@alice:example.com",
 		"content": {"body": "hi"}, "origin_server_ts": 1700000000000, "depth": 3, "prev_events": ["$prev"],

@@ -300,8 +300,6 @@ func TestVerifyRequestEventWithDuplicateKeys(t *testing.T) {
 	assert.Equal(t, event.MembershipBan, verified.Membership())
 }
 
-// Builds an event as gomatrixserverlib's state DAG event builder does, and the same event as this
-// server builds it, which must hash and sign the same
 func TestStateDAGEventHashAndSignMatchBuilder(t *testing.T) {
 	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 	roomVersion := gomatrixserverlib.MustGetRoomVersion(gomatrixserverlib.RoomVersionStateDAGs)

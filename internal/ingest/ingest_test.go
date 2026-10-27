@@ -199,9 +199,8 @@ func stateDAGTestPDU(eventID id.EventID, prevIDs []id.EventID, prevStateIDs ...i
 	return ev
 }
 
-// A state DAG event is connected once its prev state events, the create event among them, are in
-// place here or are earlier connected events, and its prev events are stored or earlier connected
-// events, unless it was pulled for another's prev events
+// An event is connected once its prev state events, create included, are in place or earlier
+// connected, and its prev events stored or earlier connected, unless pulled for another's prev events
 func TestSplitConnectedStateDAG(t *testing.T) {
 	inPlace := map[id.EventID]struct{}{"$createhash": {}, "$tip": {}, "$state": {}, "$otherRoom": {}}
 	stored := map[id.EventID]struct{}{"$tip": {}, "$staged": {}}
@@ -420,7 +419,6 @@ func TestJobsForgetARunnerThatPanicked(t *testing.T) {
 	assert.Empty(t, jobs.running, "nothing runs once stopped")
 }
 
-// fakeWork records that it ran, its phases doing nothing
 type fakeWork struct {
 	workKind workKind
 	target   *types.IngestTarget
@@ -436,8 +434,7 @@ func (w *fakeWork) fetch(context.Context) error {
 func (w *fakeWork) build(context.Context) error   { return nil }
 func (w *fakeWork) publish(context.Context) error { return nil }
 
-// A round ends after the first join it runs, so that the next collects the PDUs written meanwhile
-// and puts them ahead of the other joins
+// So that the next round puts the PDUs written meanwhile ahead of the other joins
 func TestRoundEndsAfterAJoin(t *testing.T) {
 	var ran []id.EventID
 	work := func(kind workKind, eventID id.EventID) ingestWork {

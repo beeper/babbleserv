@@ -166,8 +166,7 @@ func VerifyRemoteEvent(ctx context.Context, ev *types.Event, keyStore *KeyStore)
 	return ev, nil, nil
 }
 
-// verifyProgressEvents bounds how many events VerifyRemoteEvents verifies between its own progress
-// reports, on top of the report each key fetch makes
+// Events verified between progress reports, on top of the report each key fetch makes
 const verifyProgressEvents = 100
 
 // Parses and verifies events fetched from another server, skipping those that cannot be parsed or
@@ -182,7 +181,6 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 	return VerifyParsedRemoteEvents(ctx, ParseRemoteEvents(ctx, raws, roomVersion), keyStore, seenIDs)
 }
 
-// ParseRemoteEvents parses events fetched from another server, skipping those that cannot be parsed
 func ParseRemoteEvents[S ~[]E, E ~[]byte](ctx context.Context, raws S, roomVersion string) []*types.Event {
 	evs := make([]*types.Event, 0, len(raws))
 	for _, b := range raws {
@@ -196,8 +194,7 @@ func ParseRemoteEvents[S ~[]E, E ~[]byte](ctx context.Context, raws S, roomVersi
 	return evs
 }
 
-// VerifyParsedRemoteEvents verifies events parsed with ParseRemoteEvents, as VerifyRemoteEvents does.
-// An event given its ID already, its reference hash, is verified to have it.
+// VerifyParsedRemoteEvents is VerifyRemoteEvents for parsed events; one given an ID is verified to have it
 func VerifyParsedRemoteEvents(
 	ctx context.Context,
 	remoteEvs []*types.Event,

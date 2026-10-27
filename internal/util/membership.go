@@ -14,13 +14,11 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// ErrRestrictedJoinUnsupported refuses the template of a restricted join to a state DAG room. Its
-// resident co-signs it in send_join, while this server would publish its own copy without that
-// signature, which other servers drop when it is part of the state DAG they fetch from here.
+// The resident co-signs a restricted join in send_join, but this server would publish its own copy
+// without that signature, which other servers fetching the state DAG from here drop
 var ErrRestrictedJoinUnsupported = errors.New("restricted joins to state DAG rooms are not supported")
 
-// MembershipTemplateEvent holds a make_* template to what was asked for and sets the membership
-// asked for, as Synapse does
+// MembershipTemplateEvent checks a make_* template is what was asked for, as Synapse does
 func MembershipTemplateEvent(
 	userID id.UserID,
 	roomID id.RoomID,

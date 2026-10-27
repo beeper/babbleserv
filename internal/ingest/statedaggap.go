@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	// The limit of a state DAG get_missing_events request starts at this and doubles each request,
-	// as the MSC recommends, up to the most a babbleserv answers with
+	// A state DAG get_missing_events limit starts here and doubles each request, as the MSC
+	// recommends, up to the most babbleserv answers with
 	firstStateDAGLimit       = 10
 	MaxStateDAGMissingEvents = 1000
 	// MSC4242's bound on either list of a state DAG get_missing_events request
@@ -30,8 +30,7 @@ const (
 	maxStateDAGServerTime = 2 * time.Minute
 )
 
-// ReqGetMissingEvents is federation.ReqGetMissingEvents with MSC4242's flag walking the state DAG,
-// which mautrix lacks
+// ReqGetMissingEvents adds MSC4242's state DAG flag, which mautrix lacks
 type ReqGetMissingEvents struct {
 	federation.ReqGetMissingEvents
 	StateDAG bool `json:"org.matrix.msc4242.state_dag"`
@@ -39,11 +38,6 @@ type ReqGetMissingEvents struct {
 
 var errGapBudgetSpent = errors.New("the job's run fetched as many state DAG events as its gap fills may")
 
-// fillStateDAG pulls the state DAG events missing here that the PDUs reach along prev_state_events,
-// see stateDAGFill, asking the PDUs' origins, then the room's other servers, see gapFillServers, and
-// stages them. A PDU whose gap stays open fails, unless a server failed to answer for it other than
-// by refusing, or the fill's bounds stopped it while servers were still giving the gap, which holds
-// it back for a later round, as does reaching another of the job's targets, which publishes first.
 func (w *stateDAGPDUs) fillStateDAG(ctx context.Context, roomServers []string) error {
 	db, roomID := w.run.jobs.db, w.run.roomID
 	evs := make([]*types.Event, len(w.pdus))
@@ -80,15 +74,13 @@ func (w *stateDAGPDUs) fillStateDAG(ctx context.Context, roomServers []string) e
 	return nil
 }
 
-// askStateDAG runs the fill's requests for the open PDUs, staging the events served
 func (w *stateDAGPDUs) askStateDAG(ctx context.Context, fill *stateDAGFill, open []id.EventID, roomServers []string, walk stateDAGWalker) error {
 	db, roomID := w.run.jobs.db, w.run.roomID
 	extremities, err := db.Rooms.GetRoomStateExtremEventIDs(ctx, roomID)
 	if err != nil {
 		return err
 	}
-	// The extremities published last are nearest the PDUs, and the server walks past the others
-	// only to give events stored here, which are skipped
+	// The latest extremities are nearest the PDUs: walking past the others only gives events stored here
 	earliestIDs := extremities[max(len(extremities)-MaxStateDAGRequestIDs, 0):]
 	var origins []string
 	for _, target := range w.pdus {
@@ -105,7 +97,7 @@ func (w *stateDAGPDUs) askStateDAG(ctx context.Context, fill *stateDAGFill, open
 		if err != nil {
 			return 0, err
 		}
-		// The room's targets publish themselves, after the events they cite
+		// Targets publish themselves, after the events they cite
 		served := slices.DeleteFunc(parseStateDAGEvents(ctx, raws[:min(len(raws), limit)], w.run.roomVersion, roomID), func(ev *types.Event) bool {
 			_, target := w.run.targets[ev.ID]
 			return target
@@ -116,32 +108,26 @@ func (w *stateDAGPDUs) askStateDAG(ctx context.Context, fill *stateDAGFill, open
 	return fill.run(ctx, gapFillServers(origins, roomServers, w.run.jobs.config.ServerName), request, walk)
 }
 
-// stateDAGFill is the state DAG gap fill of PDUs of a state DAG room (MSC4242): get_missing_events
-// requests walking the state DAG back from the PDUs to this server's state extremities, until no PDU
-// reaches a state DAG event missing here, as the MSC has servers fill their state DAG
+// stateDAGFill walks the state DAG back from the PDUs with get_missing_events requests until none
+// reaches an event missing here (MSC4242)
 type stateDAGFill struct {
 	pdus []*types.Event
 	gap  *rooms.StateDAGGap
-	// The events fetched by requests naming each PDU, or walking from events it reaches
+	// Per PDU, by requests naming it or walking from events it reaches
 	fetched   map[id.EventID]int
 	maxPerPDU int
-	// What the job's run may fetch still
-	budget *int
-	// The most rounds of requests a server is asked, see stateDAGRounds, and when the fill stops
-	// asking servers
+	// What the job's run may still fetch, shared by its fills
+	budget    *int
 	maxRounds int
 	deadline  time.Time
-	// PDUs a server failed to answer for, other than by refusing, or left open at the fill's bounds
-	// while giving their gap
+	// PDUs to hold back: a server failed without refusing, or still gave their gap at the bounds
 	unanswered map[id.EventID]struct{}
 	errs       []error
 }
 
-// stateDAGRequest asks a server for the state DAG events missing here before the latest events, at
-// most limit of them, stages at most maxStaged of those not stored, and returns how many it staged
+// stateDAGRequest stages at most maxStaged of the events a server serves, returning how many
 type stateDAGRequest func(ctx context.Context, server string, latestIDs []id.EventID, limit, maxStaged int) (int, error)
 
-// stateDAGWalker walks the PDUs' gap again once requests staged more of it
 type stateDAGWalker func(ctx context.Context) (*rooms.StateDAGGap, error)
 
 func newStateDAGFill(pdus []*types.Event, gap *rooms.StateDAGGap, maxPerPDU int, budget *int, deadline time.Time) *stateDAGFill {
@@ -157,9 +143,8 @@ func newStateDAGFill(pdus []*types.Event, gap *rooms.StateDAGGap, maxPerPDU int,
 	}
 }
 
-// stateDAGRounds is how many rounds of requests a server is asked at most: those growing the limit to
-// MaxStateDAGMissingEvents, enough more at it to give a PDU its whole gap, and one to walk from the
-// frontier
+// stateDAGRounds is the most rounds a server is asked: those doubling the limit to its max, enough at
+// the max to give a PDU its whole gap, and one walking from the frontier
 func stateDAGRounds(maxPerPDU int) int {
 	rounds := 1
 	for limit := firstStateDAGLimit; limit < MaxStateDAGMissingEvents; limit *= 2 {
@@ -168,9 +153,8 @@ func stateDAGRounds(maxPerPDU int) int {
 	return rounds + maxPerPDU/MaxStateDAGMissingEvents + 1
 }
 
-// run asks each server in turn for what the PDUs still miss, until the fill's deadline, which holds
-// back the PDUs still open. With the rounds and time each server is asked bounded too, a server
-// giving a little of the gap each time cannot keep the job asking for hours.
+// run bounds the fill's time and each server's rounds and time, so that servers giving a little of
+// the gap each time cannot keep the job asking for hours
 func (f *stateDAGFill) run(ctx context.Context, servers []string, request stateDAGRequest, walk stateDAGWalker) error {
 	for _, server := range servers {
 		if len(f.open()) == 0 {
@@ -192,16 +176,10 @@ func (f *stateDAGFill) hold(eventIDs []id.EventID) {
 	}
 }
 
-// ask asks a server for the state DAG events the open PDUs miss, the limit doubling each request,
-// until none is missing. Once a request fills none of the gap, as a server capping its responses
-// gives again the events nearest the PDUs, the requests walk from the frontier instead, the first
-// MaxStateDAGRequestIDs of the events reached that cite missing ones, and once that fills none
-// either, the server has nothing more to give. Only events missing before that the walk then reaches
-// fill the gap: others a server sends are staged, and counted against the bounds, but give it no
-// more requests. A server failing is not asked again; unless it refused, the PDUs open then were
-// unanswered, as are those open once the server, still giving their gap, was asked its most rounds
-// or for maxStateDAGServerTime: Synapse caps its answers at 20 events. Each request stages no more
-// than the bounds leave, and one past them.
+// Once a request fills none of the gap, as a server capping its responses gives the events nearest
+// the PDUs again, ask walks from the frontier instead, and stops once that fills none either. A server
+// still giving the gap at its round or time bound holds back the open PDUs: Synapse caps its answers
+// at 20 events.
 func (f *stateDAGFill) ask(ctx context.Context, server string, request stateDAGRequest, walk stateDAGWalker) error {
 	deadline := f.deadline
 	if serverDeadline := time.Now().Add(maxStateDAGServerTime); serverDeadline.Before(deadline) {
@@ -263,8 +241,7 @@ func filledAny(before, after map[id.EventID]struct{}) bool {
 	return false
 }
 
-// stageable is how many events a request naming the PDUs may stage: what the job's run and the PDU
-// with the least left may fetch still, and one more, so that a gap past them shows
+// stageable allows one event past the bounds, so that a gap exceeding them shows
 func (f *stateDAGFill) stageable(pdus []id.EventID) int {
 	left := *f.budget
 	for _, eventID := range pdus {
@@ -283,14 +260,11 @@ func (f *stateDAGFill) count(pdus []id.EventID, staged int) error {
 	return nil
 }
 
-// reaching returns the events, the PDUs among them, that reach a state DAG event missing here along
-// prev_state_events, through the events stored without state or unpublished and the other PDUs
+// reaching returns the events, PDUs included, reaching a missing event along prev_state_events
 func (f *stateDAGFill) reaching() map[id.EventID]struct{} {
 	return f.reachingFrom(slices.Collect(maps.Keys(f.gap.Missing)))
 }
 
-// reachingPending returns the events, the PDUs among them, that reach another of the job's targets
-// pending, which publishes before them, as reaching reaches missing events
 func (f *stateDAGFill) reachingPending() map[id.EventID]struct{} {
 	pending := maps.Clone(f.gap.Pending)
 	for _, ev := range f.pdus {
@@ -327,7 +301,6 @@ func (f *stateDAGFill) reachingFrom(sources []id.EventID) map[id.EventID]struct{
 	return reaching
 }
 
-// open returns the PDUs, in order, whose gap is open and that may fetch more
 func (f *stateDAGFill) open() []id.EventID {
 	reaching := f.reaching()
 	var open []id.EventID
@@ -339,7 +312,6 @@ func (f *stateDAGFill) open() []id.EventID {
 	return open
 }
 
-// frontier returns the events reached, the PDUs among them, that cite a missing event, sorted
 func (f *stateDAGFill) frontier() []id.EventID {
 	citesMissing := func(cited []id.EventID) bool {
 		return slices.ContainsFunc(cited, func(eventID id.EventID) bool {
@@ -362,9 +334,8 @@ func (f *stateDAGFill) frontier() []id.EventID {
 	return frontier
 }
 
-// outcome returns, of the PDUs whose gap is still open, why each fails, and those unanswered, which
-// are held back for a later round to ask again, as are those reaching another of the job's targets,
-// so that it publishes first
+// outcome fails the PDUs whose gap stays open, except those unanswered, held back to ask again in a
+// later round, as are those reaching another of the job's targets, so that it publishes first
 func (f *stateDAGFill) outcome() (map[id.EventID]*types.IngestFailure, map[id.EventID]struct{}) {
 	reaching, reachingPending := f.reaching(), f.reachingPending()
 	failures := make(map[id.EventID]*types.IngestFailure)
@@ -386,12 +357,9 @@ func (f *stateDAGFill) outcome() (map[id.EventID]*types.IngestFailure, map[id.Ev
 	return failures, held
 }
 
-// publishStateDAG publishes PDU targets of a state DAG room this server is in, with the events they
-// and the pending events reach along prev_state_events that the job replayed but did not publish yet,
-// as federated events in topological chunks, see publishChunks. The replayed events take the state
-// their replay gave them and stay out of the timeline. An event without state here is replayed as its
-// chunk comes, once the targets it may cite published. The pending events, a join publishing next,
-// are not published.
+// publishStateDAG publishes the targets with the replayed but unpublished events they and pending
+// reach along prev_state_events, which stay out of the timeline. Pending, a join publishing next, is
+// not published.
 func (run *jobRun) publishStateDAG(ctx context.Context, targets []*types.IngestTarget, pending ...*types.Event) error {
 	byID := make(map[id.EventID]*types.IngestTarget, len(targets))
 	unpublished := make([]*types.Event, 0, len(targets))
@@ -450,9 +418,8 @@ func (run *jobRun) publishStateDAG(ctx context.Context, targets []*types.IngestT
 	return nil
 }
 
-// publishChunks splits events in topological order into the chunks a state DAG gap fill publishes,
-// of at most maxEvents and, past their first, maxBytes. A chunk holding a target ends ahead of an
-// event without state here: it may cite the target, so is replayed once the target published.
+// publishChunks caps chunks at maxEvents and, past their first event, maxBytes. A chunk holding a
+// target ends ahead of an event without state here, which may cite the target so replays after it.
 func publishChunks(
 	evs []*types.Event,
 	targets map[id.EventID]*types.IngestTarget,
@@ -481,11 +448,8 @@ func publishChunks(
 	return chunks
 }
 
-// PrevEvents pulls the prev events missing here of the PDU targets of a state DAG room sent here,
-// from the room's extremities, as PDU targets marked pulled, not written yet. Every origin is asked
-// for the gaps of the PDUs it sent, two a request, and the others are not asked: a server failing
-// leaves the prev events it did not give missing, which only leaves the PDUs citing them room
-// extremities.
+// PrevEvents fetches the prev events a state DAG room's PDU targets miss as pulled targets, asking
+// only the origins: a prev event left missing only leaves the PDUs citing it room extremities.
 func (f *Fetcher) PrevEvents(ctx context.Context, roomID id.RoomID, roomVersion string, targets []*types.IngestTarget) ([]*types.IngestTarget, error) {
 	evs := make([]*types.Event, len(targets))
 	seenIDs := make(map[id.EventID]struct{}, len(targets))
@@ -531,9 +495,8 @@ func (f *Fetcher) PrevEvents(ctx context.Context, roomID id.RoomID, roomVersion 
 	return pulled, nil
 }
 
-// missingStateDAGEvents asks a server for the events of a state DAG room's state DAG that the latest
-// events reach along prev_state_events, a message's included, before the earliest ones: at most
-// limit of them, those fewest hops away first (MSC4242)
+// missingStateDAGEvents asks for the state DAG events the latest events reach along
+// prev_state_events before the earliest ones, those fewest hops away first (MSC4242)
 func (f *Fetcher) missingStateDAGEvents(
 	ctx context.Context,
 	server string,

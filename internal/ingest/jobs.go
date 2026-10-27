@@ -1,6 +1,5 @@
-// Package ingest runs rooms' ingest jobs: per room, one runner at a time fetches what the room's
-// targets need from other servers, stages it, builds its state, then publishes the targets. Joins and
-// the PDUs arriving while a room has a job are targets. See docs/event-sending.md#ingest-jobs.
+// Package ingest runs rooms' ingest jobs, which fetch, stage, build and publish their targets: joins,
+// and PDUs arriving while the room has a job. See docs/event-sending.md#ingest-jobs.
 
 package ingest
 
@@ -25,20 +24,16 @@ import (
 )
 
 var (
-	// Ends a unit of work early, its targets published, failed or replaced
 	errWorkDone = errors.New("the work's targets are done")
-	// Ends a round that held back work failing or that failed within the retry pause
 	errWorkHeld = errors.New("the job held back work that failed")
-	// Causes ending a job's context
+	// Causes of ending a job's context
 	errLeaseLost  = errors.New("the job's lock lease was lost")
 	errNoProgress = errors.New("the job made no progress for its lease timeout")
 )
 
-// A target whose work fails this many times, other than by its job ending, fails
 const maxTargetFailures = 3
 
-// The pause before work that failed runs again, and a job that stopped on an error, sooner than the
-// IngestJobWorker's scan
+// Retries failed work and errored jobs sooner than the IngestJobWorker's scan
 const jobRetryPause = 10 * time.Second
 
 func lockName(roomID id.RoomID) string {
@@ -60,10 +55,9 @@ type Jobs struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu sync.Mutex
-	// Rooms whose job this process runs, and whether it was asked to run it again meanwhile
+	mu      sync.Mutex
 	running map[id.RoomID]*roomRunner
-	// The turns of joins and gap fills, of which the process runs a bounded number at once
+	// Bounds how many joins and gap fills the process runs at once
 	turns map[workKind]chan struct{}
 }
 
@@ -100,8 +94,7 @@ func NewJobs(
 	}
 }
 
-// turn takes a turn to run work of the kind, waiting for one while the process runs as many as it
-// may. Waiting reports progress, so that the job keeps its lease.
+// turn reports progress while waiting, so the job keeps its lease
 func (j *Jobs) turn(ctx context.Context, kind workKind) (release func(), err error) {
 	turns := j.turns[kind]
 	if turns == nil {
@@ -122,8 +115,7 @@ func (j *Jobs) turn(ctx context.Context, kind workKind) (release func(), err err
 	}
 }
 
-// reportProgressEvery keeps a job's lease through a wait bounded otherwise, refreshing it as often
-// as progress does
+// reportProgressEvery keeps a job's lease through a wait bounded otherwise
 func reportProgressEvery(ctx context.Context, cfg config.BabbleConfig) (stop func()) {
 	return util.ReportProgressEvery(ctx, cfg.Rooms.Ingest.LeaseTimeout/4)
 }
@@ -157,7 +149,7 @@ func (j *Jobs) Run(roomID id.RoomID) {
 	})
 }
 
-// forget stops tracking a runner that stopped, as one that panicked does without deciding to
+// forget covers a runner that panicked before removing itself
 func (j *Jobs) forget(roomID id.RoomID, runner *roomRunner) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -166,11 +158,9 @@ func (j *Jobs) forget(roomID id.RoomID, runner *roomRunner) {
 	}
 }
 
-// runRoom runs the room's job while this process can take its lock and work remains. Once the job
-// finished, a target written since starts it again: its writer may have failed to take the lock this
-// runner held, or asked this runner to run again. A job that held back failed work runs again at
-// once when asked to, for the targets written since, else after a pause, as does a job stopped by an
-// error, unless another runner took its lock.
+// runRoom reruns a finished job when a target was written since, as its writer may have failed to
+// take the lock this runner held. A job holding back work reruns at once when asked to; else it, and
+// a job stopped by an error, retries after a pause.
 func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner) {
 	for {
 		finished, err := j.runOnce(ctx, roomID)
@@ -200,8 +190,7 @@ func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner
 	}
 }
 
-// runOnce runs the room's job if its lock is free, reporting whether it ran it until it had no
-// targets left
+// runOnce reports whether the job ran until it had no targets left
 func (j *Jobs) runOnce(ctx context.Context, roomID id.RoomID) (bool, error) {
 	var finished bool
 	var runErr error
@@ -219,8 +208,6 @@ func (j *Jobs) runOnce(ctx context.Context, roomID id.RoomID) (bool, error) {
 	return finished, runErr
 }
 
-// runJob runs rounds until the room has no targets, then deletes the job. Each round collects the
-// targets and runs the work its strategy groups them into, each through its phases.
 func (j *Jobs) runJob(ctx context.Context, roomID id.RoomID, roomLock lock.Lock) (bool, error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -261,29 +248,27 @@ func (j *Jobs) runJob(ctx context.Context, roomID id.RoomID, roomLock lock.Lock)
 	}
 }
 
-// jobRun is one runner's run of a room's job while it holds the room's lock
+// jobRun lives while its runner holds the room's lock
 type jobRun struct {
 	jobs        *Jobs
 	roomID      id.RoomID
 	roomVersion string
 	lock        lock.Lock
 	cancel      context.CancelCauseFunc
-	// The round's targets not published or failed yet, and the state DAG events the run's gap fills
-	// may fetch still
+	// The round's unpublished targets, and how many state DAG events gap fills may still fetch
 	targets   map[id.EventID]struct{}
 	gapBudget int
 
-	mu        sync.Mutex
-	refreshed time.Time
-	watchdog  *time.Timer
-	// Whether the current phase reported progress
+	mu         sync.Mutex
+	refreshed  time.Time
+	watchdog   *time.Timer
 	progressed bool
 	roomName   string
 	notices    map[id.EventID]*time.Timer
 }
 
-// progress refreshes the lock's lease, at most four times a lease. The watchdog stops the run shortly
-// before the lease would expire without, and a lease lost to another runner stops it at once.
+// progress refreshes the lease at most four times a lease. The watchdog stops the run shortly before
+// an unrefreshed lease expires, and losing the lease stops it at once.
 func (run *jobRun) progress() {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -298,20 +283,17 @@ func (run *jobRun) progress() {
 	run.watchdog.Reset(run.watchdogTimeout())
 }
 
-// watchdogTimeout is the time from a refresh to just before the lease it writes expires
 func (run *jobRun) watchdogTimeout() time.Duration {
 	lease := run.jobs.config.Rooms.Ingest.LeaseTimeout
 	return lease - lease/10
 }
 
-// startPhase resets whether the phase about to run reported progress
 func (run *jobRun) startPhase() {
 	run.mu.Lock()
 	defer run.mu.Unlock()
 	run.progressed = false
 }
 
-// stalled reports whether the current phase ended without reporting any progress
 func (run *jobRun) stalled() bool {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -339,7 +321,6 @@ func (run *jobRun) stop() {
 	}
 }
 
-// ended is why the run ended: what ended its context, if anything did, else the error
 func (run *jobRun) ended(ctx context.Context, err error) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
@@ -347,12 +328,9 @@ func (run *jobRun) ended(ctx context.Context, err error) error {
 	return err
 }
 
-// round publishes the targets a round collected, through the work the room version's strategy groups
-// them into. Work failing holds back its targets, and work whose targets failed within the retry
-// pause or cite a target held back is held back too, until a later round after the pause: asking
-// again at once, as each PDU enqueued meanwhile would, could fail the targets within seconds. The
-// rest of the work goes on, but for the work after a join: a join can take minutes, so the round
-// ends after one, and the next collects the targets written meanwhile, putting their PDUs first.
+// round holds back failed work, and work whose targets failed within the retry pause or cite a held
+// target, until a round after the pause, as asking again at once could fail targets within seconds.
+// A join can take minutes, so the round ends after one and the next puts PDUs written meanwhile first.
 func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) error {
 	strategy, err := strategyFor(run.roomVersion)
 	if err != nil {
@@ -378,8 +356,6 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 	return fmt.Errorf("%w: %d targets: %w", errWorkHeld, len(held), errors.Join(errs...))
 }
 
-// runWorks runs a round's work in order, up to and including the first join run, returning the
-// targets held back and why, or what ended the job's context
 func (run *jobRun) runWorks(ctx context.Context, works []ingestWork) (map[id.EventID]struct{}, []error, error) {
 	now := time.Now()
 	held := make(map[id.EventID]struct{})
@@ -403,7 +379,6 @@ func (run *jobRun) runWorks(ctx context.Context, works []ingestWork) (map[id.Eve
 	return held, errs, nil
 }
 
-// heldBack reports whether a target of work failed within the retry pause or cites one held back
 func heldBack(targets []*types.IngestTarget, held map[id.EventID]struct{}, now time.Time) bool {
 	return slices.ContainsFunc(targets, func(target *types.IngestTarget) bool {
 		return now.Sub(time.UnixMilli(target.FailedAt)) < jobRetryPause || citesAny(target.Event, held)
@@ -416,15 +391,13 @@ func hold(targets []*types.IngestTarget, held map[id.EventID]struct{}) {
 	}
 }
 
-// untarget stops counting targets as the round's once published or failed, so that other targets'
-// gap fills reach them as published, or as missing
+// untarget lets other targets' gap fills reach these as published, or as missing
 func (run *jobRun) untarget(eventIDs ...id.EventID) {
 	for _, eventID := range eventIDs {
 		delete(run.targets, eventID)
 	}
 }
 
-// runTurn runs a unit of work once the process has a turn for its kind
 func (run *jobRun) runTurn(ctx context.Context, work ingestWork) error {
 	release, err := run.jobs.turn(ctx, work.kind())
 	if err != nil {
@@ -434,9 +407,8 @@ func (run *jobRun) runTurn(ctx context.Context, work ingestWork) error {
 	return run.runWork(ctx, work)
 }
 
-// runWork runs a unit of work through its phases. A failure counts against its targets, unless the
-// job ended under it: another runner took the lock, the process is stopping, or the watchdog ended a
-// phase that was making progress, slowly, rather than stuck.
+// runWork counts a failure against its targets unless the job ended under it, including the watchdog
+// ending a phase that was slow rather than stuck
 func (run *jobRun) runWork(ctx context.Context, work ingestWork) error {
 	phases := []struct {
 		name string
@@ -464,10 +436,9 @@ func (run *jobRun) runWork(ctx context.Context, work ingestWork) error {
 	return nil
 }
 
-// countFailure counts a failure of the targets' work, failing those at the limit, so that a target
-// the job cannot publish does not hold the room's job forever
+// countFailure fails targets at the limit, so one the job cannot publish does not hold it forever
 func (run *jobRun) countFailure(ctx context.Context, targets []*types.IngestTarget, cause error) {
-	// The work's context may have ended, as its watchdog ends it
+	// The watchdog may have ended the work's context
 	ctx = context.WithoutCancel(ctx)
 	zerolog.Ctx(ctx).Warn().Err(cause).Int("targets", len(targets)).Msg("Ingest work failed")
 	now := time.Now().UnixMilli()
@@ -487,7 +458,6 @@ func (run *jobRun) countFailure(ctx context.Context, targets []*types.IngestTarg
 	}
 }
 
-// fail fails a target, if it still exists, and ends its work
 func (run *jobRun) fail(ctx context.Context, target *types.IngestTarget, failure *types.IngestFailure) error {
 	failed, err := run.jobs.db.Rooms.FailIngestTarget(ctx, run.roomID, target.Event.ID, failure)
 	if err != nil {

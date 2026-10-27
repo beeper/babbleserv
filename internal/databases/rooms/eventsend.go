@@ -45,9 +45,8 @@ type RejectedEvent struct {
 
 // Store events handles writing out all the relevant event data into FoundationDB, assuming that all
 // events passed in are already authenticated and carry their state contexts. Each accepted event
-// clears the extremities it replaces, and in a state DAG room each accepted state event clears the
-// state extremities it cites and joins the state DAG served to joining servers. The caller then stores
-// the room's current state with txnStoreRoomState.
+// clears the extremities it replaces. The caller then stores the room's current state with
+// txnStoreRoomState.
 func (r *RoomsDatabase) txnStoreEvents(
 	ctx context.Context,
 	txn fdb.Transaction,
@@ -106,8 +105,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 			r.events.TxnSetRoomStateExtremEventID(txn, room.ID, ev.ID, version, ev.PrevStateEventIDs)
 			r.events.TxnAddRoomStateDAGEvent(txn, room.ID, ev.ID, version)
 		}
-		// Older state the room's ingest job replayed for a gap, which stays out of the timeline and
-		// the room extremities, as Synapse keeps the state events it fetches out of them
+		// State an ingest job replayed for a gap stays out of the timeline and extremities, as in Synapse
 		if ev.Unpublished {
 			continue
 		}
@@ -621,16 +619,13 @@ func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	return nil
 }
 
-// isReaction reports whether an event is a reaction the reaction index records: an m.reaction
-// message annotating another event
 func isReaction(ev *types.Event) bool {
 	_, relType := ev.RelatesTo()
 	return ev.Type == event.EventReaction && ev.StateKey == nil && relType == event.RelAnnotation
 }
 
-// txnCheckDuplicateReaction refuses a local user's reaction they sent already. As Synapse does, only
-// local sends are checked: a federated event is never refused for it, which in a state DAG room would
-// cut this server off from every event descending from it.
+// txnCheckDuplicateReaction checks only local sends, as Synapse does: refusing a federated event
+// would, in a state DAG room, cut this server off from every event descending from it
 func (r *RoomsDatabase) txnCheckDuplicateReaction(txn fdb.ReadTransaction, ev *types.Event) error {
 	if !isReaction(ev) {
 		return nil
@@ -642,8 +637,7 @@ func (r *RoomsDatabase) txnCheckDuplicateReaction(txn fdb.ReadTransaction, ev *t
 	return nil
 }
 
-// txnClearRedactedReaction clears the reaction index row of a reaction a redaction redacts, as
-// Synapse deletes the redacted event's relation, so its sender may react with the key again
+// txnClearRedactedReaction lets the sender react with the key again, as Synapse deletes a redacted relation
 func (r *RoomsDatabase) txnClearRedactedReaction(txn fdb.Transaction, roomID id.RoomID, redaction *types.Event, batch []*types.Event) {
 	redactedID := redaction.RedactedEventID()
 	if redactedID == "" {

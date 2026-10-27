@@ -25,33 +25,26 @@ import (
 )
 
 const (
-	// Prev events of a gap fill's pulled events whose state is fetched from the server that pulled
-	// them. Events citing the others are dropped, and the state fetched again with the next event
-	// citing them.
-	maxPrevEventStatesFetched = 10
-	// Events of a prev event's state fetched concurrently when too few are missing to fetch it whole
+	// Events citing prev events beyond this are dropped until a later fill fetches their state
+	maxPrevEventStatesFetched       = 10
 	prevEventStatesFetchConcurrency = 5
-	// PDUs a get_missing_events request names. Synapse answers at most 20 events a request and pulls
-	// 10 for a PDU it fills the gap of, so each PDU named gets that many.
+	// Synapse answers at most 20 events a request and pulls 10 per PDU
 	gapPDUsPerRequest = 2
-	// The limit of a get_missing_events request the spec has a server take when none is given
+	// The spec's default get_missing_events limit
 	defaultMissingEventsLimit = 10
-	// The largest get_missing_events response read, room for MaxStateDAGMissingEvents events of the largest
-	// size a PDU may have: a server answering with more is taken to refuse
+	// A larger get_missing_events response counts as a refusal
 	maxMissingEventsResponseBytes = MaxStateDAGMissingEvents * util.MaxPDUBytes
 )
 
-// Fetcher pulls from other servers the events and state that a room's events need and this server
-// does not store, for the room's ingest job
+// Fetcher pulls missing events and state from other servers for a room's ingest job
 type Fetcher struct {
 	config    config.BabbleConfig
 	db        *databases.Databases
 	fedclient *federation.Client
-	// fedclient without its timeout on whole requests, for responses read as they arrive
+	// Without the whole-request timeout, for responses read as they arrive
 	streamClient *federation.Client
-	// fedclient reading responses of at most maxMissingEventsResponseBytes
-	gapClient *federation.Client
-	keyStore  *util.KeyStore
+	gapClient    *federation.Client
+	keyStore     *util.KeyStore
 }
 
 func NewFetcher(cfg config.BabbleConfig, db *databases.Databases, fedclient *federation.Client, keyStore *util.KeyStore) *Fetcher {
@@ -62,29 +55,22 @@ func NewFetcher(cfg config.BabbleConfig, db *databases.Databases, fedclient *fed
 	return &Fetcher{config: cfg, db: db, fedclient: fedclient, streamClient: &streamClient, gapClient: &gapClient, keyStore: keyStore}
 }
 
-// requestTimeout bounds each request of a gap fill: half a lease, so that the progress reported
-// after it refreshes the job's lease before its watchdog stops it
+// Half a lease, so the progress reported after each request refreshes the lease before the watchdog fires
 func (f *Fetcher) requestTimeout() time.Duration {
 	return f.config.Rooms.Ingest.LeaseTimeout / 2
 }
 
-// GapFill is what a gap fill pulled for PDUs citing events missing here
 type GapFill struct {
 	Pulled []*types.Event
 	Given  *rooms.GivenStates
-	// The PDUs whose gap is still open because a server failed to answer for them, other than by
-	// refusing, so asking again may fill it, and why: a get_missing_events request, or the state at
-	// a prev event the PDUs reach, which the fill's bound on those may also have left unfetched
+	// PDUs left open by a server failing rather than refusing, or by the prev event state bound, so a retry may fill them
 	Unanswered map[id.EventID]struct{}
 	Errs       []error
 }
 
-// GapFill pulls the events missing between a joined room's extremities and the PDU targets citing
-// prev events missing here. Each PDU's origin is asked for its own PDUs' gaps, then the first
-// maxGapFillServers of the servers gapFillServers gives for the gaps still open, and the state at
-// the pulled events' prev events that have none here is fetched from the server that pulled them. As
-// Synapse does, it never fetches the state at the PDUs' own prev events: their sender pushed them, so
-// should have what they cite. Fails only on errors of this server's own.
+// GapFill pulls the events missing between a joined room's extremities and the targets, asking each
+// PDU's origin first, then the first maxGapFillServers servers. As Synapse does, it fetches the state
+// only at the pulled events' prev events, never the PDUs' own. Remote failures go in Errs.
 func (f *Fetcher) GapFill(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -112,7 +98,7 @@ func (f *Fetcher) GapFill(
 	plan := newGapPlan(targets, missing.Missing)
 	servers := gapFillServers(origins, roomServers, f.config.ServerName)
 	err = plan.run(ctx, servers, func(ctx context.Context, server string, latestIDs, pulledIDs []id.EventID) ([]*types.Event, error) {
-		// What was pulled already is known here, so the server stops at it as at the extremities
+		// Already pulled events bound the walk like the extremities
 		earliestIDs := slices.Concat(missing.Extremities, pulledIDs)
 		return f.missingEvents(ctx, server, roomID, roomVersion, latestIDs, earliestIDs, missing.MinDepth, seenIDs)
 	})
@@ -136,8 +122,7 @@ func (f *Fetcher) GapFill(
 	return fill, nil
 }
 
-// reachingPrevs returns the PDUs reaching, along prev_events through the events pulled, one of the
-// prev events, without which the events citing them are dropped
+// reachingPrevs returns the PDUs that reach one of prevIDs through the pulled events
 func reachingPrevs(pdus, pulled []*types.Event, prevIDs map[id.EventID]struct{}) map[id.EventID]struct{} {
 	reaching := make(map[id.EventID]struct{}, len(prevIDs))
 	maps.Copy(reaching, prevIDs)
@@ -160,9 +145,7 @@ func reachingPrevs(pdus, pulled []*types.Event, prevIDs map[id.EventID]struct{})
 
 type missingEventsFunc func(ctx context.Context, server string, latestIDs, pulledIDs []id.EventID) ([]*types.Event, error)
 
-// gapPlan is the get_missing_events requests of a gap fill. A PDU's gap is open while it cites a
-// prev event neither stored nor pulled. Each request names few PDUs, as servers cap the events they
-// answer with, and once a server failed or refused, it is not asked again.
+// gapPlan tracks a gap fill's get_missing_events requests; a server that fails or refuses once is not asked again
 type gapPlan struct {
 	pdus    []*types.Event
 	origins map[id.EventID]string
@@ -173,9 +156,8 @@ type gapPlan struct {
 	pulled     map[id.EventID]struct{}
 	asked      map[string]map[id.EventID]struct{}
 	dropped    map[string]struct{}
-	// PDUs a server failed to answer for, other than by refusing
-	failed map[id.EventID]struct{}
-	errs   []error
+	failed     map[id.EventID]struct{}
+	errs       []error
 }
 
 func newGapPlan(targets []*types.IngestTarget, missingIDs []id.EventID) *gapPlan {
@@ -201,8 +183,6 @@ func newGapPlan(targets []*types.IngestTarget, missingIDs []id.EventID) *gapPlan
 	return plan
 }
 
-// run asks each server for the open gaps of the PDUs it sent, then the first maxGapFillServers for
-// the gaps still open
 func (p *gapPlan) run(ctx context.Context, servers []string, missingEvents missingEventsFunc) error {
 	for _, server := range servers {
 		if err := p.ask(ctx, server, true, missingEvents); err != nil {
@@ -217,8 +197,7 @@ func (p *gapPlan) run(ctx context.Context, servers []string, missingEvents missi
 	return nil
 }
 
-// ask asks a server for the open gaps it was not asked for yet, only of the PDUs it sent if own is
-// set, a few PDUs a request
+// With own set, ask only asks for the gaps of the PDUs the server sent
 func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvents missingEventsFunc) error {
 	asked := p.asked[server]
 	if asked == nil {
@@ -268,7 +247,6 @@ func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvent
 	}
 }
 
-// open reports whether a PDU cites a prev event neither stored, in the PDUs nor pulled
 func (p *gapPlan) open(ev *types.Event) bool {
 	return slices.ContainsFunc(ev.PrevEventIDs, func(prevID id.EventID) bool {
 		_, missing := p.missing[prevID]
@@ -287,9 +265,8 @@ func (p *gapPlan) unanswered() map[id.EventID]struct{} {
 	return unanswered
 }
 
-// refusedRequest reports whether a server answered a request with what asking again would not
-// change: a status below 500 other than 429, or a response that is not the JSON asked for. A
-// response whose body failed to arrive whole, as one timing out or cut off, was not answered.
+// refusedRequest reports whether asking again would get the same answer: a status below 500 other
+// than 429, or a body that is not the JSON asked for. A body that timed out or was cut off was not answered.
 func refusedRequest(err error) bool {
 	var httpErr mautrix.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.Response == nil {
@@ -316,8 +293,8 @@ func (f *Fetcher) missingEvents(
 ) ([]*types.Event, error) {
 	ctx, cancel := context.WithTimeout(ctx, f.requestTimeout())
 	defer cancel()
-	// Events from before this server's earliest timeline event, such as its join, are kept out of the
-	// timeline as Synapse does, and the state at them fetched instead
+	// As Synapse does, min_depth keeps events before this server's earliest timeline event out, and
+	// the state at them is fetched instead
 	limit := cmp.Or(f.config.Federation.MaxFetchMissingEvents, defaultMissingEventsLimit)
 	resp, err := f.gapClient.GetMissingEvents(ctx, &federation.ReqGetMissingEvents{
 		ServerName:     server,
@@ -340,17 +317,13 @@ func (f *Fetcher) missingEvents(
 	}), nil
 }
 
-// prevEventStates are the states a gap fill fetched at prev events of the events it pulled: those
-// given, and the prev events a server failed to give the state at, other than by refusing, or that
-// the fill's bound left unfetched
 type prevEventStates struct {
-	given     *rooms.GivenStates
+	given *rooms.GivenStates
+	// Prev events a server failed to give the state at, other than by refusing, or the bound skipped
 	unfetched map[id.EventID]struct{}
 	errs      []error
 }
 
-// addPrevEventStates adds to the states, fetched from a server, the state before the prev events of
-// the events it pulled that have none here, within what a gap fill fetches
 func (f *Fetcher) addPrevEventStates(
 	ctx context.Context,
 	server string,
@@ -420,9 +393,7 @@ func (f *Fetcher) addPrevEventStates(
 	return nil
 }
 
-// fetchPrevEventState fetches from a server the state at a prev event, with the events of it that
-// are neither stored here nor known. The first error is the server failing to give it, the second
-// this server's own failing.
+// fetchPrevEventState returns the remote server's failure as the first error, this server's own as the second
 func (f *Fetcher) fetchPrevEventState(
 	ctx context.Context,
 	server string,
@@ -457,8 +428,7 @@ func (f *Fetcher) fetchPrevEventState(
 	}
 
 	var pdus []federation.PDU
-	// Fetching each event has a lot of overhead, so as Synapse does the whole state is fetched when
-	// many are missing
+	// As Synapse does, fetch the whole state when many events are missing rather than each one
 	if len(missing)*10 >= len(stateIDs.PDUs)+len(stateIDs.AuthChain) {
 		resp, err := f.fedclient.GetState(reqCtx, server, roomID, prevID)
 		if err != nil {
@@ -497,11 +467,8 @@ func (f *Fetcher) fetchPrevEventState(
 	return stateIDs.PDUs, fetched, nil, nil
 }
 
-// StateBefore fetches the state before an event of the room another server holds, with its auth
-// chain, as a send_join response gives the state before a join. Every event is fetched, stored here
-// or not, as a remote join takes the state from the events given. More events than the limit fail
-// with a tooLargeFailure before any is verified. The server may take as long to answer as for a
-// send_join, meanwhile reporting progress.
+// StateBefore fetches the state and auth chain before an event as send_join gives them, including
+// events stored here, since a remote join takes the state from the events given.
 func (f *Fetcher) StateBefore(
 	ctx context.Context,
 	server string,
@@ -531,7 +498,6 @@ func (f *Fetcher) StateBefore(
 	return eventsInRoom(ctx, stateEvs, roomID), eventsInRoom(ctx, authEvs, roomID), nil
 }
 
-// Keeps the PDUs of the wanted events, told apart by reference hash before any is verified
 func wantedPDUs(ctx context.Context, pdus []federation.PDU, roomVersion string, wanted map[id.EventID]struct{}) []federation.PDU {
 	kept := make([]federation.PDU, 0, len(wanted))
 	for _, pdu := range pdus {
@@ -550,7 +516,6 @@ func wantedPDUs(ctx context.Context, pdus []federation.PDU, roomVersion string, 
 	return kept
 }
 
-// Fetches events from a server one request each, skipping any that fail
 func (f *Fetcher) fetchEvents(ctx context.Context, server string, eventIDs []id.EventID) []federation.PDU {
 	pdus := make([][]federation.PDU, len(eventIDs))
 	limit := make(chan struct{}, prevEventStatesFetchConcurrency)
@@ -572,7 +537,6 @@ func (f *Fetcher) fetchEvents(ctx context.Context, server string, eventIDs []id.
 	return slices.Concat(pdus...)
 }
 
-// Keeps the events of the room, which another server may not stick to
 func eventsInRoom(ctx context.Context, evs []*types.Event, roomID id.RoomID) []*types.Event {
 	return slices.DeleteFunc(evs, func(ev *types.Event) bool {
 		if ev.RoomID == roomID {

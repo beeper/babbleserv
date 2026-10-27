@@ -900,8 +900,8 @@ func TestAuthHeaderCodecAndIncompleteGraph(t *testing.T) {
 	require.Empty(t, g.dirty)
 }
 
-// A state DAG event staged with no auth events takes those calculated when it is replayed, rather
-// than the unfinalized header stored for it, and its header is written whether finalized or not
+// A state DAG event staged without auth events takes those calculated on replay over its stored
+// unfinalized header, which is written finalized or not
 func TestAddCalculatedReplacesStoredHeaders(t *testing.T) {
 	s := newGraphStore()
 	create := s.addCreate()

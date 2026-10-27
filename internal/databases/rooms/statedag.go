@@ -16,30 +16,24 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// A state DAG room's events cite only events with state here, so no other server gives states
+// A state DAG room's events cite only events with state here
 var errStateDAGGivenStates = errors.New("state DAG rooms take no given states")
 
-// isStateDAGSend reports whether a federated send is to a state DAG room, by the version of the
-// room, nil when not stored, or the version the events were verified with
 func isStateDAGSend(room *types.Room, evs []*types.Event) bool {
 	return room != nil && util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) ||
 		slices.ContainsFunc(evs, (*types.Event).StateDAGs)
 }
 
-// softFails reports whether step 6 holds an accepted event to the room's current state: in a state
-// DAG room only messages soft fail, while state events always join the state DAG
+// In a state DAG room only messages soft fail, as state events always join the state DAG
 func softFails(ev *types.Event) bool {
 	return !ev.StateDAGs() || ev.StateKey == nil
 }
 
-// entersStateDAG reports whether a published event of a state DAG room becomes a state extremity:
-// an accepted state event does, in place of the prev state events it cites
 func entersStateDAG(ev *types.Event) bool {
 	return ev.StateKey != nil && !ev.Rejected && !ev.SoftFailed
 }
 
-// advanceStateExtremities returns a state DAG room's state extremities once an event publishes,
-// the change its publish writes to events/srx
+// advanceStateExtremities is the change an event's publish writes to events/srx
 func advanceStateExtremities(extremities []id.EventID, ev *types.Event) []id.EventID {
 	if !entersStateDAG(ev) {
 		return extremities
@@ -47,18 +41,13 @@ func advanceStateExtremities(extremities []id.EventID, ev *types.Event) []id.Eve
 	return advanceExtremities(extremities, ev.PrevStateEventIDs, ev.ID)
 }
 
-// citedExtremities returns the extremities a local event of a state DAG room cites, of extremities
-// in the order they were stored: all of them up to types.MaxStateDAGPrevEvents, otherwise that many
-// stored last. Depth would let a sender choose.
+// citedExtremities cites those stored last up to the cap, as ordering by depth would let a sender choose
 func citedExtremities(extremities []id.EventID) []id.EventID {
 	return append([]id.EventID{}, extremities[max(len(extremities)-types.MaxStateDAGPrevEvents, 0):]...)
 }
 
-// citedPrevStateEvents returns the prev_state_events of a local event of a state DAG room: the
-// extremities citedExtremities gives, and the membership an out-of-band change supersedes, when
-// given and not among them, in place of the extremity stored first should they fill the cap. It
-// reports whether they are every extremity and nothing else, when the state before the event is
-// current state.
+// citedPrevStateEvents adds the membership an out-of-band change supersedes, in place of the oldest
+// extremity at the cap. current means the state before the event is current state.
 func citedPrevStateEvents(extremities []id.EventID, superseded id.EventID) (cited []id.EventID, current bool) {
 	cited = citedExtremities(extremities)
 	if superseded == "" || slices.Contains(cited, superseded) {
@@ -69,7 +58,6 @@ func citedPrevStateEvents(extremities []id.EventID, superseded id.EventID) (cite
 	return append(cited, superseded), false
 }
 
-// rescindedMembership returns the membership a leave of its target rescinds, held in current state
 func rescindedMembership(held types.StateEntry) id.EventID {
 	switch held.Membership {
 	case event.MembershipInvite, event.MembershipKnock:
@@ -78,9 +66,8 @@ func rescindedMembership(held types.StateEntry) id.EventID {
 	return ""
 }
 
-// changesRemoteMembership reports whether a member event changes the membership of a user of a
-// server other than serverName, sent by someone else: an out-of-band change, should the target's
-// server not be in the room. A make_* template is the target's own event, sent back by its server.
+// changesRemoteMembership reports an out-of-band change, should the target's server not be in the
+// room. A make_* template is the target's own event, sent back by its server.
 func changesRemoteMembership(ev *types.Event, serverName string) bool {
 	if ev.Type != event.StateMember || ev.StateKey == nil {
 		return false
@@ -89,12 +76,9 @@ func changesRemoteMembership(ev *types.Event, serverName string) bool {
 	return target != ev.Sender && target.Homeserver() != serverName
 }
 
-// ErrStateDAGTooLarge refuses a join to a state DAG room whose state DAG, with the join, would hold
-// more events than this server serves
 var ErrStateDAGTooLarge = errors.New("the room's state DAG has more events than this server serves")
 
-// CheckServedStateDAG fails with ErrStateDAGTooLarge for a state DAG room whose state DAG would hold
-// more than config.Federation.MaxServedStateDAG events with one more, as a join's publish adds
+// CheckServedStateDAG counts the join about to publish against Federation.MaxServedStateDAG
 func (r *RoomsDatabase) CheckServedStateDAG(ctx context.Context, roomID id.RoomID) error {
 	limit := r.config.Federation.MaxServedStateDAG
 	_, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
@@ -108,17 +92,13 @@ func (r *RoomsDatabase) CheckServedStateDAG(ctx context.Context, roomID id.RoomI
 	return err
 }
 
-// Events of a state DAG that send_join serves per transaction
 const servedStateDAGPage = 500
 
-// ErrJoinNotInStateDAG fails serving a state DAG for a join that is not in it, which every join
-// accepted here is
+// ErrJoinNotInStateDAG should not happen, as every join accepted here is in the state DAG
 var ErrJoinNotInStateDAG = errors.New("join is not in the room's state DAG")
 
-// StreamServedStateDAG hands each the part of a state DAG room's state DAG served with a join: every
-// accepted state event published before the join, in the order it was published, a page per
-// transaction. Neither the join nor what was published after it are served, as Synapse serves only
-// the join's ancestors, and would otherwise store the join itself without state first.
+// StreamServedStateDAG pages the state events published before the join, in publish order. Synapse
+// serves only the join's ancestors, and would otherwise store the join itself without state first.
 func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.RoomID, joinID id.EventID, each func([]*types.Event) error) error {
 	type page struct {
 		evs    []*types.Event
@@ -152,12 +132,9 @@ func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.Room
 	}
 }
 
-// Events a walk of a state DAG reads per batch of reads, which share a transaction until it is too
-// old
 const stateDAGWalkChunk = 1000
 
-// GetMissingStateDAGEvents answers get_missing_events in a state DAG room with the MSC's state_dag
-// flag, see walkStateDAG
+// GetMissingStateDAGEvents answers get_missing_events with MSC4242's state_dag flag
 func (r *RoomsDatabase) GetMissingStateDAGEvents(ctx context.Context, roomID id.RoomID, earliest, latest []id.EventID, limit int) ([]*types.Event, error) {
 	read, err := r.renewableEventReads(ctx, roomID)
 	if err != nil {
@@ -166,9 +143,8 @@ func (r *RoomsDatabase) GetMissingStateDAGEvents(ctx context.Context, roomID id.
 	return walkStateDAG(roomID, earliest, latest, limit, read)
 }
 
-// renewableEventReads returns a reader of events that reads each batch in the transaction the last
-// one used, starting another once it is too old or failed with a retryable error, as one too old
-// does, so that a walk reading one hop of a state DAG at a time is not a transaction a hop
+// renewableEventReads shares a transaction across reads until it is too old or fails retryably, so
+// a walk reading one hop at a time is not a transaction a hop
 func (r *RoomsDatabase) renewableEventReads(ctx context.Context, roomID id.RoomID) (func([]id.EventID) (map[id.EventID]*types.Event, error), error) {
 	reads, err := eventsendutil.NewArtifactReads(ctx, r.db, r.events, roomID, nil, nil)
 	if err != nil {
@@ -191,11 +167,9 @@ func (r *RoomsDatabase) renewableEventReads(ctx context.Context, roomID id.RoomI
 	}, nil
 }
 
-// walkStateDAG walks a state DAG back from latest along prev_state_events, a message's included, as
-// far as earliest, and returns at most limit of the events it reaches, those fewer hops from latest
-// first, then by event ID in byte order (MSC4242). Neither latest nor earliest are returned. Only
-// events with state here that were not rejected are returned and walked through. Each hop's events
-// are read in chunks of stateDAGWalkChunk, in the order they are returned.
+// walkStateDAG walks back from latest along prev_state_events as far as earliest, excluding both,
+// returning at most limit events, fewer hops first then by event ID in byte order (MSC4242). Only
+// unrejected events with state here are returned and walked through.
 func walkStateDAG(
 	roomID id.RoomID,
 	earliest, latest []id.EventID,
@@ -234,8 +208,7 @@ func walkStateDAG(
 	return found, err
 }
 
-// readWalkable reads the events in chunks, keeping their order, and returns those walkable, at
-// most limit of them unless it is negative
+// readWalkable keeps the events' order, returning at most limit unless it is negative
 func readWalkable(
 	read func([]id.EventID) (map[id.EventID]*types.Event, error),
 	eventIDs []id.EventID,

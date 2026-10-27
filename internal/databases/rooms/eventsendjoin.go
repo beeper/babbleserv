@@ -39,8 +39,7 @@ type remoteJoin struct {
 	// The state before the join once staged, and the changes to it from the room's current state
 	boundary types.StateHash
 	diff     *boundaryChanges
-	// In a state DAG room, the tips of the state DAG the resident served with the join, see
-	// stateDAGJoinTips
+	// The state DAG tips the resident served with the join, see stateDAGJoinTips
 	tips []id.EventID
 	// Another join got this server into the room, so the join is sent as any federated event
 	asMember bool
@@ -55,18 +54,15 @@ type boundaryChanges struct {
 	changes     []types.StateChange
 }
 
-// RemoteJoin is a local user's join to a room this server is not in, with the state before it and
-// its auth chain as the resident server's send_join response gives them. The room's ingest job runs
-// it in phases: each runs the join's attempts until they reach the next phase's work, and Publish
-// runs them through, redoing any earlier work a change to the room meanwhile invalidated. Should
-// another join get this server into the room first, the join is sent as a member's.
+// RemoteJoin is a local user's join to a room this server is not in, run by the room's ingest job in
+// phases. Publish runs it through, redoing any earlier work a change to the room invalidated, and
+// sends it as a member's should another join get this server into the room first.
 type RemoteJoin struct {
 	sender *remoteJoinSender
 	log    zerolog.Logger
 }
 
-// NewRemoteJoin prepares the join of a local user, a target of the room's ingest job, which its
-// publish clears. The events are the state before the join and its auth chain, in any order.
+// NewRemoteJoin takes the send_join response's state and auth chain events in any order
 func (r *RoomsDatabase) NewRemoteJoin(
 	ctx context.Context,
 	joinEv *types.Event,
@@ -78,11 +74,8 @@ func (r *RoomsDatabase) NewRemoteJoin(
 	return r.newRemoteJoin(ctx, &remoteJoin{ev: joinEv, stateIDs: stateIDs}, evs, pushContext{rules: userPushRules, rooms: userRoomContext})
 }
 
-// NewStateDAGRemoteJoin prepares the join of a local user to a state DAG room (MSC4242), a target of
-// the room's ingest job, once the job replayed the state DAG the resident served with it, whose tips
-// are given. The state before the join is the state after its prev state events. Its publish makes
-// the join and the tips it does not cite the room's state extremities, see stateDAGJoinTips, and
-// current state the state after them.
+// NewStateDAGRemoteJoin prepares a join to a state DAG room (MSC4242) once the job replayed the
+// served state DAG. Its publish makes the join and the tips it does not cite the state extremities.
 func (r *RoomsDatabase) NewStateDAGRemoteJoin(
 	ctx context.Context,
 	joinEv *types.Event,
@@ -122,14 +115,12 @@ func (r *RoomsDatabase) newRemoteJoin(ctx context.Context, join *remoteJoin, evs
 	return &RemoteJoin{sender: &remoteJoinSender{federatedEventSender: p}, log: log}, nil
 }
 
-// Stage checks the join and the response events against their own auth events, and the join against
-// the state before it, then stages the response events (phase A)
+// Stage authorizes the join and stages the response events (phase A)
 func (j *RemoteJoin) Stage(ctx context.Context) error {
 	return j.runUntil(ctx, stagingDone)
 }
 
-// BuildState assembles the state before the join and its diff from the room's current state, or any
-// resolution a join sent as a member's needs (phase B)
+// BuildState builds the state before the join and its diff from current state (phase B)
 func (j *RemoteJoin) BuildState(ctx context.Context) error {
 	return j.runUntil(ctx, workDone)
 }
@@ -153,7 +144,6 @@ func (j *RemoteJoin) runUntil(ctx context.Context, stopAt func(preparationOutcom
 	return err
 }
 
-// stagingDone reports whether a preparation asks for anything but staging
 func stagingDone(outcome preparationOutcome) bool {
 	needs, ok := outcome.(needsWork)
 	if !ok {
@@ -163,7 +153,6 @@ func stagingDone(outcome preparationOutcome) bool {
 	return !staging
 }
 
-// workDone reports whether a preparation asks for no more preparatory work
 func workDone(outcome preparationOutcome) bool {
 	_, ok := outcome.(needsWork)
 	return !ok
@@ -220,8 +209,7 @@ func (s *remoteJoinSender) prepare(ctx context.Context) (preparationOutcome, err
 
 func (p *remoteJoinSender) prepareJoin(ctx context.Context) (preparationOutcome, error) {
 	if p.join.ev.StateDAGs() {
-		// The room's job staged and replayed the state DAG the join cites, so there is nothing to
-		// check or stage first
+		// The room's job already staged and replayed the state DAG the join cites
 		room, err := util.DoReadTransaction(ctx, p.r.db, func(txn fdb.ReadTransaction) (*types.Room, error) {
 			return p.txnCheckRemoteJoinRoom(txn, nil)
 		})
@@ -326,7 +314,7 @@ func (s *remoteJoinSender) txnCheckRemoteJoinRoom(
 				break
 			}
 		}
-		// A state DAG room's create event is staged, the one its room ID names
+		// A state DAG room's ID names its create event, which is staged
 		if joinEv.StateDAGs() {
 			if createEv := s.r.events.TxnGetEvent(txn, joinEv.ImplicitCreateEventID()); createEv != nil {
 				roomCreate = []*types.PartialEvent{&createEv.PartialEvent}

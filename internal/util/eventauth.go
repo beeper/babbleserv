@@ -55,8 +55,8 @@ func userIDForSender(_ spec.RoomID, senderID spec.SenderID) (*spec.UserID, error
 }
 
 // Authorize keeps lookup errors separate from rejections, including provider errors that
-// gomatrixserverlib.Allowed does not propagate. It adds the rule of state DAG rooms (MSC4242) that
-// gomatrixserverlib lacks, 1.3: a create event citing prev state events is rejected.
+// gomatrixserverlib.Allowed does not propagate.
+// It adds MSC4242's rule 1.3, which gomatrixserverlib lacks: a create cites no prev state events.
 func Authorize(ev *types.Event, lookup AuthEventLookup) (authErr, err error) {
 	if ev.Type == event.StateCreate && ev.StateDAGs() && len(ev.PrevStateEventIDs) > 0 {
 		return errors.New("create event has prev_state_events"), nil
@@ -76,15 +76,13 @@ func Authorize(ev *types.Event, lookup AuthEventLookup) (authErr, err error) {
 	return authErr, nil
 }
 
-// PrevStateEventLookup returns an event an event cites in prev_state_events, nil when unknown here
+// PrevStateEventLookup returns nil for an event unknown here
 type PrevStateEventLookup func(id.EventID) (*types.Event, error)
 
 // An event is evaluated only once every event it cites is, so a missing one is not a rejection
 var ErrPrevStateEventMissing = errors.New("prev state event missing")
 
-// AuthorizePrevStateEvents applies section 2 of the auth rules of state DAG rooms (MSC4242): each
-// event the event cites in prev_state_events must be a state event of its room that was not
-// rejected, so rejection cascades along the state DAG. Events of other room versions pass.
+// AuthorizePrevStateEvents applies MSC4242's auth rules section 2, cascading rejection along the state DAG
 func AuthorizePrevStateEvents(ev *types.Event, lookup PrevStateEventLookup) (authErr, err error) {
 	if !ev.StateDAGs() {
 		return nil, nil

@@ -10,12 +10,10 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// SplitConnected splits a room's events, in topological order, into those citing only events in
-// place here or earlier connected events, which publish with nothing fetched, and the rest, whose
-// gaps the room's job fills. Prev events are in place when stored, as are auth events. In a state
-// DAG room (MSC4242) the prev state events, with the implicit create event, must be published here,
-// with state, or stored in another room, which the MSC's section 2 rejects citing, and the prev
-// events stored, unless the event was pulled for another's prev events, whose own are not pulled.
+// SplitConnected splits off the events citing only events in place here or connected before them,
+// which publish with nothing fetched. In a state DAG room (MSC4242) a prev state event is in place
+// once published here, or stored in another room, which section 2 rejects citing, and a pulled
+// event's prev events need not be.
 func (j *Jobs) SplitConnected(ctx context.Context, evs []*types.Event, pulled map[id.EventID]struct{}) (connected, rest []*types.Event, err error) {
 	if len(evs) == 0 {
 		return nil, nil, nil
@@ -34,8 +32,6 @@ func (j *Jobs) SplitConnected(ctx context.Context, evs []*types.Event, pulled ma
 	return connected, rest, nil
 }
 
-// citedEventIDs returns, each once, the events the events cite that must be stored, and the prev
-// state events of state DAG events
 func citedEventIDs(evs []*types.Event, pulled map[id.EventID]struct{}) (stored, prevState []id.EventID) {
 	for _, ev := range evs {
 		switch {
@@ -59,7 +55,6 @@ func isPulled(ev *types.Event, pulled map[id.EventID]struct{}) bool {
 	return found
 }
 
-// splitConnected splits events in topological order, keeping that order in both parts
 func splitConnected(evs []*types.Event, stored, prevStateInPlace, pulled map[id.EventID]struct{}) (connected, rest []*types.Event) {
 	earlier := make(map[id.EventID]struct{}, len(evs))
 	missingFrom := func(inPlace map[id.EventID]struct{}) func(id.EventID) bool {
@@ -87,7 +82,6 @@ func splitConnected(evs []*types.Event, stored, prevStateInPlace, pulled map[id.
 	return connected, rest
 }
 
-// splitConnectedTargets orders PDU targets topologically, then splits them as SplitConnected does
 func (j *Jobs) splitConnectedTargets(ctx context.Context, pdus []*types.IngestTarget) (connected, gaps []*types.IngestTarget, err error) {
 	byID := make(map[id.EventID]*types.IngestTarget, len(pdus))
 	evs := make([]*types.Event, len(pdus))

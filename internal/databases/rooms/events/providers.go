@@ -104,7 +104,6 @@ func (ep *TxnEventsProvider) Settle() {
 	}
 }
 
-// CancelUnread cancels the reads started that nothing got
 func (ep *TxnEventsProvider) CancelUnread() {
 	for eventID, fut := range ep.futures {
 		fut.Cancel()

@@ -57,8 +57,7 @@ type Event struct {
 	SoftFailed bool `msgpack:"sfd" json:"-"`
 	Outlier    bool `msgpack:"out" json:"-"`
 	Rejected   bool `msgpack:"rej" json:"-"`
-	// An accepted state event of a state DAG room that an ingest job's replay gave state, which the
-	// job publishes later: no published event cites one, see Jobs.SplitConnected
+	// Given state by an ingest job's replay but not published yet, so no published event may cite it
 	Unpublished bool `msgpack:"unp,omitempty" json:"-"`
 	// Internal indicator of whether the event has been redacted - needed? (content hash)
 	Redacted bool `msgpack:"red" json:"-"`
@@ -98,9 +97,7 @@ type Event struct {
 
 type EventExtra map[string]jsontext.Value
 
-// takeEventIDs takes a member that is a list of strings out of the extra members, as event IDs. Any
-// other value stays there to be sent on as received, as room versions not reading the member ignore
-// it.
+// takeEventIDs leaves any value but a list of strings in the extra members, to be sent on as received
 func (e EventExtra) takeEventIDs(name string) []id.EventID {
 	var values []jsontext.Value
 	if value, found := e[name]; !found || jsonv2.Unmarshal(value, &values) != nil || values == nil {
@@ -374,14 +371,11 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 	return ev.CheckStateDAGFormat()
 }
 
-// The most prev_events and prev_state_events an event of a state DAG room may cite. Synapse drops
-// events citing more of either, so a room taking one would diverge from it.
+// Synapse drops state DAG events citing more prev_events or prev_state_events, so taking one diverges
 const MaxStateDAGPrevEvents = 20
 
-// CheckStateDAGFormat refuses an event of a state DAG room (MSC4242) parsed with an auth_events
-// member, which would otherwise be taken for its calculated auth events, one without a list of
-// prev_state_events, and one citing more than MaxStateDAGPrevEvents prev events or prev state events.
-// Events of other room versions, or of a version not known yet, pass.
+// CheckStateDAGFormat refuses a state DAG event (MSC4242) parsed with auth_events, which would be
+// taken for its calculated ones, without a prev_state_events list, or citing too many events.
 func (ev *Event) CheckStateDAGFormat() error {
 	switch {
 	case !ev.StateDAGs():
@@ -566,9 +560,8 @@ func (ev *Event) DomainlessRoomID() id.RoomID {
 	return id.RoomID("!" + ev.ID[1:])
 }
 
-// AuthDependencyIDs are the events authorizing the event depends on, which staging and ordering
-// follow: its auth events, or in a state DAG room its prev state events, preceded by the create
-// event that it cites implicitly in a room with a domainless room ID.
+// AuthDependencyIDs are the event's auth events, or prev state events in a state DAG room, preceded
+// by the create event that it cites implicitly in a room with a domainless room ID.
 func (ev *Event) AuthDependencyIDs() []id.EventID {
 	if ev.StateDAGs() {
 		return ev.withImplicitCreate(ev.PrevStateEventIDs)
@@ -576,8 +569,7 @@ func (ev *Event) AuthDependencyIDs() []id.EventID {
 	return ev.AuthEventIDsWithCreate()
 }
 
-// AuthEventIDsWithCreate are the event's auth events, preceded by the create event that it cites
-// implicitly in a room with a domainless room ID: where its auth chain starts.
+// AuthEventIDsWithCreate are where the event's auth chain starts, whatever the room version
 func (ev *Event) AuthEventIDsWithCreate() []id.EventID {
 	return ev.withImplicitCreate(ev.AuthEventIDs)
 }
@@ -595,8 +587,7 @@ func (ev *Event) HasStateIn(roomID id.RoomID) bool {
 	return ev != nil && !ev.Outlier && ev.RoomID == roomID && !ev.AfterState.IsZero()
 }
 
-// ResetOutcome clears what authorizing the event decided: its rejection, soft failure and state, and
-// whether it awaits publication.
+// ResetOutcome clears the event's rejection, soft failure, state and pending publication.
 func (ev *Event) ResetOutcome() {
 	ev.Rejected, ev.SoftFailed, ev.Unpublished = false, false, false
 	ev.BeforeState, ev.AfterState = StateHash{}, StateHash{}

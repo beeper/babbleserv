@@ -26,8 +26,7 @@ type serverKeysError struct {
 	err        error
 }
 
-// KeyStore caches servers' signing keys, fetching each server's at most once at a time. A fetch
-// holds up only the callers needing that server's keys.
+// KeyStore fetches each server's keys once at a time, holding up only the callers needing them
 type KeyStore struct {
 	fclient  fclient.FederationClient
 	lock     sync.Mutex
@@ -60,8 +59,7 @@ func (k *KeyStore) GetServerKeys(ctx context.Context, serverName string) (server
 	return keys, err
 }
 
-// getServerKeys returns the server's cached keys, else waits for a fetch of them, starting one unless
-// another caller has. The fetch carries on should the caller give up, for the others waiting on it.
+// The fetch carries on should the caller give up, for the others waiting on it
 func (k *KeyStore) getServerKeys(ctx context.Context, serverName string) (serverKeys, bool, error) {
 	k.lock.Lock()
 	if cached, found := k.cache[serverName]; found && cached.validUntil.After(time.Now()) {
@@ -166,8 +164,8 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 	return errors.Join(errs...)
 }
 
-// VerifyJSONs verifies each request's signature, failing whole only once ctx ends: a caller giving up
-// waiting for a server's keys says nothing of what the server signed
+// VerifyJSONs fails whole only once ctx ends: a caller giving up waiting for a server's keys says
+// nothing of what the server signed
 func (k *KeyStore) VerifyJSONs(ctx context.Context, requests []gomatrixserverlib.VerifyJSONRequest) ([]gomatrixserverlib.VerifyJSONResult, error) {
 	results := make([]gomatrixserverlib.VerifyJSONResult, len(requests))
 	for i, request := range requests {

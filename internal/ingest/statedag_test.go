@@ -55,8 +55,7 @@ func TestStateDAGWorksRunJoinsOldestFirst(t *testing.T) {
 		"PDUs citing a pending join, or one citing it, go after the joins, in topological order")
 }
 
-// The tips of a served state DAG are its events none of its events cites: the state extremities the
-// resident has, which the join may not cite
+// Tips are the served events none cites, the resident's state extremities
 func TestStateDAGJoinTips(t *testing.T) {
 	w := &stateDAGJoin{served: make(map[id.EventID]bool)}
 	for _, ev := range []*types.Event{
@@ -72,7 +71,6 @@ func TestStateDAGJoinTips(t *testing.T) {
 	assert.Equal(t, []id.EventID{"$tipA", "$tipB"}, w.tips(), "sorted, an event served twice counted once")
 }
 
-// stateDAGResponse is a send_join response with a state DAG of n events, between other members
 func stateDAGResponse(n int) string {
 	events := make([]string, n)
 	for i := range n {
@@ -140,8 +138,7 @@ func TestDecodeStateDAGFailures(t *testing.T) {
 	assert.Equal(t, stop, err, "an error handling a chunk ends the decoding with it")
 }
 
-// A send_join response's state DAG is bounded in bytes as well as events, so that a server cannot
-// serve endless junk within the count
+// So that a server cannot serve endless junk within the event count
 func TestStateDAGJoinBoundsTheBytesServed(t *testing.T) {
 	var cfg config.BabbleConfig
 	cfg.Rooms.Ingest.MaxJoinEvents = 2

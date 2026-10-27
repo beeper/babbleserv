@@ -32,9 +32,8 @@ func makeMembershipContent(membership event.Membership, reason string) map[strin
 	return content
 }
 
-// getOtherServers returns the servers asked to join or knock on a room this server is not in, as
-// Synapse asks them: those the request names with ?via, or ?server_name which it replaced in spec
-// 1.12, those the room alias lookup gave, and the room ID's domain, unless domainless as in v12 rooms
+// As Synapse does: ?via, ?server_name which via replaced in spec 1.12, the alias lookup's servers,
+// then the room ID's domain, which v12 room IDs lack
 func getOtherServers(r *http.Request, roomID id.RoomID, aliasServers []string) []string {
 	query := r.URL.Query()
 	otherServers := slices.Concat(query["via"], query["server_name"], aliasServers)
@@ -44,8 +43,6 @@ func getOtherServers(r *http.Request, roomID id.RoomID, aliasServers []string) [
 	return otherServers
 }
 
-// remoteMembershipServers returns the servers getOtherServers gives, then that of the user's inviter,
-// without repeats or this server
 func (c *ClientRoutes) remoteMembershipServers(r *http.Request, roomID id.RoomID, userID id.UserID, aliasServers []string) ([]string, error) {
 	otherServers := getOtherServers(r, roomID, aliasServers)
 	if mtup, ev, err := c.db.Rooms.GetCurrentMembershipAndEvent(r.Context(), userID, roomID); err != nil {
@@ -62,8 +59,7 @@ func (c *ClientRoutes) remoteMembershipServers(r *http.Request, roomID id.RoomID
 	return servers, nil
 }
 
-// getRoomIDFromRequest returns the room the request names, looking up a room alias over federation,
-// with the servers the lookup gave. An alias that cannot be looked up gives no room ID.
+// getRoomIDFromRequest also returns the servers a room alias lookup gave
 func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) (id.RoomID, []string) {
 	roomID := util.RoomIDFromRequestURLParam(r, param)
 	if strings.HasPrefix(roomID.String(), "!") {
@@ -98,19 +94,14 @@ type federatedMakeResp struct {
 var (
 	// A server answering make_* with a template this server cannot sign
 	errInvalidMembershipTemplate = errors.New("invalid membership event template")
-	// A server answering make_* for a room of a version this server does not join
-	errIncompatibleRoomVersion = errors.New("room version not supported")
-	// A make_* request that got no answer from the server
-	errMakeRequestFailed = errors.New("make request failed")
-	// A remote membership with no server to ask
-	errNoKnownServers = errors.New("no known servers")
+	errIncompatibleRoomVersion   = errors.New("room version not supported")
+	errMakeRequestFailed         = errors.New("make request failed")
+	errNoKnownServers            = errors.New("no known servers")
 )
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
-// none does, an errIncompatibleRoomVersion is returned if a server gave a room version this server
-// does not join, else an util.ErrRestrictedJoinUnsupported if a server gave a restricted join, else
-// the error of the last server whose request failed, or else an errInvalidMembershipTemplate, or
-// errNoKnownServers without servers.
+// none does, an unsupported room version or restricted join is reported ahead of a failed request,
+// then an invalid template.
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
 	roomID id.RoomID,
@@ -166,7 +157,6 @@ func membershipTemplateEvent(
 	return util.MembershipTemplateEvent(userID, roomID, membership, resp.Event, resp.RoomVersion)
 }
 
-// joinedRoomVersions are the room versions this server joins rooms of, which a make_knock offers
 func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
 	var versions []gomatrixserverlib.RoomVersion
 	for version := range gomatrixserverlib.RoomVersions() {
@@ -178,9 +168,8 @@ func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
 	return versions
 }
 
-// As Synapse does, a server refusing to give a template is passed on, with the room version of an
-// incompatible one, and a server failing to give a usable one is a bad gateway. A restricted join to
-// a state DAG room is refused.
+// As Synapse does, a server's refusal is passed on, with the room version of an incompatible one, and
+// a server failing to give a usable template is a bad gateway
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
 	var httpErr gomatrix.HTTPError
 	if errors.As(err, &httpErr) {

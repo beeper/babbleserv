@@ -23,8 +23,7 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// The invite room state, stripped state or with MSC4311 whole events, is not read, so it is left
-// unparsed: a stripped create event is no PDU to check
+// invite_room_state is unread, so left unparsed: a stripped create event is no PDU to check
 type inviteRequest struct {
 	Event       *types.Event      `json:"event"`
 	InviteState []json.RawMessage `json:"invite_room_state"`
@@ -120,10 +119,9 @@ func (f *FederationRoutes) SendJoin(w http.ResponseWriter, r *http.Request) {
 	release := func() {}
 	defer func() { release() }()
 	f.sendMembershipEventFromOtherServer(w, r, event.MembershipJoin, membershipResponse{
-		// A state DAG too large to serve with the join refuses the join before it is sent, rather
-		// than leave the joiner joined here alone. A join stored already counts in it, so is answered
-		// again as the first was. A server served as many state DAGs as it may at once waits for
-		// one to end before its join is sent, holding no transaction.
+		// Refuse a state DAG too large to serve before the join is sent, rather than leave the joiner
+		// joined here alone; a join stored already is answered again as the first was. An origin at
+		// its limit of served state DAGs waits here, holding no transaction.
 		beforeSend: func(room *types.Room, ev *types.Event) error {
 			if !util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
 				return nil
@@ -159,19 +157,16 @@ func (f *FederationRoutes) SendJoin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// stateDAGJoinResponse is the send_join response of a state DAG room (MSC4242), whose state DAG
-// replaces the state before the join, its auth chain and the servers in the room:
-// {origin, event, state_dag}. It is written as the state DAG is read, a page a transaction, as a large
-// room's is far more than one transaction reads or a response should hold whole.
+// stateDAGJoinResponse is MSC4242's send_join response, {origin, event, state_dag}, streamed a page a
+// transaction as a large room's state DAG is far more than one transaction reads.
 type stateDAGJoinResponse struct {
 	f    *FederationRoutes
 	room *types.Room
 	ev   *types.Event
 }
 
-// write streams the response. Should reading the state DAG fail part way, or the joining server stop
-// reading it for stateDAGWriteTimeout, the body is left unfinished, so the joining server takes it
-// for a failed request and sends the join again.
+// write leaves the body unfinished should reading fail part way or the joiner stop reading for
+// stateDAGWriteTimeout, so the joiner sees a failed request and sends the join again
 func (resp stateDAGJoinResponse) write(w http.ResponseWriter, r *http.Request) {
 	log := hlog.FromRequest(r)
 	head, err := json.Marshal(struct {
@@ -242,8 +237,6 @@ func (f *FederationRoutes) SendKnock(w http.ResponseWriter, r *http.Request) {
 
 var errTooManyStateDAGJoins = errors.New("the server has as many state DAGs of joins served and waiting as it may")
 
-// Most time a write of a send_join response's state DAG may take, so that a joining server no longer
-// reading it ends the response, and the bytes buffered between writes
 const (
 	stateDAGWriteTimeout = 30 * time.Second
 	stateDAGWriteBuffer  = 64 << 10
@@ -261,8 +254,7 @@ func (d deadlineWriter) Write(p []byte) (int, error) {
 	return d.w.Write(p)
 }
 
-// connWriter is the writer of the response's connection, which the access log's writer hides from
-// http.ResponseController
+// connWriter unwraps the access log's writer, which hides the connection from http.ResponseController
 func connWriter(w http.ResponseWriter) http.ResponseWriter {
 	if counting, ok := w.(*requestlog.CountingResponseWriter); ok {
 		return counting.ResponseWriter
@@ -270,8 +262,8 @@ func connWriter(w http.ResponseWriter) http.ResponseWriter {
 	return w
 }
 
-// originLimiter bounds the requests of each origin served at once, as Synapse's rc_federation does:
-// more wait for a turn, in a queue of a bounded length past which they are refused
+// originLimiter bounds each origin's concurrent requests like Synapse's rc_federation, queueing a
+// bounded number more
 type originLimiter struct {
 	limit, queue int
 	mu           sync.Mutex
@@ -287,8 +279,6 @@ func newOriginLimiter(limit, queue int) *originLimiter {
 	return &originLimiter{limit: limit, queue: queue, origins: make(map[string]*originTurns)}
 }
 
-// acquire takes one of the origin's turns, returning its release, waiting for one while ctx lasts,
-// unless the origin's queue is full, which fails with errTooManyStateDAGJoins
 func (l *originLimiter) acquire(ctx context.Context, origin string) (func(), error) {
 	l.mu.Lock()
 	o := l.origins[origin]
@@ -331,7 +321,7 @@ func (l *originLimiter) release(origin string, o *originTurns) func() {
 	})
 }
 
-// forgetIdle drops the turns of an origin no request holds or waits for, under the lock
+// forgetIdle runs under the lock
 func (l *originLimiter) forgetIdle(origin string, o *originTurns) {
 	if len(o.turns) == 0 && o.waiting == 0 {
 		delete(l.origins, origin)

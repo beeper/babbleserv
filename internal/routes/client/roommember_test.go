@@ -23,7 +23,6 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// fakeWatch fires once its channel closes, with err
 type fakeWatch struct {
 	fire      chan struct{}
 	err       error
@@ -161,7 +160,6 @@ func TestKnocksOfferTheVersionsThisServerJoins(t *testing.T) {
 	assert.Contains(t, c.joinedRoomVersions(), gomatrixserverlib.RoomVersionStateDAGs)
 }
 
-// Rejecting an invite or rescinding a knock without the room's servers cites the membership it ends
 func TestOutlierLeaveCitesTheHeldMembershipInStateDAGRooms(t *testing.T) {
 	now := time.UnixMilli(1700000000000)
 	partial := types.NewPartialEvent("!room:there", event.StateMember, new("@alice:here"), "@alice:here", map[string]any{"membership": "leave"})

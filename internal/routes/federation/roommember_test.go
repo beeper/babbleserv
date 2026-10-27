@@ -10,8 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Stripped state is no PDU, so a stripped create of a state DAG room, without prev_state_events,
-// does not fail the request
+// A stripped create of a state DAG room lacks prev_state_events, which must not fail the request
 func TestInviteRequestTakesStrippedState(t *testing.T) {
 	var req inviteRequest
 	require.NoError(t, json.Unmarshal([]byte(`{

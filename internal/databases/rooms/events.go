@@ -40,10 +40,8 @@ func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.Eve
 	return stored, nil
 }
 
-// GetPrevStateEventIDsInPlace returns those of the events that an event of a state DAG room can be
-// judged citing in prev_state_events: published in the room, with state contexts and not replayed by
-// its job without being published yet, or stored in another room, which the MSC's section 2 rejects
-// citing
+// GetPrevStateEventIDsInPlace returns the events a prev_state_events citation can be judged by:
+// published here with state contexts, or stored in another room, which MSC4242 section 2 rejects
 func (r *RoomsDatabase) GetPrevStateEventIDsInPlace(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
 	withState := make(map[id.EventID]struct{})
 	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
@@ -202,7 +200,6 @@ func (r *RoomsDatabase) txnGetStoredEventIDs(txn fdb.ReadTransaction, eventIDs [
 	return stored, nil
 }
 
-// txnAnyHasState reports whether any of the events has state in the room, reading them normally
 func (r *RoomsDatabase) txnAnyHasState(ctx context.Context, txn fdb.ReadTransaction, roomID id.RoomID, eventIDs []id.EventID) (bool, error) {
 	eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
 	eventsProvider.WillGet(eventIDs...)

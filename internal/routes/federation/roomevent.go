@@ -17,7 +17,6 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// The /event response, the event as a transaction's only PDU
 type respGetEvent struct {
 	Origin          string         `json:"origin"`
 	OriginTimestamp int64          `json:"origin_server_ts"`
@@ -26,8 +25,8 @@ type respGetEvent struct {
 
 // https://spec.matrix.org/v1.10/server-server-api/#get_matrixfederationv1eventeventid
 //
-// Rejected events are served, as Synapse serves them: a server fetching one a state DAG event cites
-// rejects that event itself.
+// Rejected events are served, as Synapse does: a server fetching one a state DAG event cites rejects
+// it itself.
 func (f *FederationRoutes) GetEvent(w http.ResponseWriter, r *http.Request) {
 	eventID := util.EventIDFromRequestURLParam(r, "eventID")
 	ev, err := f.db.Rooms.GetEvent(r.Context(), eventID)
@@ -67,8 +66,7 @@ func (f *FederationRoutes) GetEventAuth(w http.ResponseWriter, r *http.Request) 
 	}{authChain})
 }
 
-// The most bytes of events a state DAG walk answers with, at most ingest.MaxStateDAGMissingEvents of
-// them, which its requester walks further from as it does from any it did not have
+// Past this a state DAG walk answers with fewer events, which the requester walks on from
 const maxStateDAGMissingEventsBytes = 8 << 20
 
 // https://spec.matrix.org/v1.10/server-server-api/#post_matrixfederationv1get_missing_eventsroomid
@@ -161,8 +159,6 @@ func (f *FederationRoutes) GetMissingEvents(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// getMissingStateDAGEvents walks a state DAG room's state DAG from the latest events, as MSC4242 has
-// get_missing_events do with its flag, see rooms.GetMissingStateDAGEvents
 func (f *FederationRoutes) getMissingStateDAGEvents(w http.ResponseWriter, r *http.Request, roomID id.RoomID, req ingest.ReqGetMissingEvents) {
 	if len(req.EarliestEvents) > ingest.MaxStateDAGRequestIDs || len(req.LatestEvents) > ingest.MaxStateDAGRequestIDs {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf(

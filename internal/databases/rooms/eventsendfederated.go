@@ -35,17 +35,13 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 	return err
 }
 
-// outlierChecks are the checks applied when storing an outlier membership another server sent, so
-// that a job started or a membership changed meanwhile conflicts with the write
+// outlierChecks are read in the write, so a job started or a membership changed meanwhile conflicts
 type outlierChecks struct {
-	// Fail with ErrRoomIngesting while the room has an ingest job
 	refuseWhileIngesting bool
-	// Store a leave only should it end the membership its target holds, see endsHeldMembership
-	endsHeld bool
+	endsHeld             bool
 }
 
-// sendOutlierMembership stores an outlier membership as SendFederatedOutlierMembershipEvent does,
-// unless the checks refuse it, when it returns false
+// sendOutlierMembership returns false when the checks refuse the event
 func (r *RoomsDatabase) sendOutlierMembership(ctx context.Context, ev *types.Event, checks outlierChecks) (bool, error) {
 	if ev.Type != event.StateMember {
 		panic("outlier event is not a member event")
@@ -148,11 +144,10 @@ type GivenStates struct {
 }
 
 type SendFederatedEventsOptions struct {
-	// Fail with ErrRoomIngesting rather than send while the room has an ingest job, which publishes
-	// the room's events while it runs. The publish reads the job's record, so a job started meanwhile
-	// conflicts with it.
+	// Fail with ErrRoomIngesting while the room has an ingest job, which publishes the room's events
+	// itself. The publish reads the job's record, so a job started meanwhile conflicts.
 	RefuseWhileIngesting bool
-	// The events that are targets of the room's ingest job, which the publish storing them clears
+	// Ingest job targets, cleared by the publish that stores them
 	Targets map[id.EventID]types.IngestTargetKind
 }
 
@@ -161,8 +156,7 @@ type SendFederatedEventsOptions struct {
 //
 // Every event fetched from other servers must be in evs or given: an event that cannot be evaluated
 // is dropped with an error wrapping ErrEventDropped. An event with a given before-state takes it
-// instead of the state after its prev events. A local user's join to a room this server is not in
-// is a RemoteJoin instead.
+// instead of the state after its prev events. Remote joins go through RemoteJoin instead.
 func (r *RoomsDatabase) SendFederatedEvents(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -207,9 +201,8 @@ func (r *RoomsDatabase) SendFederatedEvents(
 }
 
 // sendOutlierMemberships stores those of a batch's events for a room this server is not in that are
-// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom. If the
-// room now has an ingest job, started by a join in progress, every event becomes one of its targets
-// instead, and each outlier's write re-checks for the job before storing.
+// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom.
+// A room with an ingest job, started by a join in progress, takes the events as targets instead.
 func (r *RoomsDatabase) sendOutlierMemberships(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -244,10 +237,9 @@ func (r *RoomsDatabase) sendOutlierMemberships(
 }
 
 // isOutlierMembership reports whether a member event of a room this server is not in may reach a
-// local user who sees it outside the room: an invite of a local user, or a leave of one, taken only
-// should it end the membership the user holds, see txnEndsHeldMembership. A remote user's membership
-// is never an outlier, as only local users have membership rows, so a remote invitee's rejection is
-// not taken: the invitee's server records it locally.
+// local user outside the room: their invite, or a leave, see endsHeldMembership.
+// A remote user's membership is never an outlier, as only local users have membership rows, so a
+// remote invitee's rejection is not taken: the invitee's server records it locally.
 func (r *RoomsDatabase) isOutlierMembership(roomID id.RoomID, ev *types.Event) bool {
 	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID || !r.isLocalUser(id.UserID(*ev.StateKey)) {
 		return false
@@ -259,8 +251,6 @@ func (r *RoomsDatabase) isOutlierMembership(roomID id.RoomID, ev *types.Event) b
 	return false
 }
 
-// txnEndsHeldMembership reports whether a leave of a local user ends the membership the user holds
-// in a room this server is not in, see endsHeldMembership
 func (r *RoomsDatabase) txnEndsHeldMembership(txn fdb.ReadTransaction, leave *types.Event) (bool, error) {
 	target := id.UserID(*leave.StateKey)
 	memberships, err := r.txnGetRoomUserMemberships(txn, leave.RoomID, []id.UserID{target})
@@ -275,11 +265,9 @@ func (r *RoomsDatabase) txnEndsHeldMembership(txn fdb.ReadTransaction, leave *ty
 	}
 }
 
-// endsHeldMembership reports whether another user's leave of a local user ends the invite the user
-// holds in a room this server is not in: the inviter rescinding it. In a state DAG room the leave
-// must cite the invite in prev_state_events, since without full state resolution that citation is
-// the only way to tell the leave supersedes it (MSC4242). A knock is never ended this way, as Synapse
-// takes no out-of-band knock rejection: the sender's power cannot be checked outside the room.
+// endsHeldMembership accepts only the inviter rescinding an invite. In a state DAG room the leave
+// must also cite the invite in prev_state_events, the only sign it supersedes it without state
+// resolution (MSC4242). Knocks are never ended, as in Synapse: the sender's power cannot be checked.
 func endsHeldMembership(leave, held *types.Event) bool {
 	if held.StateDAGs() && !slices.Contains(leave.PrevStateEventIDs, held.ID) {
 		return false
@@ -412,11 +400,9 @@ type federatedPreparation struct {
 	givenBefore map[id.EventID]types.StateHash
 	dropped     map[id.EventID]struct{}
 	rejected    map[id.EventID]struct{}
-	// Batch events stored without state, whose headers staging wrote citing nothing
+	// Batch events stored without state, whose staged headers cite no auth events
 	stateless map[id.EventID]struct{}
 	batch     map[id.EventID]struct{}
-	// A state DAG room (MSC4242), whose events cite no auth events and take the state after their
-	// prev state events
 	stateDAGs bool
 }
 
@@ -426,8 +412,8 @@ func (p *federatedPreparation) newContextResolver() *eventsendutil.Resolver {
 
 // txnPrepareFederated prepares an attempt's copies of federated events. Events are authorized
 // against their own auth events, step 4, the state before them, step 5, and the room's current
-// state, step 6. A state DAG room's events cite no auth events, so they skip step 4, and only its
-// messages are held to step 6.
+// state, step 6.
+// A state DAG room's events cite no auth events, so skip step 4, and only its messages face step 6.
 func (s *federatedEventSender) txnPrepareFederated(
 	ctx context.Context,
 	txn fdb.ReadTransaction,
@@ -523,15 +509,13 @@ func (s *federatedEventSender) txnPrepareFederated(
 		} else if storedEv, err := storedEvents.Get(ev.ID); err != nil {
 			return nil, err
 		} else if stateDAGs && storedEv != nil && !storedEv.HasStateIn(s.roomID) {
-			// Staged without state by a join or gap fill that could not replay it, so evaluated as
-			// new, as long as nothing gives it state meanwhile
+			// Staged without state by a join or gap fill, so evaluated as new unless given state meanwhile
 			plan.guard.stateless = append(plan.guard.stateless, ev.ID)
 			p.stateless[ev.ID] = struct{}{}
 		} else {
 			if storedEv != nil {
 				ev.CopyOutcome(storedEv)
-				// Calculated in a state DAG room, so not given with the event, and resolutions read
-				// them from this copy
+				// Calculated in a state DAG room rather than sent, and resolutions read them from here
 				ev.AuthEventIDs = storedEv.AuthEventIDs
 				if storedEv.Unpublished {
 					// The replay set its prev_content, which a copy read before the replay lacks
@@ -539,8 +523,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 				}
 			}
 			if ev.Unpublished {
-				// Replayed by the room's ingest job, which publishes it now with the state the replay
-				// gave it, see txnStoreEvents
+				// Replayed by the room's ingest job, published now with the replay's state, see txnStoreEvents
 				ev.RoomVersion = room.Version
 				continue
 			}
@@ -559,8 +542,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 		}
 		ev.RoomVersion = room.Version
 		if stateDAGs {
-			// Calculated in step 5 from the state before the event, replacing any a local event was
-			// prepared with
+			// Calculated in step 5, replacing any a local event was prepared with
 			ev.AuthEventIDs = nil
 			continue
 		}
@@ -618,8 +600,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 		} else if ev.IsDuplicate {
 			plan.evs = append(plan.evs, ev)
 		} else if ev.Unpublished {
-			// Not evaluated, but held to the invariant as evaluated events are: send_join, send_leave
-			// and send_knock take a replayed event with no fast-path check
+			// Not evaluated, but still checked, as send_join, send_leave and send_knock skip the fast-path check
 			if unpublished, err := p.citedUnpublished(ev); err != nil {
 				return nil, err
 			} else if unpublished != "" {
@@ -649,13 +630,12 @@ func (s *federatedEventSender) txnPrepareFederated(
 	// Step 6: Passes authorization rules based on the current state of the room, otherwise it is
 	// “soft failed”. Pending extremities start from the room's stored extremities, none for a join in
 	// join mode, and advance as events are accepted. Current state is the state after them, resolved
-	// when there are several. In a state DAG room it is the state after the pending state
-	// extremities instead, which only accepted state events advance.
+	// when there are several.
+	// A state DAG room's current state follows its state extremities, which only state events advance.
 	pendingExtremities := extremities
 	current := stateSteps{current: room.CurrentState}
-	// A run of events the room's job replayed is older state that stays out of the room's
-	// extremities and timeline. It joins the state extremities, and moves current state once, at its
-	// last event, ahead of the next event, which is authorized against it.
+	// Events the ingest job replayed are older state kept out of the extremities and timeline. A run
+	// of them joins the state extremities and moves current state once, before the next event.
 	var replayed *types.Event
 	stepReplayed := func() (*eventsendutil.ResolutionRequest, error) {
 		if replayed == nil {
@@ -763,9 +743,8 @@ func (s *federatedEventSender) txnPrepareFederated(
 }
 
 // evaluate assigns an event its state and authorizes it against the state before it, step 5.
-// Returns false for an event dropped from the batch. In a state DAG room the MSC's section 2 comes
-// first, then the state before an event is the state after its prev state events, which must all
-// have state here, and its auth events are calculated from that state.
+// Returns false for an event dropped from the batch.
+// A state DAG event takes the state after its prev state events, and auth events calculated from it.
 func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.ResolutionRequest, error) {
 	log := zerolog.Ctx(p.ctx).With().
 		Stringer("event_id", ev.ID).
@@ -783,9 +762,9 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 	if !given {
 		// Resolving only a subset of the prev events would persist incomplete state. Leave the
 		// event unstored so it can be evaluated again when state at every prev event is available,
-		// from the sending server for prev events without state here. In a state DAG room /send
-		// passes only PDUs whose prev state events have state here or are earlier in the batch, so
-		// this drops a membership sent to send_ endpoints citing others, never fetching state.
+		// from the sending server for prev events without state here.
+		// A state DAG room never fetches state: /send passes only PDUs whose prev state events are
+		// known or earlier in the batch, so this drops only send_ endpoint memberships citing others.
 		prevs, unavailable := ev.PrevEventIDs, ErrPrevEventsUnavailable
 		if p.stateDAGs {
 			prevs, unavailable = ev.PrevStateEventIDs, ErrPrevStateEventsUnavailable
@@ -886,9 +865,8 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 	return true, nil, nil
 }
 
-// citedUnpublished returns a prev state event of a state DAG event that the room's ingest job replayed
-// but did not publish yet, unless the batch publishes it: no published event cites one, as its
-// publish adds it to the state extremities, see types.Event.Unpublished
+// citedUnpublished returns a cited prev state event the ingest job replayed but has not published,
+// or a dropped batch one: no published event may cite either, see types.Event.Unpublished
 func (p *federatedPreparation) citedUnpublished(ev *types.Event) (id.EventID, error) {
 	for _, prevID := range ev.PrevStateEventIDs {
 		if _, found := p.batch[prevID]; found {
@@ -905,12 +883,9 @@ func (p *federatedPreparation) citedUnpublished(ev *types.Event) (id.EventID, er
 	return "", nil
 }
 
-// authorizePrevStateEvents applies the MSC's section 2 to a state DAG event, so that one citing a
-// rejected event, a message or another room's event is rejected rather than dropped, an event ID
-// fixing its room, without working out the state before it: the event takes known empty state, as
-// nothing reads it, events citing it being rejected in turn. Batch events carry the outcome this
-// attempt gave them, stored events their stored one. Returns false for an event dropped, citing an
-// event that is not stored.
+// authorizePrevStateEvents applies MSC4242's section 2: an event citing a rejected event, a message
+// or another room's event is rejected rather than dropped, since its ID fixes what it cites, and
+// takes empty state, as nothing reads it. Returns false for an event citing one not stored.
 func (p *federatedPreparation) authorizePrevStateEvents(ev *types.Event) (bool, error) {
 	authErr, err := util.AuthorizePrevStateEvents(ev, p.plan.eventsProvider.Get)
 	if errors.Is(err, util.ErrPrevStateEventMissing) {
@@ -1358,8 +1333,7 @@ func (s *federatedEventSender) txnReadoptedEvents(
 
 // buildJoinBoundary is the artifact job building the state before a remote join as a boundary over
 // the room's current state, and diffing the current state against it for the join's publish. It
-// stages what it builds. In a state DAG room the state before the join is the state after its prev
-// state events instead, see stateDAGJoinBefore.
+// stages what it builds.
 func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 	join := s.join
 	room, err := s.r.GetRoom(ctx, s.roomID)

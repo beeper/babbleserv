@@ -421,8 +421,7 @@ func (fs *FederationSender) syncTransientForServer(
 				Msg("Sending remote presence update")
 			continue
 		case types.BabbleservRemoteOutlierEvent:
-			// Sent as stored: parsed without its room version, the event would be written back in
-			// another version's format
+			// Sent as stored: parsed without its room version, it would be rewritten in another format
 			allPDUs = append(allPDUs, td.Content)
 			log.Debug().
 				Str("room_id", gjson.GetBytes(td.Content, "room_id").String()).

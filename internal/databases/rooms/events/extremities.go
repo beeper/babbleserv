@@ -51,8 +51,7 @@ func (e *EventsDirectory) TxnLookupCurrentRoomExtremEventIDs(
 // Room state extremities
 //
 
-// TxnSetRoomStateExtremEventID makes an accepted state event, published at version, a state
-// extremity in place of the prev state events it cites
+// TxnSetRoomStateExtremEventID makes an accepted state event an extremity in place of those it cites
 func (e *EventsDirectory) TxnSetRoomStateExtremEventID(
 	txn fdb.Transaction,
 	roomID id.RoomID,
@@ -66,8 +65,7 @@ func (e *EventsDirectory) TxnSetRoomStateExtremEventID(
 	txn.SetVersionstampedValue(e.keyForRoomStateExtrem(roomID, eventID), types.MustVersionstampToBytes(version))
 }
 
-// TxnResetRoomStateExtremEventIDs replaces the room's state extremities, as a remote join's publish
-// does, with the events given, each at version
+// TxnResetRoomStateExtremEventIDs replaces the room's state extremities, as a remote join's publish does
 func (e *EventsDirectory) TxnResetRoomStateExtremEventIDs(txn fdb.Transaction, roomID id.RoomID, eventIDs []id.EventID, version tuple.Versionstamp) {
 	txn.ClearRange(e.roomStateExtremIDs.Sub(roomID.String()))
 	for _, eventID := range eventIDs {
@@ -75,8 +73,7 @@ func (e *EventsDirectory) TxnResetRoomStateExtremEventIDs(txn fdb.Transaction, r
 	}
 }
 
-// TxnLookupCurrentRoomStateExtremEventIDs returns the room's state extremities in the order they
-// were published
+// TxnLookupCurrentRoomStateExtremEventIDs returns the extremities in publish order
 func (e *EventsDirectory) TxnLookupCurrentRoomStateExtremEventIDs(txn fdb.ReadTransaction, roomID id.RoomID) []id.EventID {
 	iter := txn.GetRange(
 		e.roomStateExtremIDs.Sub(roomID.String()),
@@ -138,15 +135,12 @@ func (e *EventsDirectory) keyForRoomStateDAG(roomID id.RoomID, version tuple.Ver
 	return key
 }
 
-// TxnAddRoomStateDAGEvent adds an accepted state event, published or replayed at version, to the
-// room's state DAG
 func (e *EventsDirectory) TxnAddRoomStateDAGEvent(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID, version tuple.Versionstamp) {
 	txn.SetVersionstampedKey(e.keyForRoomStateDAG(roomID, version), []byte(eventID))
 }
 
-// TxnRoomStateDAGPage returns at most limit of the room's state DAG events, in the order they were
-// added, from after the key given, the start when nil, with the key to read on from, nil past the
-// last
+// TxnRoomStateDAGPage reads in the order events were added, returning the key to read on from, nil
+// past the last
 func (e *EventsDirectory) TxnRoomStateDAGPage(txn fdb.ReadTransaction, roomID id.RoomID, after fdb.Key, limit int) ([]id.EventID, fdb.Key, error) {
 	begin, end := e.roomStateDAG.Sub(roomID.String()).FDBRangeKeys()
 	if after != nil {
@@ -169,8 +163,7 @@ func (e *EventsDirectory) TxnRoomStateDAGPage(txn fdb.ReadTransaction, roomID id
 	return eventIDs, kvs[len(kvs)-1].Key, nil
 }
 
-// TxnRoomStateDAGLonger reports whether the room's state DAG has more than limit events, resolving
-// the key limit+1 rows in on the storage servers rather than reading them
+// TxnRoomStateDAGLonger resolves the key limit+1 rows in on the storage servers rather than reading them
 func (e *EventsDirectory) TxnRoomStateDAGLonger(txn fdb.ReadTransaction, roomID id.RoomID, limit int) (bool, error) {
 	begin, end := e.roomStateDAG.Sub(roomID.String()).FDBRangeKeys()
 	key, err := txn.GetKey(fdb.KeySelector{Key: begin, Offset: limit + 1}).Get()

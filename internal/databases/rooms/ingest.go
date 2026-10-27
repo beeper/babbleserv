@@ -17,15 +17,12 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// ErrRoomIngesting refuses a send that would publish past a room's ingest job, which publishes the
-// room's PDUs while it runs
+// ErrRoomIngesting refuses a send that would publish past the room's ingest job
 var ErrRoomIngesting = errors.New("the room has an ingest job")
 
-// ErrIngestTargetGone fails the publish of a join whose target another runner of the room's job
-// failed or replaced meanwhile
+// ErrIngestTargetGone means another runner failed or replaced the join's target meanwhile
 var ErrIngestTargetGone = errors.New("the join's ingest target is gone")
 
-// Targets read per transaction
 const ingestTargetsPage = 500
 
 func (r *RoomsDatabase) keyForIngestJob(roomID id.RoomID) fdb.Key {
@@ -40,7 +37,6 @@ func (r *RoomsDatabase) keyForIngestJoin(roomID id.RoomID, userID id.UserID) fdb
 	return r.ingestJoins.Pack(tuple.Tuple{roomID.String(), userID.String()})
 }
 
-// The counters of a room's PDU queue
 const (
 	ingestQueuePDUs  = "pdus"
 	ingestQueueBytes = "bytes"
@@ -74,8 +70,7 @@ func (r *RoomsDatabase) txnGetIngestJoin(txn fdb.ReadTransaction, roomID id.Room
 	return types.NewIngestJoinFromBytes(b)
 }
 
-// txnEnsureIngestJob writes the room's job unless it has one. Every target write calls it, so no
-// target is left without a job to publish it.
+// Every target write calls this, so no target is left without a job to publish it
 func (r *RoomsDatabase) txnEnsureIngestJob(txn fdb.Transaction, roomID id.RoomID, roomVersion string) error {
 	job, err := r.txnGetIngestJob(txn, roomID)
 	if err != nil || job != nil {
@@ -89,8 +84,7 @@ func (r *RoomsDatabase) txnSetIngestTarget(txn fdb.Transaction, target *types.In
 	txn.Set(r.keyForIngestTarget(target.Event.RoomID, target.Event.ID), target.ToMsgpack())
 }
 
-// txnAddQueued adds to the room's queue counters, as atomic adds so that target writes do not
-// conflict over them
+// Atomic adds, so target writes do not conflict over the counters
 func (r *RoomsDatabase) txnAddQueued(txn fdb.Transaction, roomID id.RoomID, delta types.IngestQueue) {
 	if delta.PDUs != 0 {
 		txn.Add(r.keyForIngestQueue(roomID, ingestQueuePDUs), counterDelta(delta.PDUs))
@@ -139,9 +133,7 @@ func joinUser(target *types.IngestTarget) id.UserID {
 	return id.UserID(*target.Event.StateKey)
 }
 
-// EnqueueIngestJoin writes a local user's join as a target of the room's job, with the user's iju
-// naming it. When the user has a join pending already, nothing is written and that join is returned
-// to wait on instead.
+// EnqueueIngestJoin returns the user's already pending join to wait on instead, if there is one
 func (r *RoomsDatabase) EnqueueIngestJoin(ctx context.Context, joinEv *types.Event, servers []string) (id.EventID, error) {
 	if joinEv.Type != event.StateMember || joinEv.StateKey == nil || joinEv.Membership() != event.MembershipJoin {
 		return "", fmt.Errorf("event %s is not a join", joinEv.ID)
@@ -164,7 +156,6 @@ func (r *RoomsDatabase) EnqueueIngestJoin(ctx context.Context, joinEv *types.Eve
 	})
 }
 
-// txnPendingIngestJoin returns the join target the user's iju names, if it has not failed
 func (r *RoomsDatabase) txnPendingIngestJoin(txn fdb.ReadTransaction, roomID id.RoomID, userID id.UserID) (id.EventID, error) {
 	join, err := r.txnGetIngestJoin(txn, roomID, userID)
 	if err != nil || join == nil || join.Failure != nil {
@@ -188,8 +179,7 @@ func (r *RoomsDatabase) GetIngestJoin(ctx context.Context, roomID id.RoomID, use
 	})
 }
 
-// WatchIngestJoin returns the user's join to the room through its job, nil once published, and a
-// watch firing when that changes
+// WatchIngestJoin returns the user's join, nil once published, with a watch firing when that changes
 func (r *RoomsDatabase) WatchIngestJoin(ctx context.Context, roomID id.RoomID, userID id.UserID) (*types.IngestJoin, fdb.FutureNil, error) {
 	type watched struct {
 		join  *types.IngestJoin
@@ -205,8 +195,6 @@ func (r *RoomsDatabase) WatchIngestJoin(ctx context.Context, roomID id.RoomID, u
 	return res.join, res.watch, err
 }
 
-// EnqueueIngestPDUs writes PDUs from origin as targets of the room's job, other than those stored
-// or targets already, and counts them in the room's queue
 func (r *RoomsDatabase) EnqueueIngestPDUs(ctx context.Context, roomID id.RoomID, origin string, evs []*types.Event) error {
 	now := time.Now().UnixMilli()
 	targets := make([]*types.IngestTarget, len(evs))
@@ -222,8 +210,6 @@ func (r *RoomsDatabase) EnqueueIngestPDUs(ctx context.Context, roomID id.RoomID,
 	return r.enqueueIngestPDUs(ctx, roomID, targets)
 }
 
-// EnqueuePulledIngestPDUs writes PDU targets the room's job pulled, as EnqueueIngestPDUs writes those
-// sent here
 func (r *RoomsDatabase) EnqueuePulledIngestPDUs(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
 	for _, target := range targets {
 		if target.Kind != types.IngestTargetPDU || !target.Pulled {
@@ -233,11 +219,9 @@ func (r *RoomsDatabase) EnqueuePulledIngestPDUs(ctx context.Context, roomID id.R
 	return r.enqueueIngestPDUs(ctx, roomID, targets)
 }
 
-// Max bytes of events an enqueue writes in a transaction, well within FoundationDB's 10 MB transaction limit
+// Per transaction, well within FoundationDB's 10 MB transaction limit
 const maxEnqueueBytes = 4 << 20
 
-// enqueueIngestPDUs writes the targets in transactions of at most maxEnqueueBytes, which a /send
-// transaction's PDUs fit in one of, while a gap fill may pull many more
 func (r *RoomsDatabase) enqueueIngestPDUs(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
 	for _, chunk := range chunkIngestTargets(targets, maxEnqueueBytes) {
 		if err := r.enqueueIngestPDUChunk(ctx, roomID, chunk); err != nil {
@@ -247,8 +231,7 @@ func (r *RoomsDatabase) enqueueIngestPDUs(ctx context.Context, roomID id.RoomID,
 	return nil
 }
 
-// chunkIngestTargets splits targets, in order, into chunks of at most maxBytes; a chunk's first
-// target may alone exceed that limit
+// A chunk's first target may alone exceed maxBytes
 func chunkIngestTargets(targets []*types.IngestTarget, maxBytes int) [][]*types.IngestTarget {
 	var chunks [][]*types.IngestTarget
 	size := 0
@@ -263,9 +246,8 @@ func chunkIngestTargets(targets []*types.IngestTarget, maxBytes int) [][]*types.
 	return chunks
 }
 
-// enqueueIngestPDUChunk writes the targets but for duplicates and those stored. In a state DAG room
-// an event stored is skipped only once published with state, as the federated pipeline publishes one
-// replayed but unpublished, or staged without state, as a new event.
+// In a state DAG room a stored event is skipped only once published with state: the federated
+// pipeline publishes one replayed but unpublished, or staged without state, as a new event.
 func (r *RoomsDatabase) enqueueIngestPDUChunk(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) error {
 	stateDAGs := targets[0].Event.StateDAGs()
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (types.Nil, error) {
@@ -338,13 +320,12 @@ func (r *RoomsDatabase) IngestJobRoomIDs(ctx context.Context, after id.RoomID, l
 	})
 }
 
-// FoundationDB's transaction_too_old: a read version older than the five seconds it keeps
+// FoundationDB's transaction_too_old: a read version past the five seconds it keeps
 const fdbTransactionTooOld = 1007
 
-// GetIngestTargets returns a room's job and its targets, or no job. The targets are read over
-// several transactions at the read version of the first, so that targets written together, as the
-// PDUs of a /send, are read all or none: a round seeing only some would fill the gaps of those
-// citing the others. Reads outlasting that version start again.
+// GetIngestTargets reads the targets over several transactions at the first one's read version, so
+// targets written together, as a /send's PDUs, are seen all or none; a round seeing only some would
+// fill the gaps of those citing the others. Reads outlasting that version start again.
 func (r *RoomsDatabase) GetIngestTargets(ctx context.Context, roomID id.RoomID) (*types.IngestJob, []*types.IngestTarget, error) {
 	job, err := r.GetIngestJob(ctx, roomID)
 	if err != nil || job == nil {
@@ -378,8 +359,7 @@ func (r *RoomsDatabase) readIngestTargets(ctx context.Context, roomID id.RoomID)
 	}
 }
 
-// readIngestTargetsPage reads a page of targets, the first page setting the read version the others
-// read at, without retrying them, as a retry would read at the same version
+// Pages after the first are not retried, as a retry would read at the same version
 func (r *RoomsDatabase) readIngestTargetsPage(ctx context.Context, version *int64, keys fdb.KeyRange) ([]*types.IngestTarget, error) {
 	if *version == 0 {
 		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.IngestTarget, error) {
@@ -421,7 +401,7 @@ func (r *RoomsDatabase) txnIngestTargetsPage(txn fdb.ReadTransaction, keys fdb.K
 	return page, nil
 }
 
-// UpdateIngestTarget changes a target as long as it exists, returning it as it was before, or nil
+// UpdateIngestTarget returns the target as it was before the update, or nil if it is gone
 func (r *RoomsDatabase) UpdateIngestTarget(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -440,9 +420,8 @@ func (r *RoomsDatabase) UpdateIngestTarget(
 	})
 }
 
-// FailIngestTarget removes a target that failed, recording a join's failure in its user's iju. It
-// writes only while the target exists, so a runner that lost the job cannot fail a join another
-// runner published.
+// FailIngestTarget records a join's failure in its user's iju, only while the target exists, so a
+// runner that lost the job cannot fail a join another runner published
 func (r *RoomsDatabase) FailIngestTarget(ctx context.Context, roomID id.RoomID, eventID id.EventID, failure *types.IngestFailure) (bool, error) {
 	return util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (bool, error) {
 		cleared, err := r.txnClearIngestTargets(txn, roomID, []id.EventID{eventID})
@@ -461,8 +440,7 @@ func (r *RoomsDatabase) FailIngestTarget(ctx context.Context, roomID id.RoomID, 
 	})
 }
 
-// ClearIngestTargets removes targets the job is done with that their publish did not remove, with
-// the iju of a join naming one
+// ClearIngestTargets also clears the iju of a join naming one of the targets
 func (r *RoomsDatabase) ClearIngestTargets(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) error {
 	_, err := util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (types.Nil, error) {
 		return nil, r.txnClearDoneTargets(txn, roomID, eventIDs)
@@ -470,9 +448,7 @@ func (r *RoomsDatabase) ClearIngestTargets(ctx context.Context, roomID id.RoomID
 	return err
 }
 
-// txnClearIngestTargets removes the targets that still exist, returning them, and takes the PDUs
-// among them out of the room's queue. The reads are normal ones, so two runners cannot both take the
-// same PDU out.
+// Normal reads, so two runners cannot both take the same PDU out of the queue
 func (r *RoomsDatabase) txnClearIngestTargets(txn fdb.Transaction, roomID id.RoomID, eventIDs []id.EventID) ([]*types.IngestTarget, error) {
 	eventIDs = slices.Compact(slices.Sorted(slices.Values(eventIDs)))
 	futures := make([]fdb.FutureByteSlice, len(eventIDs))
@@ -500,7 +476,6 @@ func (r *RoomsDatabase) txnClearIngestTargets(txn fdb.Transaction, roomID id.Roo
 	return cleared, nil
 }
 
-// txnClearDoneTargets removes targets the job is done with, with the iju of a join naming one
 func (r *RoomsDatabase) txnClearDoneTargets(txn fdb.Transaction, roomID id.RoomID, eventIDs []id.EventID) error {
 	cleared, err := r.txnClearIngestTargets(txn, roomID, eventIDs)
 	if err != nil {
@@ -533,10 +508,8 @@ func (r *RoomsDatabase) txnClearDoneTargets(txn fdb.Transaction, roomID id.RoomI
 	return nil
 }
 
-// txnClearPublishedTargets removes, in the transaction publishing them, the targets a publish is
-// done with: stored PDUs whatever their outcome, accepted joins. A join stored otherwise is left for
-// the job to fail or follow with a new join. A join target gone fails the publish with
-// ErrIngestTargetGone: another runner failed or replaced it, which iju records.
+// Clears stored PDUs whatever their outcome but joins only once accepted; a join stored otherwise is
+// left for the job to fail or follow with a new join.
 func (r *RoomsDatabase) txnClearPublishedTargets(
 	txn fdb.Transaction,
 	roomID id.RoomID,
@@ -563,8 +536,7 @@ func (r *RoomsDatabase) txnClearPublishedTargets(
 	return r.txnClearDoneTargets(txn, roomID, targetIDs(publishedTargets(evs, targets)))
 }
 
-// txnTakeIngestJoinTarget removes a join target, with its iju, in the transaction publishing the
-// local join standing in for it, failing with ErrIngestTargetGone once the target is gone
+// Runs in the transaction publishing the local join standing in for the target
 func (r *RoomsDatabase) txnTakeIngestJoinTarget(txn fdb.Transaction, roomID id.RoomID, eventID id.EventID) error {
 	if b, err := txn.Get(r.keyForIngestTarget(roomID, eventID)).Get(); err != nil {
 		return err
@@ -593,8 +565,7 @@ func publishedTargets(evs []*types.Event, targets map[id.EventID]types.IngestTar
 	return published
 }
 
-// ReplaceIngestJoin replaces a join target with a new join event of the same user, from a fresh
-// make_join, as long as the user's iju still names the old one
+// ReplaceIngestJoin swaps in a join from a fresh make_join while the user's iju still names the old one
 func (r *RoomsDatabase) ReplaceIngestJoin(ctx context.Context, old *types.IngestTarget, joinEv *types.Event, servers []string) (bool, error) {
 	userID := joinUser(old)
 	if joinEv.StateKey == nil || id.UserID(*joinEv.StateKey) != userID || joinEv.RoomID != old.Event.RoomID {
@@ -621,9 +592,8 @@ func (r *RoomsDatabase) ReplaceIngestJoin(ctx context.Context, old *types.Ingest
 	})
 }
 
-// FinishIngestJob deletes a room's job once it has no targets, with its queue's counters. It reads
-// the room's target range, so a target written meanwhile conflicts with the delete and the job
-// carries on.
+// FinishIngestJob reads the room's target range, so a target written meanwhile conflicts with the
+// delete and the job carries on
 func (r *RoomsDatabase) FinishIngestJob(ctx context.Context, roomID id.RoomID) (bool, error) {
 	return util.DoWriteTransaction(ctx, r.db, func(txn fdb.Transaction) (bool, error) {
 		kvs, err := txn.GetRange(r.ingestTargets.Sub(roomID.String()), fdb.RangeOptions{Limit: 1}).GetSliceWithError()
@@ -636,8 +606,7 @@ func (r *RoomsDatabase) FinishIngestJob(ctx context.Context, roomID id.RoomID) (
 	})
 }
 
-// txnCheckNoIngestJob fails with ErrRoomIngesting while the room has a job. A normal read, so a job
-// written meanwhile conflicts with the transaction.
+// A normal read, so a job written meanwhile conflicts with the transaction
 func (r *RoomsDatabase) txnCheckNoIngestJob(txn fdb.Transaction, roomID id.RoomID) error {
 	if b, err := txn.Get(r.keyForIngestJob(roomID)).Get(); err != nil {
 		return err

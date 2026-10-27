@@ -42,8 +42,7 @@ type sendGuard struct {
 	joined   bool
 	unstored []id.EventID
 	// Events stored without state, which the publish gives state as new events
-	stateless []id.EventID
-	// The room must have no ingest job, see SendFederatedEventsOptions.RefuseWhileIngesting
+	stateless   []id.EventID
 	noIngestJob bool
 }
 
@@ -54,8 +53,7 @@ type publishPlan struct {
 	preparedEvents
 	// Stored rejected events a remote join accepts, which its publish then un-rejects
 	readopted []*types.Event
-	// The remote join whose publish replaces every extremity, and in a state DAG room the state
-	// extremities it replaces them with, see stateDAGJoinTips
+	// The remote join whose publish replaces every extremity
 	resetExtremities      id.EventID
 	resetStateExtremities []id.EventID
 	// What else the publish writes: an alias, publication, a transaction ID or a lock refresh
@@ -92,8 +90,7 @@ type eventSender struct {
 	build   func(context.Context, preparationWork) error
 	after   func(context.Context, *SendEventsResult)
 	pause   func(context.Context, int) error
-	// Ends the send's attempts with errPhaseReached once a preparation's outcome satisfies it, before
-	// acting on it, so a job can run a send's preparatory work in phases
+	// Ends attempts with errPhaseReached once an outcome matches, so a job can run a send in phases
 	stopAt func(preparationOutcome) bool
 }
 
@@ -347,8 +344,6 @@ func (s *eventSender) txnNewStateBatch(
 	return s.r.state.NewBatch(s.roomID), authGraph
 }
 
-// newResolver resolves contexts in a preparation's transaction, leaving those over the inline
-// budgets to an artifact job
 func (s *eventSender) newResolver(txn fdb.ReadTransaction, p *preparedEvents, roomVersion string) *eventsendutil.Resolver {
 	return eventsendutil.NewResolver(txn, p.eventsProvider, p.authGraph, eventsendutil.ResolverOptions{
 		StateBatch:     p.stateBatch,

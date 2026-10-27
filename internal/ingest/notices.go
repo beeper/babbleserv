@@ -12,13 +12,11 @@ import (
 	"github.com/beeper/babbleserv/internal/types"
 )
 
-// BabbleBot's notices to a joining user. Their transaction IDs derive from the join event, so client
-// retries, other processes and overlapping runners send each once.
+// Deriving from the join event, client retries, other processes and overlapping runners send each
+// notice once
 func joinNoticeTxnID(eventID id.EventID) string  { return "join-pending/" + eventID.String() }
 func joinOutcomeTxnID(eventID id.EventID) string { return "join-outcome/" + eventID.String() }
 
-// noticeDelay is the time remaining until a join enqueued at enqueued has been pending for the
-// duration after, zero once that time has passed
 func noticeDelay(enqueued int64, after time.Duration, now time.Time) time.Duration {
 	return max(time.UnixMilli(enqueued).Add(after).Sub(now), 0)
 }
@@ -31,7 +29,6 @@ func (run *jobRun) setRoomName(name string) {
 	}
 }
 
-// roomDisplayName names the room by the name in the state before a join once fetched, else its ID
 func (run *jobRun) roomDisplayName() string {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -41,8 +38,6 @@ func (run *jobRun) roomDisplayName() string {
 	return run.roomID.String()
 }
 
-// scheduleJoinNotices has BabbleBot tell each joining user that their join is under way, once it has
-// been pending for JoinNoticeAfter
 func (run *jobRun) scheduleJoinNotices(targets []*types.IngestTarget) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -64,8 +59,6 @@ func (run *jobRun) sendJoinNotice(ctx context.Context, target *types.IngestTarge
 	))
 }
 
-// cancelNotice stops the notice of a join that is no longer this run's to follow up: replaced, or
-// done by another runner
 func (run *jobRun) cancelNotice(eventID id.EventID) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -90,8 +83,7 @@ func (run *jobRun) joinDone(ctx context.Context, target *types.IngestTarget, fai
 	run.notice(ctx, target, joinOutcomeTxnID(target.Event.ID), body)
 }
 
-// failureReason says why a join failed in a notice, by its error code, so no server's error text
-// reaches it
+// failureReason goes by error code so no server's error text reaches the notice
 func failureReason(failure *types.IngestFailure) string {
 	switch failure.ErrCode {
 	case mautrix.MForbidden.ErrCode:

@@ -47,7 +47,6 @@ func TestAdvanceStateExtremities(t *testing.T) {
 	}
 }
 
-// Events sent in a line advance the state extremities each cites, as the publish advances events/srx
 func TestStateExtremitiesAdvanceAlongABatch(t *testing.T) {
 	batch := []*types.Event{
 		stateDAGTestEvent("$create", true),
@@ -146,7 +145,6 @@ func TestOnlyMessagesSoftFailInStateDAGRooms(t *testing.T) {
 	assert.True(t, softFails(state), "every event soft fails in other room versions")
 }
 
-// stateDAG holds events with state, keyed by ID, each citing the prev state events listed for it
 func stateDAG(dag map[id.EventID][]id.EventID) map[id.EventID]*types.Event {
 	evs := make(map[id.EventID]*types.Event, len(dag))
 	for eventID, prevStateEventIDs := range dag {

@@ -219,8 +219,7 @@ func (cr *Resolver) resolveContexts(contexts []types.StateHash) (types.StateHash
 	return cr.ResolveContexts(contexts)
 }
 
-// checkContexts requests a job for more contexts than the resolver compares inline, as the current
-// state of a state DAG room resolves every state extremity
+// A state DAG room's current state resolves every state extremity, whose count alone may need a job
 func (cr *Resolver) checkContexts(contexts []types.StateHash) *ResolutionRequest {
 	if cr.maxContexts > 0 && len(contexts) > cr.maxContexts {
 		return &ResolutionRequest{Contexts: contexts}

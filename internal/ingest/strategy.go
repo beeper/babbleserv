@@ -16,13 +16,12 @@ import (
 
 var errUnsupportedRoomVersion = errors.New("this server cannot ingest events of the room version")
 
-// strategy is how a room version's jobs publish their targets. A round collects the room's targets
-// and the strategy groups them into units of work, run in order, each through its phases.
+// strategy groups a round's targets into units of work, run in order, each through its phases
 type strategy interface {
 	collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error)
 }
 
-// workKind is what a unit of work does, which bounds how many of its kind the process runs at once
+// workKind bounds how many units of work of the kind the process runs at once
 type workKind int
 
 const (
@@ -38,13 +37,12 @@ func pduWorkKind(gap bool) workKind {
 	return workConnected
 }
 
-// ingestWork publishes some of a room's targets: a join, or PDUs. A phase ending the work early, its
-// targets failed or replaced, returns errWorkDone.
+// A phase of an ingestWork ending it early, its targets failed or replaced, returns errWorkDone
 type ingestWork interface {
 	kind() workKind
-	// Phase A: fetch from other servers what the targets need, verify it and stage it
+	// Phase A: fetch, verify and stage what the targets need from other servers
 	fetch(ctx context.Context) error
-	// Phase B: give the staged events and the targets the state they need
+	// Phase B: give the staged events and the targets their state
 	build(ctx context.Context) error
 	// Phase C: publish the targets, each cleared by the transaction publishing it
 	publish(ctx context.Context) error
@@ -60,9 +58,7 @@ func strategyFor(roomVersion string) (strategy, error) {
 	return legacyStrategy{}, nil
 }
 
-// legacyStrategy runs jobs of rooms without state DAGs, room versions 1 to 12: each join on the
-// remote join path, oldest first, and the PDUs as federated sends in chunks, those citing only stored
-// events and each other apart from those with gaps to fill
+// legacyStrategy runs jobs of rooms without state DAGs, room versions 1 to 12
 type legacyStrategy struct{}
 
 func (legacyStrategy) collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error) {
@@ -80,15 +76,11 @@ func legacyWorkKinds(run *jobRun) workKinds {
 	}
 }
 
-// workKinds makes a room version's units of work of a round's targets: a join, or a chunk of PDUs,
-// connected or with gaps to fill
 type workKinds struct {
 	join func(*types.IngestTarget) ingestWork
 	pdus func(pdus []*types.IngestTarget, gap bool) ingestWork
 }
 
-// collectWorks groups a round's targets into units of work, see roundWorks, splitting the PDUs into
-// those connected and those with gaps while this server is in the room or no join is pending
 func collectWorks(ctx context.Context, run *jobRun, targets []*types.IngestTarget, kinds workKinds) ([]ingestWork, error) {
 	joins, pdus := splitTargets(targets)
 	joined := false
@@ -108,18 +100,15 @@ func collectWorks(ctx context.Context, run *jobRun, targets []*types.IngestTarge
 	return roundWorks(kinds, joins, connected, gaps, joined), nil
 }
 
-// Most PDUs, and their bytes, a federated send of a job's PDUs takes, as /send does
+// Per federated send of a job's PDUs, as /send takes
 const (
 	maxPDUChunk      = 50
 	maxPDUChunkBytes = 4 << 20
 )
 
-// roundWorks are the units of work publishing a round's targets. While this server is not in the
-// room, the PDUs wait for a later round without joins: one whose join was replaced or found gone
-// publishes nothing, and the PDUs would be dropped as a room's this server is not in. In a room it is
-// in, a member's join is a whole send_join, so the PDUs go first but for those citing a pending join,
-// whose gap fill would pull the join from another server: connected PDUs cite none with a gap, and
-// the PDUs with gaps fill them before the joins.
+// roundWorks runs only the joins while this server is not in the room: should none publish, the PDUs
+// would be dropped. Otherwise the PDUs go first, but for those citing a pending join, whose gap fill
+// would pull the join from another server.
 func roundWorks(kinds workKinds, joins, connected, gaps []*types.IngestTarget, joined bool) []ingestWork {
 	works := make([]ingestWork, 0, len(joins)+2)
 	joinWorks := make([]ingestWork, len(joins))
@@ -143,8 +132,7 @@ func roundWorks(kinds workKinds, joins, connected, gaps []*types.IngestTarget, j
 	return works
 }
 
-// splitCitingJoins splits PDU targets in topological order into those citing neither a join target
-// nor a PDU citing one, and the rest, keeping the order in both
+// splitCitingJoins takes the PDUs in topological order, to catch those citing a join transitively
 func splitCitingJoins(pdus, joins []*types.IngestTarget) (independent, citing []*types.IngestTarget) {
 	if len(joins) == 0 {
 		return pdus, nil
@@ -164,8 +152,7 @@ func splitCitingJoins(pdus, joins []*types.IngestTarget) (independent, citing []
 	return independent, citing
 }
 
-// chunkPDUs splits PDU targets, in order, into chunks of at most maxCount targets and, past their
-// first, maxBytes of events
+// chunkPDUs caps chunks at maxCount and, past their first target, maxBytes
 func chunkPDUs(pdus []*types.IngestTarget, maxCount, maxBytes int) [][]*types.IngestTarget {
 	var chunks [][]*types.IngestTarget
 	size := 0
@@ -180,7 +167,6 @@ func chunkPDUs(pdus []*types.IngestTarget, maxCount, maxBytes int) [][]*types.In
 	return chunks
 }
 
-// splitTargets returns the joins and the PDUs among targets, each oldest first
 func splitTargets(targets []*types.IngestTarget) (joins, pdus []*types.IngestTarget) {
 	for _, target := range targets {
 		if target.Kind == types.IngestTargetJoin {

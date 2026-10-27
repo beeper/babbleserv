@@ -28,22 +28,17 @@ const (
 	longestSendJoinRetryPause = 30 * time.Second
 )
 
-// joinWork is a local user's join to a room through a resident server, run on the remote join path
-// in phases B and C: build the state before the join, then publish it, as a member's join should
-// another have got this server into the room first. The room version's strategy fetches what the
-// join needs in phase A.
+// joinWork is a local user's join through a resident server. The room version's strategy fetches in
+// phase A; phases B and C build and publish the state before the join.
 type joinWork struct {
 	run    *jobRun
 	target *types.IngestTarget
 	join   *databases.RemoteJoin
-	// A server answered a send_join of the join, so accepted it, as a state DAG resident serving no
-	// state DAG that connects it does
-	answered bool
-	// When the join's first send_join was sent, which its JoinTimeout counts from
+	// A server accepted the join by answering a send_join, even one serving no state DAG connecting it
+	answered  bool
 	firstSent time.Time
 }
 
-// A refused join is replaced with a fresh one at most once, counted from the user's first join
 const maxJoinReplacements = 1
 
 func (w *joinWork) targets() []*types.IngestTarget {
@@ -54,7 +49,7 @@ func (w *joinWork) kind() workKind {
 	return workJoin
 }
 
-// timesOut also bounds how long the join's response is read for, not just how long it is sent for
+// timesOut bounds reading the join's response as well as sending it
 func (w *joinWork) timesOut() time.Time {
 	return w.firstSent.Add(w.run.jobs.config.Rooms.Ingest.JoinTimeout)
 }
@@ -73,7 +68,6 @@ func (w *joinWork) publish(ctx context.Context) error {
 		// A stored duplicate, or the join sent as a member's
 		return w.run.fail(ctx, w.target, rejectedFailure(res.Rejected[0].Error))
 	}
-	// Published, stored before, or the user joined with a new local event instead
 	if err := w.run.jobs.db.Rooms.ClearIngestTargets(ctx, w.run.roomID, []id.EventID{w.target.Event.ID}); err != nil {
 		return err
 	}
@@ -83,7 +77,6 @@ func (w *joinWork) publish(ctx context.Context) error {
 	return nil
 }
 
-// refused fails the target on an error refusing the join, passing any other on
 func (w *joinWork) refused(ctx context.Context, err error) error {
 	if errors.Is(err, rooms.ErrAuthStage4) || errors.Is(err, rooms.ErrAuthStage5) {
 		return w.run.fail(ctx, w.target, rejectedFailure(err))
@@ -91,11 +84,9 @@ func (w *joinWork) refused(ctx context.Context, err error) error {
 	return err
 }
 
-// errResendRefused is a server refusing a join an earlier send_join may have landed with
 var errResendRefused = errors.New("a server refused a join that may have landed")
 
-// mayLand records that the send_join about to be sent may land, and when the first was sent,
-// returning the target as it was, or errWorkDone once the target is gone
+// mayLand persists that the next send_join may land before it is sent, returning the target as it was
 func (w *joinWork) mayLand(ctx context.Context) (*types.IngestTarget, error) {
 	now := time.Now().UnixMilli()
 	before, err := w.run.jobs.db.Rooms.UpdateIngestTarget(ctx, w.run.roomID, w.target.Event.ID, func(target *types.IngestTarget) {
@@ -111,7 +102,6 @@ func (w *joinWork) mayLand(ctx context.Context) (*types.IngestTarget, error) {
 	return before, nil
 }
 
-// gone ends the work of a join target another runner published, failed or replaced
 func (w *joinWork) gone(ctx context.Context) error {
 	zerolog.Ctx(ctx).Debug().Stringer("event_id", w.target.Event.ID).Msg("Join target is gone, another runner published, failed or replaced it")
 	w.run.untarget(w.target.Event.ID)
@@ -119,11 +109,8 @@ func (w *joinWork) gone(ctx context.Context) error {
 	return errWorkDone
 }
 
-// sendFailed handles a send_join that got no response, before being the target as it was before
-// the send. A server refusing the join fails it, unless an earlier send may have landed, which
-// returns errResendRefused, or another server answered one, so accepted the join, which leaves the
-// join to the next attempt. Otherwise it pauses before the next attempt, failing the join once it
-// timed out.
+// sendFailed fails the join or pauses before the next attempt. A refusal fails it unless another
+// server accepted it, or an earlier send may have landed, which returns errResendRefused.
 func (w *joinWork) sendFailed(ctx context.Context, before *types.IngestTarget, server string, attempt int, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -182,8 +169,8 @@ func sendJoinRetryPause(attempt int) time.Duration {
 	return pause/2 + rand.N(pause/2)
 }
 
-// replaceJoin replaces the target with a join from a fresh make_join, which the next round sends,
-// unless it replaced the user's first join already
+// replaceJoin swaps the target for a fresh make_join's join for the next round to send, at most
+// maxJoinReplacements times counting from the user's first join
 func (w *joinWork) replaceJoin(ctx context.Context, refusal error) error {
 	if w.target.Replacements >= maxJoinReplacements {
 		zerolog.Ctx(ctx).Warn().Int("replacements", w.target.Replacements).Msg("Not replacing a refused join again")
@@ -213,8 +200,7 @@ func (w *joinWork) replaceJoin(ctx context.Context, refusal error) error {
 	return errWorkDone
 }
 
-// legacyJoin is a join to a room without a state DAG. Phase A sends the stored join event in a
-// send_join, verifies the response and stages its events.
+// legacyJoin is a join to a room without a state DAG, fetched in phase A by a send_join
 type legacyJoin struct {
 	joinWork
 }
@@ -232,10 +218,7 @@ func (w *legacyJoin) fetch(ctx context.Context) error {
 	return w.refused(ctx, w.join.Stage(ctx))
 }
 
-// sendJoin sends the stored join event to a server of the room, and returns the verified state
-// before the join and its auth chain. A send that may have landed is sent again until the join
-// times out. Should a server refuse a join an earlier send may have landed with, the state before
-// the join is fetched instead, or failing that the target replaced with a fresh join.
+// sendJoin sends the join again until it times out, even when an earlier send may have landed
 func (w *legacyJoin) sendJoin(ctx context.Context) (stateEvs, authEvs []*types.Event, err error) {
 	for attempt := 0; ; attempt++ {
 		server := w.target.Servers[attempt%len(w.target.Servers)]
@@ -258,8 +241,8 @@ func (w *legacyJoin) sendJoin(ctx context.Context) (stateEvs, authEvs []*types.E
 	}
 }
 
-// afterRefusedResend fetches the state before a join that may have landed from the target's servers,
-// which store it once they accepted it. Should none give it, the target is replaced with a fresh join.
+// afterRefusedResend fetches the state before a join that may have landed, which servers that
+// accepted it store, replacing the join should none give it
 func (w *legacyJoin) afterRefusedResend(ctx context.Context, refusal error) ([]*types.Event, []*types.Event, error) {
 	ev := w.target.Event
 	limit := w.run.jobs.config.Rooms.Ingest.MaxJoinEvents
@@ -278,7 +261,7 @@ func (w *legacyJoin) afterRefusedResend(ctx context.Context, refusal error) ([]*
 	return nil, nil, w.replaceJoin(ctx, refusal)
 }
 
-// verifyResponse verifies the events of a send_join response, skipping those failing
+// verifyResponse skips events failing verification
 func (w *legacyJoin) verifyResponse(ctx context.Context, state, authChain []json.RawMessage) ([]*types.Event, []*types.Event, error) {
 	roomVersion := w.target.Event.RoomVersion
 	seenIDs := make(map[id.EventID]struct{}, len(state)+len(authChain))
@@ -294,10 +277,8 @@ func (w *legacyJoin) verifyResponse(ctx context.Context, state, authChain []json
 	return stateEvs, authEvs, nil
 }
 
-// legacyPDUs are PDUs of a room sent here while it had a job, or citing events it does not store.
-// For those with a gap, phase A pulls the events they cite that are not stored here, and the state
-// at prev events without it, asking each PDU's origin first, then the room's other servers. Phase C
-// sends them as federated events, dropping those still citing missing events as /send did before.
+// legacyPDUs are PDUs sent while the room had a job, or citing events not stored here. Phase A fills
+// their gaps; phase C sends them, dropping those still citing missing events as /send did before.
 type legacyPDUs struct {
 	run  *jobRun
 	pdus []*types.IngestTarget
@@ -313,14 +294,14 @@ func (w *legacyPDUs) kind() workKind {
 	return pduWorkKind(w.gap)
 }
 
-// fetch fills the PDUs' gaps. A gap no server filled leaves its PDU to be dropped once every server
-// asked answered or refused, as asking again would not change it.
+// fetch leaves a PDU whose gap no server filled to be dropped once every server asked answered or
+// refused, as asking again would not change it
 func (w *legacyPDUs) fetch(ctx context.Context) error {
 	if !w.gap {
 		return nil
 	}
 	db := w.run.jobs.db
-	// Kept as outlier memberships or dropped, as a room this server is not in takes PDUs
+	// A room this server is not in keeps PDUs as outlier memberships or drops them, without a fill
 	if joined, err := db.Rooms.IsServerJoined(ctx, w.run.roomID, w.run.jobs.config.ServerName); err != nil || !joined {
 		return err
 	}
@@ -336,8 +317,8 @@ func (w *legacyPDUs) build(context.Context) error {
 	return nil
 }
 
-// publish sends the PDUs, but for those whose gap a server failed to answer for and those citing
-// them, which stay targets, failing the work for a later round to ask again
+// publish holds back PDUs whose gap went unanswered, and those citing them, failing the work so a
+// later round asks again
 func (w *legacyPDUs) publish(ctx context.Context) error {
 	var pulled []*types.Event
 	var given *rooms.GivenStates
@@ -362,11 +343,9 @@ func (w *legacyPDUs) send(ctx context.Context, pulled []*types.Event, given *roo
 	return w.run.sendPDUs(ctx, pulled, given, targets)
 }
 
-// sendPDUs sends PDU targets as federated events, after the events pulled for them, then clears
-// those the publish did not
 func (run *jobRun) sendPDUs(ctx context.Context, pulled []*types.Event, given *rooms.GivenStates, targets []*types.IngestTarget) error {
 	pdus := make(map[id.EventID]types.IngestTargetKind, len(targets))
-	// Pulled events are older so go first, the send keeps the order of unrelated events
+	// Pulled events go first as they are older; the send keeps the order of unrelated events
 	evs := slices.Clone(pulled)
 	for _, target := range targets {
 		pdus[target.Event.ID] = types.IngestTargetPDU
@@ -381,8 +360,7 @@ func (run *jobRun) sendPDUs(ctx context.Context, pulled []*types.Event, given *r
 			zerolog.Ctx(ctx).Warn().Err(rejected.Error).Stringer("event_id", rejected.Event.ID).Msg("Dropped PDU target")
 		}
 	}
-	// What the publish did not clear: dropped events, and outlier memberships of a room this server
-	// is not in, which have no publish
+	// The publish leaves dropped events and outlier memberships as targets
 	if err := run.jobs.db.Rooms.ClearIngestTargets(ctx, run.roomID, targetIDs(targets)); err != nil {
 		return err
 	}
@@ -390,8 +368,7 @@ func (run *jobRun) sendPDUs(ctx context.Context, pulled []*types.Event, given *r
 	return nil
 }
 
-// holdUnanswered splits PDU targets in topological order into those to send and those held back:
-// the unanswered and those citing a held one
+// holdUnanswered takes pdus in topological order, holding back the unanswered and those citing them
 func holdUnanswered(pdus []*types.IngestTarget, unanswered map[id.EventID]struct{}) (sent, held []*types.IngestTarget) {
 	heldIDs := make(map[id.EventID]struct{}, len(unanswered))
 	maps.Copy(heldIDs, unanswered)
@@ -414,13 +391,10 @@ func citesAny(ev *types.Event, eventIDs map[id.EventID]struct{}) bool {
 	return slices.ContainsFunc(ev.PrevEventIDs, cited) || slices.ContainsFunc(ev.AuthDependencyIDs(), cited)
 }
 
-// Most servers a gap fill asks beyond the PDUs' origins, and asks for the gaps of PDUs other servers
-// sent
 const maxGapFillServers = 5
 
-// gapFillServers are the servers a gap fill asks, in order, without this one: the PDUs' origins, each
-// of which has what its PDUs cite, then the room's other servers while fewer than maxGapFillServers
-// are asked, so that a large room's dead servers cannot stretch a fill over hours
+// gapFillServers asks the PDUs' origins first, as each has what its PDUs cite, then other servers up
+// to maxGapFillServers, so a large room's dead servers cannot stretch a fill over hours
 func gapFillServers(origins, roomServers []string, self string) []string {
 	var servers []string
 	add := func(server string) {
@@ -440,9 +414,7 @@ func gapFillServers(origins, roomServers []string, self string) []string {
 	return servers
 }
 
-// roomDisplayName is how BabbleBot names a room from its state events: by name, else canonical alias,
-// the last of each when there are several, as a state DAG in topological order holds every name the
-// room had
+// roomDisplayName takes the last name, else canonical alias, as a state DAG holds every name the room had
 func roomDisplayName(stateEvs []*types.Event) string {
 	var name, alias string
 	for _, ev := range stateEvs {
@@ -459,8 +431,6 @@ func roomDisplayName(stateEvs []*types.Event) string {
 	return cmp.Or(name, alias)
 }
 
-// makeJoin makes and signs a fresh join of the user from the first server giving a template of the
-// room's version
 func (j *Jobs) makeJoin(ctx context.Context, roomID id.RoomID, roomVersion string, userID id.UserID, servers []string) (*types.Event, string, error) {
 	origin := spec.ServerName(j.config.ServerName)
 	var errs []error

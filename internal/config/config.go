@@ -50,45 +50,34 @@ type stateBudgetConfig struct {
 
 // Bounds on a room's ingest job, which joins the room and publishes the events whose state it needs
 type ingestConfig struct {
-	// How long a job runs without progress before its lease expires and another runner may resume
-	// it. The runner stops itself then too.
+	// How long a job runs without progress before its lease expires, stopping its runner
 	// Default: 2m
 	LeaseTimeout time.Duration `yaml:"leaseTimeout"`
-	// How long after a join's first send_join it is sent again after failures that may be transient,
-	// and its response read, before the join fails
+	// How long after its first send_join a join retries transient failures before it fails
 	// Default: 10m
 	JoinTimeout time.Duration `yaml:"joinTimeout"`
-	// How long a send_join waits for its response to start: the resident builds the state it serves
-	// first, which for a large room takes minutes
+	// How long a send_join waits for its response to start, which for a large room takes minutes
 	// Default: 5m
 	SendJoinResponseTimeout time.Duration `yaml:"sendJoinResponseTimeout"`
-	// Most joins and gap fills the process runs at once across rooms' jobs, as each holds what it
-	// fetched, up to hundreds of megabytes for a large room's join; jobs wait for a turn
+	// Most joins and gap fills run at once across jobs, each holding up to hundreds of MB it fetched
 	// Default: 4 and 16
 	MaxConcurrentJoins    int `yaml:"maxConcurrentJoins"`
 	MaxConcurrentGapFills int `yaml:"maxConcurrentGapFills"`
-	// How long a state DAG room's gap fill asks servers for a chunk of PDUs, past which the PDUs
-	// whose gap is open are held back for the job's next round
+	// How long a gap fill asks servers for a chunk of PDUs before holding back those still open
 	// Default: 5m
 	GapFillTimeout time.Duration `yaml:"gapFillTimeout"`
-	// Most events a join accepts from the resident server: state and auth chain events, or in a
-	// state DAG room (MSC4242) the state DAG
+	// Most events a join accepts: the state and auth chain, or the state DAG (MSC4242)
 	// Default: 1000000
 	MaxJoinEvents int `yaml:"maxJoinEvents"`
-	// Most state events a state DAG room's gap fill fetches for a PDU, counting each request naming
-	// it, and that one run of the room's job fetches in all, past which the PDU fails or the run's
-	// gap fills stop until it runs again
+	// Most state events a gap fill fetches per PDU, and per job run before gap fills wait for the next
 	// Default: 10000 and 100000
 	MaxGapEvents       int `yaml:"maxGapEvents"`
 	MaxGapEventsPerRun int `yaml:"maxGapEventsPerRun"`
-	// Most PDUs, and their bytes, a room's job holds queued before /send waits for it to publish
-	// some rather than queue more
+	// Most PDUs and bytes a room's job queues before /send waits for it to publish
 	// Default: 2000 and 50000000
 	MaxQueuedPDUs     int   `yaml:"maxQueuedPDUs"`
 	MaxQueuedPDUBytes int64 `yaml:"maxQueuedPDUBytes"`
-	// How long /send waits for a full queue before failing the transaction, which its sender sends
-	// again later. Shorter than the minute Synapse waits for a response, so a sender gone meanwhile
-	// leaves no request waiting.
+	// How long /send waits on a full queue before failing, under Synapse's one minute response timeout
 	// Default: 50s
 	QueueWait time.Duration `yaml:"queueWait"`
 }
@@ -119,8 +108,7 @@ type BabbleConfig struct {
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
 
-		// Offer the unstable state DAG room version (MSC4242): advertise it, create rooms of it, join
-		// and take invites to them.
+		// Offer the unstable state DAG room version (MSC4242) for creates, joins and invites
 		UnstableStateDAGs bool `yaml:"unstableStateDAGs"`
 
 		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
@@ -202,13 +190,10 @@ type BabbleConfig struct {
 	Federation struct {
 		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
 		FetchProfileForMemberEvents bool `yaml:"fetchProfileForMemberEvents"`
-		// Most state events send_join serves of a state DAG room (MSC4242). A room with more refuses
-		// joins before taking them, rather than leave the joining server joined here alone.
+		// Most state DAG events send_join serves; larger rooms refuse joins before accepting them
 		// Default: 1000000
 		MaxServedStateDAG int `yaml:"maxServedStateDAG"`
-		// Most send_join responses of state DAG rooms served to one server at once, each streaming
-		// the whole state DAG, and its further send_joins waiting for one to end before their join is
-		// taken, as Synapse's rc_federation has; more are refused with a 429
+		// Concurrent and queued state DAG send_joins per origin before a 429, like Synapse's rc_federation
 		// Default: 3 and 50
 		MaxStateDAGJoinsPerOrigin       int `yaml:"maxStateDAGJoinsPerOrigin"`
 		MaxQueuedStateDAGJoinsPerOrigin int `yaml:"maxQueuedStateDAGJoinsPerOrigin"`
@@ -367,8 +352,7 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 
 var stableRoomVersions = []string{"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
 
-// RoomVersions returns the room versions this server creates rooms of and takes invites to, each
-// with whether it is stable
+// RoomVersions maps the versions this server creates and joins to whether each is stable
 func (c *BabbleConfig) RoomVersions() map[string]bool {
 	versions := make(map[string]bool, len(stableRoomVersions)+1)
 	for _, version := range stableRoomVersions {
@@ -380,9 +364,8 @@ func (c *BabbleConfig) RoomVersions() map[string]bool {
 	return versions
 }
 
-// JoinsRoomVersion reports whether this server joins rooms of a version and takes invites to them:
-// those it creates rooms of. gomatrixserverlib implements more, such as pseudo IDs (MSC4014), whose
-// events this server can neither build nor verify.
+// JoinsRoomVersion is narrower than gomatrixserverlib, which implements versions such as pseudo IDs
+// (MSC4014) whose events this server can neither build nor verify
 func (c *BabbleConfig) JoinsRoomVersion(version string) bool {
 	_, found := c.RoomVersions()[version]
 	return found

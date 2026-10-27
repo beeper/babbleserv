@@ -43,7 +43,7 @@ type respTransaction struct {
 	PDUs map[id.EventID]respTransactionResult `json:"pdus"`
 }
 
-// The most PDUs and EDUs a transaction carries, as the spec has it and Synapse refuses more
+// The spec's limits, past which Synapse refuses a transaction
 const (
 	maxTransactionPDUs = 50
 	maxTransactionEDUs = 100
@@ -84,8 +84,7 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 
 	log.Debug().Msg("Processing incoming federation transaction")
 
-	// The sender has an answer within the minute it waits, so as not to send the transaction again
-	// while it is processed
+	// Answer within the minute the sender waits, so it doesn't resend the transaction meanwhile
 	deadline := arrived.Add(f.config.Rooms.Ingest.QueueWait)
 	var resp *respTransaction
 	pduErr, eduErr := runTransaction(&log, func(admitted *admission) (err error) {
@@ -113,10 +112,8 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 	util.ResponseJSON(w, r, http.StatusOK, resp)
 }
 
-// runTransaction processes a transaction's PDUs and EDUs concurrently, the EDUs once the PDUs admit
-// them: at once for a transaction whose PDUs cannot wait on a room's ingest queue, else once the PDUs
-// succeeded. A transaction failing is sent again whole, so its EDUs are left for then rather than
-// processed twice.
+// runTransaction holds the EDUs until the PDUs succeed, or cannot wait on an ingest queue: a failed
+// transaction is resent whole, so its EDUs would be processed twice
 func runTransaction(log *zerolog.Logger, pdus func(*admission) error, edus func() error) (pduErr, eduErr error) {
 	admitted := newAdmission()
 	var wg sync.WaitGroup
@@ -137,9 +134,8 @@ func runTransaction(log *zerolog.Logger, pdus func(*admission) error, edus func(
 
 const remoteDeviceIngestConcurrency = 4
 
-// processTransactionEDUs processes a transaction's EDUs by type, failing only for to-device messages
-// it failed to store, which are lost unless the transaction is sent again: the other types are
-// idempotent or ephemeral
+// processTransactionEDUs fails only for to-device messages it failed to store, which are lost unless
+// the transaction is resent: the other types are idempotent or ephemeral
 func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.Request, origin string, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 
@@ -504,8 +500,7 @@ func (f *FederationRoutes) processTransactionPDUs(
 		wg.Go(func() {
 			log := hlog.FromRequest(r).With().Stringer("room_id", roomID).Logger()
 			ctx := log.WithContext(r.Context())
-			// A panic leaves the room's events out of the response rather than failing every
-			// transaction its sender sends with them
+			// A panic leaves the room's events out of the response rather than failing every resend
 			defer util.RecoverPanic(&log, nil)
 			results, err := f.processRoomPDUs(ctx, origin, roomID, room, waits[roomID], evs)
 			if err != nil {
@@ -520,7 +515,6 @@ func (f *FederationRoutes) processTransactionPDUs(
 	wg.Wait()
 	close(resultsCh)
 	close(errsCh)
-	// The transaction fails whole, its sender sending it again, with the EDUs left for then
 	for _, wait := range waits {
 		<-wait.done
 		if wait.err != nil {
@@ -557,12 +551,9 @@ func (f *FederationRoutes) processTransactionPDUs(
 	return &resp, nil
 }
 
-// processRoomPDUs sends a room's PDUs, or enqueues them for the room's ingest job. While the room has
-// a job, every PDU waits for it, once the job's queue has room. Otherwise the PDUs citing only events
-// in place here and each other publish now, unless a job starts meanwhile, and the rest are enqueued
-// after for the job to fill their gaps: enqueueing them first would start the job, which the publish
-// would then defer to. Should the split or the publish fail, every PDU is enqueued instead, so an
-// error returned is an enqueue's, which fails the transaction for its sender to send again.
+// processRoomPDUs publishes the PDUs connected here and enqueues the rest after, as enqueueing first
+// would start the job the publish defers to. A room with a job enqueues them all, as does a failed
+// split or publish, so only an enqueue error fails the transaction.
 func (f *FederationRoutes) processRoomPDUs(
 	ctx context.Context,
 	origin string,
@@ -581,8 +572,7 @@ func (f *FederationRoutes) processRoomPDUs(
 		return f.enqueueRoomPDUs(ctx, origin, roomID, evs)
 	}
 	connected, rest := evs, []*types.Event(nil)
-	// Events of a room this server is not in are only kept as outlier memberships, which need nothing
-	// they cite
+	// A room this server is not in only keeps outlier memberships, which need nothing they cite
 	if room.joined {
 		var err error
 		if connected, rest, err = f.ingestJobs.SplitConnected(ctx, evs, nil); err != nil {
@@ -614,8 +604,6 @@ func (f *FederationRoutes) processRoomPDUs(
 	return results, nil
 }
 
-// enqueueRoomPDUs writes a room's PDUs as targets of its ingest job, which publishes them once it has
-// what they need, and answers them as received
 func (f *FederationRoutes) enqueueRoomPDUs(
 	ctx context.Context,
 	origin string,
@@ -630,13 +618,10 @@ func (f *FederationRoutes) enqueueRoomPDUs(
 	return &rooms.SendEventsResult{Allowed: evs}, nil
 }
 
-// A transaction whose PDUs for a room with a full ingest queue waited too long fails with it
 var errQueueFull = errors.New("the room's ingest queue stayed full")
 
 const queuePollInterval = time.Second
 
-// admission tells a transaction's EDUs whether its PDUs, which may wait on rooms' ingest queues and
-// fail the transaction, let them be processed
 type admission struct {
 	once sync.Once
 	done chan struct{}
@@ -659,14 +644,11 @@ func (a *admission) wait() bool {
 	return a.ok
 }
 
-// queueWait is the wait of a transaction's PDUs for capacity in their room's ingest queue
 type queueWait struct {
 	done chan struct{}
 	err  error
 }
 
-// waitForQueues waits, for each room with an ingest job that the transaction has PDUs for, until
-// the job's queue has room or the deadline passes. Other rooms' PDUs do not wait.
 func (f *FederationRoutes) waitForQueues(
 	r *http.Request,
 	txnRooms *pduRooms,
@@ -690,9 +672,6 @@ func (f *FederationRoutes) waitForQueues(
 	return waits
 }
 
-// waitForQueue waits until the room's job has room in its queue for more PDUs, failing with
-// errQueueFull once it stayed full until the deadline, which counts from the transaction's arrival,
-// so that its sender has an answer within the minute it waits
 func (f *FederationRoutes) waitForQueue(ctx context.Context, roomID id.RoomID, deadline time.Time) error {
 	cfg := f.config.Rooms.Ingest
 	for waited := false; ; waited = true {

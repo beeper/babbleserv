@@ -15,22 +15,16 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// sendJoinOutcome is what a send_join that got no response tells of the join, see
-// classifySendJoinError
 type sendJoinOutcome int
 
 const (
-	// The join may have landed or not, so the same event is sent again
+	// The join may have landed, so the same event is sent again
 	sendJoinRetry sendJoinOutcome = iota
-	// Not accepted, but nothing is wrong with the join, so the same event is sent again, the
-	// attempt not having landed
+	// Not landed, but nothing is wrong with the join, so the same event is sent again
 	sendJoinRateLimited
-	// The resident server refused the join
 	sendJoinRefused
 )
 
-// classifySendJoinError tells what a failed send_join means for the join: refused by a 4xx other than
-// a 429, else possibly landed, as with a 5xx, a timeout or a broken connection
 func classifySendJoinError(err error) sendJoinOutcome {
 	var httpErr gomatrix.HTTPError
 	if !errors.As(err, &httpErr) {
@@ -43,9 +37,8 @@ func classifySendJoinError(err error) sendJoinOutcome {
 	return sendJoinRetry
 }
 
-// failureFromError is how a /join answers a join failing with the error: a remote server's error as
-// it gave it, as the handler did before joins ran as jobs, a refused join as forbidden. Errors of
-// this server's own are not passed on.
+// failureFromError passes on a remote server's error as given, as /join did before joins ran as
+// jobs, but not this server's own errors
 func failureFromError(err error) *types.IngestFailure {
 	var failure *types.IngestFailure
 	var httpErr gomatrix.HTTPError
@@ -76,8 +69,6 @@ func failureFromError(err error) *types.IngestFailure {
 	return &types.IngestFailure{Status: http.StatusInternalServerError, ErrCode: mautrix.MUnknown.ErrCode, Message: "Failed to join the room"}
 }
 
-// unreachableFailure is a join whose send_join kept failing: the last server's error, or bad gateway
-// when no server answered
 func unreachableFailure(err error) *types.IngestFailure {
 	var httpErr gomatrix.HTTPError
 	if errors.As(err, &httpErr) {
@@ -90,14 +81,11 @@ func unreachableFailure(err error) *types.IngestFailure {
 	}
 }
 
-// rejectedFailure is a join refused by this server's checks of it
 func rejectedFailure(err error) *types.IngestFailure {
 	respErr := util.RejectedEventError(err)
 	return &types.IngestFailure{Status: util.ErrorStatus(respErr), ErrCode: respErr.ErrCode, Message: err.Error()}
 }
 
-// incompleteStateDAGFailure is a join to a state DAG room that no server served a state DAG for that
-// connects the join to the create event, as the MSC requires
 func incompleteStateDAGFailure() *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusBadGateway,
@@ -106,7 +94,6 @@ func incompleteStateDAGFailure() *types.IngestFailure {
 	}
 }
 
-// tooLargeFailure is a join refused for too many of some kind of event (what) the resident gave with it
 func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,
@@ -115,8 +102,6 @@ func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 	}
 }
 
-// tooManyTipsFailure is a join to a state DAG room whose state DAG has more forward extremities than
-// a join publishes beside it
 func tooManyTipsFailure(tips, limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,
@@ -125,8 +110,7 @@ func tooManyTipsFailure(tips, limit int) *types.IngestFailure {
 	}
 }
 
-// unfilledGapFailure is a PDU of a state DAG room citing state events that no server served a path
-// from to the create event, as the MSC requires of the server sending it
+// The MSC requires a PDU's sender to serve a path from the state events it cites to the create event
 func unfilledGapFailure() *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusBadGateway,
@@ -135,7 +119,6 @@ func unfilledGapFailure() *types.IngestFailure {
 	}
 }
 
-// tooLargeGapFailure is a PDU of a state DAG room whose gap fill fetched more than it may
 func tooLargeGapFailure(limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,

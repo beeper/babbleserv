@@ -357,9 +357,8 @@ func (c *ClientRoutes) sendRoomLeaveOrKick(w http.ResponseWriter, r *http.Reques
 	util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)
 }
 
-// newOutlierLeave builds a local user's leave ending the invite or knock they hold in a room this
-// server is not in, after the held membership event. In a state DAG room it cites that event in
-// prev_state_events, as an out-of-band change does (MSC4242).
+// In a state DAG room the leave cites the held membership in prev_state_events, as an out-of-band
+// change does (MSC4242)
 func newOutlierLeave(partialEv *types.PartialEvent, held *types.Event, now time.Time) *types.Event {
 	ev := &types.Event{
 		RoomVersion:  held.RoomVersion,
@@ -407,10 +406,8 @@ func (c *ClientRoutes) sendBanOrUnban(w http.ResponseWriter, r *http.Request, me
 // A make_leave or send_leave failure, before the membership is stored locally
 var errRemoteLeaveFailed = errors.New("remote leave failed")
 
-// remoteJoin joins a local user to a room this server is not in. The join made through make_join
-// becomes a target of the room's ingest job, which sends it and publishes it, while the request waits
-// for the job to publish or fail it. A join of the user the job has pending already, as a retried
-// /join finds, is waited on instead of making another.
+// remoteJoin hands the join to the room's ingest job to send and publish, waiting for it to publish or
+// fail it; a join the job already has pending, as a retried /join finds, is waited on instead
 func (c *ClientRoutes) remoteJoin(r *http.Request, roomID id.RoomID, userID id.UserID, servers []string) error {
 	ctx := r.Context()
 	log := hlog.FromRequest(r).With().Stringer("room_id", roomID).Logger()
@@ -442,13 +439,12 @@ func (c *ClientRoutes) remoteJoin(r *http.Request, roomID id.RoomID, userID id.U
 	return c.waitForJoin(log.WithContext(ctx), roomID, userID)
 }
 
-// The user's join is read again this often, should its watch fail or miss a change
+// In case the join's watch fails or misses a change
 const joinWaitPoll = 5 * time.Second
 
 var errJoinIncomplete = errors.New("the join finished without the user joined")
 
-// waitForJoin waits for the room's ingest job to publish the user's join, or fail it. The job clears
-// the user's iju in the transaction publishing the join, and records a failure there.
+// The job clears the user's iju in the transaction publishing the join, and records a failure in it
 func (c *ClientRoutes) waitForJoin(ctx context.Context, roomID id.RoomID, userID id.UserID) error {
 	for {
 		join, watch, err := c.db.Rooms.WatchIngestJoin(ctx, roomID, userID)
@@ -477,8 +473,7 @@ func (c *ClientRoutes) waitForJoin(ctx context.Context, roomID id.RoomID, userID
 	}
 }
 
-// waitForChange waits until the watch fires, the poll interval passes or the context ends. A watch
-// that fails, as one past FoundationDB's limit on watches does, leaves the poll.
+// A failed watch, as one past FoundationDB's limit on watches, leaves only the poll
 func waitForChange(ctx context.Context, watch fdb.FutureNil, poll time.Duration) error {
 	timer := time.NewTimer(poll)
 	defer timer.Stop()
@@ -502,8 +497,7 @@ func waitForChange(ctx context.Context, watch fdb.FutureNil, poll time.Duration)
 	}
 }
 
-// remoteMembership sends target's knock or leave of a room this server is not in via make_/send_
-// endpoints
+// remoteMembership sends target's knock or leave of a room this server is not in via make_/send_ endpoints
 func (c *ClientRoutes) remoteMembership(
 	r *http.Request,
 	roomID id.RoomID,

@@ -34,7 +34,7 @@ type Bot struct {
 	db     *databases.Databases
 	userID id.UserID
 	exists atomic.Bool
-	// A registered user has BabbleBot's localpart, so BabbleBot sends nothing
+	// A registered user has BabbleBot's localpart, so BabbleBot sends nothing rather than speak as them
 	disabled atomic.Bool
 }
 
@@ -47,8 +47,6 @@ func New(cfg config.BabbleConfig, logger zerolog.Logger, db *databases.Databases
 	}
 }
 
-// EnsureUser creates BabbleBot's user unless it exists. Should a registered user have its localpart,
-// BabbleBot is disabled rather than sending its notices as that user.
 func (b *Bot) EnsureUser(ctx context.Context) error {
 	if b.exists.Load() || b.disabled.Load() {
 		return nil
@@ -67,8 +65,7 @@ func (b *Bot) EnsureUser(ctx context.Context) error {
 	return nil
 }
 
-// Notice sends a notice to a local user in their room with BabbleBot, created on first use. Notices
-// with the same transaction ID are sent once, whoever sends them.
+// Notice sends once per transaction ID, whoever sends it, creating the user's room with BabbleBot on first use
 func (b *Bot) Notice(ctx context.Context, userID id.UserID, txnID, body string) error {
 	if err := b.EnsureUser(ctx); err != nil || b.disabled.Load() {
 		return err
@@ -93,8 +90,7 @@ func (b *Bot) Notice(ctx context.Context, userID id.UserID, txnID, body string) 
 	return nil
 }
 
-// room returns BabbleBot's room with the user, creating it if there is none. Concurrent creators
-// conflict on the room's record, and the others use the room the first created.
+// Concurrent creators conflict on the room's record, and the others use the room the first created
 func (b *Bot) room(ctx context.Context, userID id.UserID) (id.RoomID, error) {
 	if roomID, err := b.db.Rooms.GetBotRoom(ctx, userID); err != nil || roomID != "" {
 		return roomID, err

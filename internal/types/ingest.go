@@ -21,30 +21,26 @@ type IngestJob struct {
 // IngestTarget is an event a room's ingest job publishes once the state it needs is stored
 type IngestTarget struct {
 	Kind IngestTargetKind `msgpack:"knd"`
-	// As signed and verified, its ID taken from the record's key
+	// As signed and verified; its ID comes from the record's key
 	Event *Event `msgpack:"evt"`
 	// The origin of a PDU, the servers to send a join through, first the one whose template it is
 	Servers  []string `msgpack:"srv"`
 	Enqueued int64    `msgpack:"enq"`
-	// A send_join was sent that the resident server may have accepted, so refusing a later one
-	// does not mean the join was refused
+	// A send_join may have been accepted, so refusing a later one does not mean the join was refused
 	MayHaveLanded bool `msgpack:"mhl,omitempty"`
-	// When the join's first send_join was sent, which its JoinTimeout counts from
+	// JoinTimeout counts from the first send_join
 	FirstSent int64 `msgpack:"fst,omitempty"`
-	// Rounds whose work for the target failed, other than by the job ending, and when the last did,
-	// which holds the target back for the job's retry pause
+	// Failed rounds, not counting the job ending; the last, at FailedAt, holds it back for a retry pause
 	Failures int   `msgpack:"fls,omitempty"`
 	FailedAt int64 `msgpack:"fat,omitempty"`
-	// The bytes a PDU counts for in its room's queue, from when it was enqueued
+	// The bytes a PDU counts for in its room's queue
 	Size int `msgpack:"sz,omitempty"`
-	// Fresh joins from make_join this join replaced the user's first with, each a resident refused
+	// Fresh make_join joins that replaced ones a resident refused
 	Replacements int `msgpack:"rpl,omitempty"`
-	// A PDU pulled by get_missing_events for a target's unknown prev events rather than sent here,
-	// whose own prev events are not pulled, so that the pulls stay bounded
+	// Pulled by get_missing_events rather than sent here, so its own prev events are not, bounding pulls
 	Pulled bool `msgpack:"pld,omitempty"`
 }
 
-// IngestQueue is what a room's job has queued of PDUs, which /send stops adding to while it is full
 type IngestQueue struct {
 	PDUs  int64
 	Bytes int64

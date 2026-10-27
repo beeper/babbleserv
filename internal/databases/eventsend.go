@@ -41,17 +41,15 @@ func (d *Databases) SendFederatedEvents(
 	})
 }
 
-// RemoteJoin is a local user's join to a room through another server, see rooms.RemoteJoin, which
-// joins with a new local event when another join got this server into the room meanwhile and the
-// send_join event cannot become the user's membership
+// RemoteJoin joins with a new local event when another join got this server into the room meanwhile
+// and the send_join event cannot become the user's membership
 type RemoteJoin struct {
 	*rooms.RemoteJoin
 	d      *Databases
 	joinEv *types.Event
 }
 
-// NewRemoteJoin prepares a local user's join to a room through another server, with the state before
-// the join and its auth chain from the resident server, and the local members' push rules
+// NewRemoteJoin takes the state before the join and its auth chain from the resident server
 func (d *Databases) NewRemoteJoin(
 	ctx context.Context,
 	joinEv *types.Event,
@@ -69,9 +67,7 @@ func (d *Databases) NewRemoteJoin(
 	return &RemoteJoin{RemoteJoin: join, d: d, joinEv: joinEv}, nil
 }
 
-// NewStateDAGRemoteJoin prepares a local user's join to a state DAG room through another server,
-// once the room's ingest job replayed the state DAG the resident served, whose tips are given, see
-// rooms.RoomsDatabase.NewStateDAGRemoteJoin
+// NewStateDAGRemoteJoin runs once the room's ingest job replayed the state DAG the resident served
 func (d *Databases) NewStateDAGRemoteJoin(ctx context.Context, joinEv *types.Event, tips []id.EventID) (*RemoteJoin, error) {
 	userPushRules, userRoomContext, err := d.pushContext(ctx, joinEv.RoomID)
 	if err != nil {
@@ -84,9 +80,8 @@ func (d *Databases) NewStateDAGRemoteJoin(ctx context.Context, joinEv *types.Eve
 	return &RemoteJoin{RemoteJoin: join, d: d, joinEv: joinEv}, nil
 }
 
-// Publish sends the join: while this server is not in the room it takes the response state as the
-// room's state, otherwise it is sent like any federated event, against that state and the room's
-// current state.
+// Publish takes the response state as the room's state while this server is not in the room,
+// otherwise sends the join like any federated event, against that and the room's current state
 func (j *RemoteJoin) Publish(ctx context.Context) (*rooms.SendEventsResult, error) {
 	res, err := j.RemoteJoin.Publish(ctx)
 	if err != nil {
@@ -136,7 +131,6 @@ func (d *Databases) sendEventsFunc(
 	return fn(userPushRules, userRoomContext)
 }
 
-// pushContext returns the push rules and room context of the room's local joined members
 func (d *Databases) pushContext(ctx context.Context, roomID id.RoomID) (types.UserPushRulesMap, types.UserRoomContextMap, error) {
 	// Get room for member count - this means the member count for push rules does *not* consider
 	// any member events in the batch being persisted.

@@ -19,12 +19,9 @@ import (
 	"github.com/beeper/babbleserv/internal/util"
 )
 
-// ErrServerUserTaken refuses a server-owned user whose localpart a registered user has
 var ErrServerUserTaken = errors.New("a registered user has the server-owned user's localpart")
 
-// EnsureServerUser creates a local user the server owns, such as BabbleBot, with no password and
-// the display name, unless it exists already. Reports whether it created the user. A registered
-// user with the localpart is never taken over: that fails with ErrServerUserTaken.
+// EnsureServerUser reports whether it created the user, and never takes over a registered user
 func (a *AccountsDatabase) EnsureServerUser(ctx context.Context, localpart, displayName string) (bool, error) {
 	user := types.User{Username: localpart, ServerName: a.config.ServerName, CreatedAt: time.Now().UTC(), ServerOwned: true}
 	userID := user.UserID()
@@ -42,12 +39,10 @@ func (a *AccountsDatabase) EnsureServerUser(ctx context.Context, localpart, disp
 	})
 }
 
-// isReservedLocalpart reports whether registration refuses a localpart, kept for a server-owned user
 func (a *AccountsDatabase) isReservedLocalpart(username string) bool {
 	return strings.EqualFold(username, a.config.BabbleBot.Localpart)
 }
 
-// AddDirectRoom adds a room with another user to the user's m.direct account data
 func (a *AccountsDatabase) AddDirectRoom(ctx context.Context, userID, otherUserID id.UserID, roomID id.RoomID) error {
 	tup := types.AccountDataTup{UserID: userID, Type: event.AccountDataDirectChats}
 	changed, err := util.DoWriteTransactionWithVersion(ctx, a.db, func(txn fdb.Transaction) (bool, error) {

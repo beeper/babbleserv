@@ -111,15 +111,13 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	}{ev, ev.RoomVersion})
 }
 
-// membershipResponse is how a send_ endpoint answers once the event is sent, refusing it beforehand,
-// once it is verified, with the error beforeSend returns. A response too large to build whole is a
-// streamedResponse.
+// membershipResponse's beforeSend may refuse a verified event before it is sent; afterSend returns a
+// streamedResponse for a response too large to build whole.
 type membershipResponse struct {
 	beforeSend func(room *types.Room, ev *types.Event) error
 	afterSend  func(room *types.Room, ev *types.Event) (any, error)
 }
 
-// streamedResponse is a response written as it is read
 type streamedResponse interface {
 	write(w http.ResponseWriter, r *http.Request)
 }
@@ -231,8 +229,7 @@ func responseMembershipError(w http.ResponseWriter, r *http.Request, err error) 
 	util.ResponseErrorUnknownJSON(w, r, err)
 }
 
-// responseIncompatibleRoomVersion refuses a request about a room of a version this server does not
-// federate, naming the version as the spec asks
+// responseIncompatibleRoomVersion names the room version, as the spec asks
 func responseIncompatibleRoomVersion(w http.ResponseWriter, r *http.Request, roomVersion, message string) {
 	util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
 		"errcode":      mautrix.MIncompatibleRoomVersion.ErrCode,

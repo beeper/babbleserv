@@ -24,8 +24,7 @@ type gapRequest struct {
 	pulledIDs []id.EventID
 }
 
-// gapServers answers get_missing_events as Synapse does, with the events it holds before the latest
-// events it knows, ignoring the others
+// gapServers answers get_missing_events as Synapse does, ignoring latest events it does not know
 type gapServers struct {
 	before   map[string]map[id.EventID][]id.EventID
 	errs     map[string]error
@@ -74,8 +73,7 @@ func TestGapPlanAsksEachOriginForItsOwnPDUs(t *testing.T) {
 	assert.Empty(t, plan.unanswered())
 }
 
-// However many origins a chunk's PDUs have, each is asked for its own, and only the first few for
-// the gaps of the others
+// Each origin is asked for its own PDUs' gaps, and only the first few for the others'
 func TestGapPlanAsksEveryOrigin(t *testing.T) {
 	servers := &gapServers{}
 	var targets []*types.IngestTarget
@@ -172,8 +170,7 @@ func TestGapPlanStopsWithItsContext(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
-// The PDUs reaching, through the events pulled, a prev event whose state was not fetched are held
-// back, as the pulled events citing it would be dropped, and the PDUs with them
+// PDUs reaching an unfetched prev event through pulled events are held back, as those events would be dropped
 func TestReachingPrevs(t *testing.T) {
 	pulled := []*types.Event{
 		testPDU("$pulledOld", []id.EventID{"$unfetched"}),

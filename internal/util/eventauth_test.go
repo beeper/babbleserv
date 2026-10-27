@@ -103,8 +103,7 @@ func TestAuthorizePrevStateEvents(t *testing.T) {
 	assert.NoError(t, authErr, "other room versions have no prev state events to check")
 }
 
-// Rejecting an event citing a rejected one rejects every state event built on it in turn, while a
-// branch citing only accepted events is unaffected
+// The cascade spares a branch citing only accepted events
 func TestPrevStateEventRejectionCascades(t *testing.T) {
 	stateKey := ""
 	chain := []*types.Event{

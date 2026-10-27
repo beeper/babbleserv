@@ -44,8 +44,7 @@ type SendLocalEventsOptions struct {
 	// Records the room the send creates as BabbleBot's room with this user, see txnClaimBotRoom
 	BotRoomUser id.UserID
 
-	// The ingest job's join target the send stands in for, which its publish takes, failing with
-	// ErrIngestTargetGone once another runner of the room's job failed or replaced it
+	// The ingest job's join target the send stands in for, which its publish takes
 	IngestJoinTarget id.EventID
 }
 
@@ -238,10 +237,8 @@ func (r *RoomsDatabase) PrepareLocalEvents(ctx context.Context, roomID id.RoomID
 
 // txnPrepareLocalEvents builds local events sent at now in a line, each authorized against the state
 // after the one before, from the room's current state. In a state DAG room each cites the state
-// extremities as they stand after the events before it, and is authorized against the state after
-// them. When there are too many to cite, that is not current state, and the event must pass current
-// state too. A resolution too large to run here is returned as work instead. Unless publishing,
-// current state is only resolved when an event needs it.
+// extremities left by the events before it, and must also pass current state when it cannot cite
+// them all. A resolution too large to run here is returned as work.
 func (s *localEventSender) txnPrepareLocalEvents(
 	ctx context.Context,
 	txn fdb.ReadTransaction,
@@ -308,8 +305,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 
 	keyID, key := s.r.config.MustGetActiveSigningKey()
 
-	// The room's current state after the events accepted so far, the state before the next unless
-	// it cites other than every state extremity. Zero while a resolution is put off.
+	// Current state after the events accepted so far, zero while its resolution is put off
 	steps := stateSteps{current: room.CurrentState}
 	currentState := func() (types.StateHash, *eventsendutil.ResolutionRequest, error) {
 		if steps.current.IsZero() {
@@ -346,9 +342,8 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			if request, err := cite(superseded); err != nil || request != nil {
 				return nil, s.workFor(prepared, request, room), err
 			} else if superseded != "" && !slices.Contains(citedExtremities(stateExtremities), superseded) {
-				// Resolution orders a membership behind the extremities by more than ancestry, so it
-				// can come out after later state, and the rescind would make older state current
-				// everywhere. Sent without the citation, the target's server may refuse it.
+				// Resolution may order a membership behind the extremities after later state, so citing it
+				// would make older state current everywhere; uncited, the target's server may refuse the leave
 				current, request, err := currentState()
 				if err != nil || request != nil {
 					return nil, s.workFor(prepared, request, room), err
@@ -495,10 +490,9 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	return prepared, nil, nil
 }
 
-// txnSupersededMembership returns the invite or knock in current state that a leave of a state DAG
-// room rescinds out of band: the target's server is not in the room, so holds that membership
-// without the state DAG, and can tell the leave supersedes it only should the leave cite it
-// (MSC4242). Other changes of a remote user's membership cite the state extremities alone.
+// txnSupersededMembership returns the invite or knock a leave rescinds out of band: the target's
+// server, not in the room, holds it without the state DAG and can only tell the leave supersedes it
+// if the leave cites it (MSC4242)
 func (s *localEventSender) txnSupersededMembership(
 	txn fdb.ReadTransaction,
 	stateBatch *state.Batch,
