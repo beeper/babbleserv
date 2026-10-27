@@ -81,3 +81,20 @@ func TestKeyStoreFetchesEachServerOnce(t *testing.T) {
 	assert.Equal(t, 1, client.fetchCount("dead.example"), "then the keys are cached")
 	assert.Equal(t, int32(2), progress.Load())
 }
+
+// A caller giving up waiting for a server's keys fails the verification whole, rather than failing
+// each signature as if the server had signed nothing valid
+func TestVerifyJSONsFailsWithItsContext(t *testing.T) {
+	client := &slowKeysClient{
+		fetches: make(map[spec.ServerName]int),
+		release: map[spec.ServerName]chan struct{}{"dead.example": make(chan struct{})},
+	}
+	defer close(client.release["dead.example"])
+	keyStore := util.NewKeyStore(client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	results, err := keyStore.VerifyJSONs(ctx, []gomatrixserverlib.VerifyJSONRequest{{ServerName: "dead.example", Message: []byte(`{}`)}})
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, results)
+}

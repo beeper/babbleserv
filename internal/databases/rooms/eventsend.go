@@ -45,8 +45,8 @@ type RejectedEvent struct {
 
 // Store events handles writing out all the relevant event data into FoundationDB, assuming that all
 // events passed in are already authenticated and carry their state contexts. Each accepted event
-// clears the extremities it replaces, and in a state DAG room each accepted state event the state
-// extremities it cites and joins the state DAG served to joining servers. The caller then stores
+// clears the extremities it replaces, and in a state DAG room each accepted state event clears the
+// state extremities it cites and joins the state DAG served to joining servers. The caller then stores
 // the room's current state with txnStoreRoomState.
 func (r *RoomsDatabase) txnStoreEvents(
 	ctx context.Context,
@@ -156,6 +156,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 				txn.Set(r.events.KeyForRoomReaction(room.ID, relEvID, ev.Sender, ev.ReactionKey()), []byte(ev.ID))
 			}
 		}
+		r.txnClearRedactedReaction(txn, room.ID, ev, newEvs)
 
 		// Store notification counts for local users
 		if userNotifs, ok := eventNotifications[ev.ID]; ok {
@@ -603,7 +604,6 @@ func createRoomVersion(createEv *types.PartialEvent) string {
 
 var errRoomNotFederated = errors.New("this room is not federated")
 
-// Run final internal checks on an event before we accept it for storage
 func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	txn fdb.ReadTransaction,
 	roomID id.RoomID,
@@ -640,6 +640,29 @@ func (r *RoomsDatabase) txnCheckDuplicateReaction(txn fdb.ReadTransaction, ev *t
 		return errors.New("duplicate reaction for this event/user")
 	}
 	return nil
+}
+
+// txnClearRedactedReaction clears the reaction index row of a reaction a redaction redacts, as
+// Synapse deletes the redacted event's relation, so its sender may react with the key again
+func (r *RoomsDatabase) txnClearRedactedReaction(txn fdb.Transaction, roomID id.RoomID, redaction *types.Event, batch []*types.Event) {
+	redactedID := redaction.RedactedEventID()
+	if redactedID == "" {
+		return
+	}
+	var redacted *types.Event
+	if i := slices.IndexFunc(batch, func(ev *types.Event) bool { return ev.ID == redactedID }); i >= 0 {
+		redacted = batch[i]
+	} else {
+		redacted = r.events.TxnGetEvent(txn, redactedID)
+	}
+	if redacted == nil || redacted.RoomID != roomID || !isReaction(redacted) {
+		return
+	}
+	relEvID, _ := redacted.RelatesTo()
+	key := r.events.KeyForRoomReaction(roomID, relEvID, redacted.Sender, redacted.ReactionKey())
+	if id.EventID(txn.Get(key).MustGet()) == redactedID {
+		txn.Clear(key)
+	}
 }
 
 // Strip everything unexpected from an event's unsigned map before it is stored.

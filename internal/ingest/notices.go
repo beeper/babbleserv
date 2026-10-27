@@ -17,7 +17,8 @@ import (
 func joinNoticeTxnID(eventID id.EventID) string  { return "join-pending/" + eventID.String() }
 func joinOutcomeTxnID(eventID id.EventID) string { return "join-outcome/" + eventID.String() }
 
-// noticeDelay is how long until a join enqueued at enqueued has been pending for after
+// noticeDelay is the time remaining until a join enqueued at enqueued has been pending for the
+// duration after, zero once that time has passed
 func noticeDelay(enqueued int64, after time.Duration, now time.Time) time.Duration {
 	return max(time.UnixMilli(enqueued).Add(after).Sub(now), 0)
 }

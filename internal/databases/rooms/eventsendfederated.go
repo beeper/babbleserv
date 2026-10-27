@@ -31,6 +31,22 @@ import (
 // future non-outlier memberships overwrite. An event already stored as a room event is left as it
 // is, an outlier copy would take it out of room state.
 func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context, ev *types.Event) error {
+	_, err := r.sendOutlierMembership(ctx, ev, outlierChecks{})
+	return err
+}
+
+// outlierChecks are the checks applied when storing an outlier membership another server sent, so
+// that a job started or a membership changed meanwhile conflicts with the write
+type outlierChecks struct {
+	// Fail with ErrRoomIngesting while the room has an ingest job
+	refuseWhileIngesting bool
+	// Store a leave only should it end the membership its target holds, see endsHeldMembership
+	endsHeld bool
+}
+
+// sendOutlierMembership stores an outlier membership as SendFederatedOutlierMembershipEvent does,
+// unless the checks refuse it, when it returns false
+func (r *RoomsDatabase) sendOutlierMembership(ctx context.Context, ev *types.Event, checks outlierChecks) (bool, error) {
 	if ev.Type != event.StateMember {
 		panic("outlier event is not a member event")
 	}
@@ -41,11 +57,18 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 	userID := id.UserID(*ev.StateKey)
 	isLocal := r.isLocalUser(userID)
 
+	var refused bool
 	versionFut, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (fdb.FutureKey, error) {
+		refused = false
 		roomEventVersion := txn.Get(r.events.KeyForIDToVersion(ev.ID))
 		var storedFut fdb.FutureByteSlice
 		if isLocal {
 			storedFut = txn.Get(r.users.KeyForMembership(userID, ev.RoomID))
+		}
+		if checks.refuseWhileIngesting {
+			if err := r.txnCheckNoIngestJob(txn, ev.RoomID); err != nil {
+				return nil, err
+			}
 		}
 		// A normal read, so a publish to the room meanwhile conflicts with this write, which is only
 		// for a room this server is not in
@@ -56,6 +79,14 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 			return nil, fmt.Errorf("cannot send outlier events to rooms this server is participating in")
 		} else if roomEventVersion.MustGet() != nil {
 			return nil, nil
+		}
+		if checks.endsHeld && ev.Membership() == event.MembershipLeave {
+			if ends, err := r.txnEndsHeldMembership(txn, ev); err != nil {
+				return nil, err
+			} else if !ends {
+				refused = true
+				return nil, nil
+			}
 		}
 
 		version := r.events.TxnStoreEventRows(txn, true, ev)[ev.ID]
@@ -74,10 +105,12 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 	})
 
 	if err != nil {
-		return err
+		return false, err
+	} else if refused {
+		return false, nil
 	} else if versionFut == nil {
 		zerolog.Ctx(ctx).Debug().Stringer("event_id", ev.ID).Msg("Outlier membership event is stored as a room event")
-		return nil
+		return true, nil
 	}
 	if isLocal {
 		r.notifier.SendChange(notifier.Change{
@@ -92,7 +125,7 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 		Bool("is_outlier", ev.Outlier).
 		Any("versionstamp", types.DecodeRawVersionstamp(versionFut.MustGet())).
 		Msg("Stored outlier membership event")
-	return nil
+	return true, nil
 }
 
 var (
@@ -174,8 +207,9 @@ func (r *RoomsDatabase) SendFederatedEvents(
 }
 
 // sendOutlierMemberships stores those of a batch's events for a room this server is not in that are
-// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom. While
-// the room has an ingest job, which a join in progress has, the events are its instead.
+// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom. If the
+// room now has an ingest job, started by a join in progress, every event becomes one of its targets
+// instead, and each outlier's write re-checks for the job before storing.
 func (r *RoomsDatabase) sendOutlierMemberships(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -189,73 +223,68 @@ func (r *RoomsDatabase) sendOutlierMemberships(
 			return nil, fmt.Errorf("%w: %s", ErrRoomIngesting, roomID)
 		}
 	}
+	checks := outlierChecks{refuseWhileIngesting: options.RefuseWhileIngesting, endsHeld: true}
 	res := &SendEventsResult{}
 	for _, ev := range evs {
-		if outlier, err := r.isOutlierMembership(ctx, roomID, ev); err != nil {
-			return nil, err
-		} else if !outlier {
+		outlier := *ev
+		stored := false
+		if r.isOutlierMembership(roomID, ev) {
+			var err error
+			if stored, err = r.sendOutlierMembership(ctx, &outlier, checks); err != nil {
+				return nil, err
+			}
+		}
+		if !stored {
 			res.Rejected = append(res.Rejected, RejectedEvent{ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, ErrServerNotInRoom, roomID)})
 			continue
-		}
-		outlier := *ev
-		if err := r.SendFederatedOutlierMembershipEvent(ctx, &outlier); err != nil {
-			return nil, err
 		}
 		res.Allowed = append(res.Allowed, &outlier)
 	}
 	return res, nil
 }
 
-// isOutlierMembership reports whether a member event of a room this server is not in reaches a local
-// user who sees it outside the room: an invite of a local user, or a leave ending the membership the
-// user holds, see endsHeldMembership. A remote user's membership is never an outlier, as only local
-// users have membership rows, so a remote invitee's rejection is not taken: the invitee's server
-// records it locally.
-func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomID, ev *types.Event) (bool, error) {
-	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID {
-		return false, nil
-	}
-	target := id.UserID(*ev.StateKey)
-	if !r.isLocalUser(target) {
-		return false, nil
-	}
-	switch ev.Membership() {
-	case event.MembershipInvite:
-		return true, nil
-	case event.MembershipLeave:
-		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
-			memberships, err := r.txnGetRoomUserMemberships(txn, roomID, []id.UserID{target})
-			if err != nil {
-				return false, err
-			} else if membership, found := memberships[target]; !found {
-				return false, nil
-			} else if held := r.events.TxnGetEvent(txn, membership.EventID); held == nil {
-				return false, nil
-			} else {
-				return endsHeldMembership(ev, held), nil
-			}
-		})
-	}
-	return false, nil
-}
-
-// endsHeldMembership reports whether another user's leave of a local user ends the membership the
-// user holds in a room this server is not in: the inviter rescinding an invite, or in a state DAG
-// room, a kick rejecting a knock, whose sender's power this server cannot check outside the room. In
-// a state DAG room the leave must cite the membership in prev_state_events: without the state DAG,
-// that is the only way to tell the leave supersedes it (MSC4242).
-func endsHeldMembership(leave, held *types.Event) bool {
-	stateDAGs := held.StateDAGs()
-	if stateDAGs && !slices.Contains(leave.PrevStateEventIDs, held.ID) {
+// isOutlierMembership reports whether a member event of a room this server is not in may reach a
+// local user who sees it outside the room: an invite of a local user, or a leave of one, taken only
+// should it end the membership the user holds, see txnEndsHeldMembership. A remote user's membership
+// is never an outlier, as only local users have membership rows, so a remote invitee's rejection is
+// not taken: the invitee's server records it locally.
+func (r *RoomsDatabase) isOutlierMembership(roomID id.RoomID, ev *types.Event) bool {
+	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID || !r.isLocalUser(id.UserID(*ev.StateKey)) {
 		return false
 	}
-	switch held.Membership() {
-	case event.MembershipInvite:
-		return leave.Sender == held.Sender
-	case event.MembershipKnock:
-		return stateDAGs && leave.Sender != held.Sender
+	switch ev.Membership() {
+	case event.MembershipInvite, event.MembershipLeave:
+		return true
 	}
 	return false
+}
+
+// txnEndsHeldMembership reports whether a leave of a local user ends the membership the user holds
+// in a room this server is not in, see endsHeldMembership
+func (r *RoomsDatabase) txnEndsHeldMembership(txn fdb.ReadTransaction, leave *types.Event) (bool, error) {
+	target := id.UserID(*leave.StateKey)
+	memberships, err := r.txnGetRoomUserMemberships(txn, leave.RoomID, []id.UserID{target})
+	if err != nil {
+		return false, err
+	} else if membership, found := memberships[target]; !found {
+		return false, nil
+	} else if held := r.events.TxnGetEvent(txn, membership.EventID); held == nil {
+		return false, nil
+	} else {
+		return endsHeldMembership(leave, held), nil
+	}
+}
+
+// endsHeldMembership reports whether another user's leave of a local user ends the invite the user
+// holds in a room this server is not in: the inviter rescinding it. In a state DAG room the leave
+// must cite the invite in prev_state_events, since without full state resolution that citation is
+// the only way to tell the leave supersedes it (MSC4242). A knock is never ended this way, as Synapse
+// takes no out-of-band knock rejection: the sender's power cannot be checked outside the room.
+func endsHeldMembership(leave, held *types.Event) bool {
+	if held.StateDAGs() && !slices.Contains(leave.PrevStateEventIDs, held.ID) {
+		return false
+	}
+	return held.Membership() == event.MembershipInvite && leave.Sender == held.Sender
 }
 
 // givenStates is what a send keeps of the states the sending server gave
@@ -440,7 +469,6 @@ func (s *federatedEventSender) txnPrepareFederated(
 		eventsProvider.WillGet(ev.PrevEventIDs...)
 	}
 	eventsProvider.WillGet(extremities...)
-	eventsProvider.WillGet(stateExtremities...)
 
 	stored, err := s.r.txnGetStoredEventIDs(txn, util.EventsToIDs(evs))
 	if err != nil {
@@ -505,6 +533,10 @@ func (s *federatedEventSender) txnPrepareFederated(
 				// Calculated in a state DAG room, so not given with the event, and resolutions read
 				// them from this copy
 				ev.AuthEventIDs = storedEv.AuthEventIDs
+				if storedEv.Unpublished {
+					// The replay set its prev_content, which a copy read before the replay lacks
+					ev.Unsigned = storedEv.Unsigned
+				}
 			}
 			if ev.Unpublished {
 				// Replayed by the room's ingest job, which publishes it now with the state the replay
@@ -583,7 +615,17 @@ func (s *federatedEventSender) txnPrepareFederated(
 	for _, ev := range evs {
 		if _, dropped := p.dropped[ev.ID]; dropped {
 			continue
-		} else if ev.IsDuplicate || ev.Unpublished {
+		} else if ev.IsDuplicate {
+			plan.evs = append(plan.evs, ev)
+		} else if ev.Unpublished {
+			// Not evaluated, but held to the invariant as evaluated events are: send_join, send_leave
+			// and send_knock take a replayed event with no fast-path check
+			if unpublished, err := p.citedUnpublished(ev); err != nil {
+				return nil, err
+			} else if unpublished != "" {
+				p.drop(ev, fmt.Errorf("%w: %w: %s is not published yet", ErrEventDropped, ErrPrevStateEventsUnavailable, unpublished))
+				continue
+			}
 			plan.evs = append(plan.evs, ev)
 		} else if keep, request, err := p.evaluate(ev); err != nil {
 			return nil, err
@@ -850,6 +892,9 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 func (p *federatedPreparation) citedUnpublished(ev *types.Event) (id.EventID, error) {
 	for _, prevID := range ev.PrevStateEventIDs {
 		if _, found := p.batch[prevID]; found {
+			if _, dropped := p.dropped[prevID]; dropped {
+				return prevID, nil
+			}
 			continue
 		} else if prev, err := p.plan.eventsProvider.Get(prevID); err != nil {
 			return "", err

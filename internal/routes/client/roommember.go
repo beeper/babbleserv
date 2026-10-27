@@ -130,7 +130,7 @@ func (c *ClientRoutes) SendRoomJoin(w http.ResponseWriter, r *http.Request) {
 
 // Joon a room by alias or ID
 func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
-	roomID := c.getRoomIDFromRequest(r, "roomID")
+	roomID, aliasServers := c.getRoomIDFromRequest(r, "roomID")
 	if roomID == "" {
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
 		return
@@ -159,7 +159,9 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 		c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 			return util.EmptyJSON
 		})
-	} else if err := c.remoteJoin(r, roomID, userID, getOtherServers(r, roomID)); err != nil {
+	} else if servers, err := c.remoteMembershipServers(r, roomID, userID, aliasServers); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+	} else if err := c.remoteJoin(r, roomID, userID, servers); err != nil {
 		responseRemoteMembershipError(w, r, err)
 	} else {
 		util.ResponseJSON(w, r, http.StatusOK, struct {
@@ -170,7 +172,7 @@ func (c *ClientRoutes) sendRoomJoin(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3knockroomidoralias
 func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request) {
-	roomID := c.getRoomIDFromRequest(r, "roomID")
+	roomID, aliasServers := c.getRoomIDFromRequest(r, "roomID")
 	if roomID == "" {
 		util.ResponseErrorJSON(w, r, mautrix.MNotFound)
 		return
@@ -199,7 +201,9 @@ func (c *ClientRoutes) SendRoomKnockAlias(w http.ResponseWriter, r *http.Request
 		c.sendLocalEventHandleResults(w, r, roomID, ev, func(ev *types.Event) any {
 			return util.EmptyJSON
 		})
-	} else if err := c.remoteMembership(r, roomID, event.MembershipKnock, userID, getOtherServers(r, roomID)); err != nil {
+	} else if servers, err := c.remoteMembershipServers(r, roomID, userID, aliasServers); err != nil {
+		util.ResponseErrorUnknownJSON(w, r, err)
+	} else if err := c.remoteMembership(r, roomID, event.MembershipKnock, userID, servers); err != nil {
 		responseRemoteMembershipError(w, r, err)
 	} else {
 		util.ResponseJSON(w, r, http.StatusOK, util.EmptyJSON)

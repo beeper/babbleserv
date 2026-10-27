@@ -119,6 +119,20 @@ func TestChangesRemoteMembership(t *testing.T) {
 	assert.False(t, changesRemoteMembership(stateDAGTestEvent("$topic", true), "here"))
 }
 
+func TestOnlyInvitesAndKnocksAreRescinded(t *testing.T) {
+	for membership, rescinded := range map[event.Membership]bool{
+		event.MembershipInvite: true,
+		event.MembershipKnock:  true,
+		event.MembershipJoin:   false,
+		event.MembershipBan:    false,
+		event.MembershipLeave:  false,
+		"":                     false,
+	} {
+		held := types.StateEntry{EventID: "$held", Membership: membership}
+		assert.Equal(t, rescinded, rescindedMembership(held) == "$held", membership)
+	}
+}
+
 func TestOnlyMessagesSoftFailInStateDAGRooms(t *testing.T) {
 	message, state := stateDAGTestEvent("$message", false), stateDAGTestEvent("$topic", true)
 	for _, ev := range []*types.Event{message, state} {
@@ -132,7 +146,7 @@ func TestOnlyMessagesSoftFailInStateDAGRooms(t *testing.T) {
 	assert.True(t, softFails(state), "every event soft fails in other room versions")
 }
 
-// stateDAG holds events with state, keyed by ID, each citing the events after it
+// stateDAG holds events with state, keyed by ID, each citing the prev state events listed for it
 func stateDAG(dag map[id.EventID][]id.EventID) map[id.EventID]*types.Event {
 	evs := make(map[id.EventID]*types.Event, len(dag))
 	for eventID, prevStateEventIDs := range dag {

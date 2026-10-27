@@ -132,8 +132,11 @@ func TestRemoteMembershipErrorKeepsTheRoomVersion(t *testing.T) {
 
 func TestOtherServersSkipsDomainlessRoomIDs(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/join?server_name=a.example.com", nil)
-	assert.Equal(t, []string{"a.example.com", "b.example.com"}, getOtherServers(request, "!room:b.example.com"))
-	assert.Equal(t, []string{"a.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
+	assert.Equal(t, []string{"a.example.com", "b.example.com"}, getOtherServers(request, "!room:b.example.com", nil))
+	assert.Equal(t, []string{"a.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE", nil))
+	assert.Equal(t, []string{"a.example.com", "alias.example.com", "c.example.com"},
+		getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE", []string{"alias.example.com", "c.example.com"}),
+		"a domainless room ID's servers come from the alias lookup")
 }
 
 func TestMakeFederatedEventWithoutServers(t *testing.T) {
@@ -143,7 +146,7 @@ func TestMakeFederatedEventWithoutServers(t *testing.T) {
 
 func TestOtherServersTakeVia(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/knock?via=a.example.com&server_name=c.example.com", nil)
-	assert.Equal(t, []string{"a.example.com", "c.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE"))
+	assert.Equal(t, []string{"a.example.com", "c.example.com"}, getOtherServers(request, "!Rj0GwmnxPwQdujbQoFNSGbRnXTcwYq1b4eMimk4k3EE", nil))
 }
 
 func TestKnocksOfferTheVersionsThisServerJoins(t *testing.T) {

@@ -19,10 +19,11 @@ func TestStateDAGRoomVersionOnlyOnceEnabled(t *testing.T) {
 	assert.False(t, stable)
 }
 
-func TestJoinedRoomVersionsAreThoseHashed(t *testing.T) {
+func TestJoinedRoomVersionsAreThoseCreated(t *testing.T) {
 	var cfg BabbleConfig
 	assert.True(t, cfg.JoinsRoomVersion("12"))
-	assert.True(t, cfg.JoinsRoomVersion(string(gomatrixserverlib.RoomVersionHydra)))
+	assert.False(t, cfg.JoinsRoomVersion(string(gomatrixserverlib.RoomVersionHydra)))
+	assert.False(t, cfg.JoinsRoomVersion(string(gomatrixserverlib.RoomVersionPseudoIDs)))
 	assert.False(t, cfg.JoinsRoomVersion("1"))
 	assert.False(t, cfg.JoinsRoomVersion("unknown"))
 	assert.False(t, cfg.JoinsRoomVersion(string(gomatrixserverlib.RoomVersionStateDAGs)))

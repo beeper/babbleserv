@@ -103,9 +103,10 @@ type EventsDirectory struct {
 	// value: Versionstamp the event was published at
 	roomStateExtremIDs subspace.Subspace
 
-	// A state DAG room's state DAG as other servers see it (MSC4242): every accepted state event,
-	// written as it is published, which send_join serves to joining servers. An event given contexts
-	// but never published has no row, so a joiner never adopts state no other server has.
+	// A state DAG room's state DAG as other servers see it (MSC4242): every accepted state
+	// event, written as it is published, or as a join's replay from outside the room gives it
+	// contexts, the resident having published it. send_join serves the rows before the join's.
+	// Staging never writes it, so a joiner never adopts state no other server has.
 	//
 	// key: (RoomID, Versionstamp)
 	// value: EventID

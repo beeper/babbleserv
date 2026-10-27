@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,12 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 func TestStateDAGWorksRunJoinsOldestFirst(t *testing.T) {
@@ -123,15 +127,31 @@ func TestDecodeStateDAGFailures(t *testing.T) {
 		"an event not an obj": `{"state_dag":[{"event_id":"$0"}, nope]}`,
 	} {
 		_, err := decodeChunks(t, body, 10, 1<<20)
-		assert.ErrorIs(t, err, errBadStateDAGResponse, name)
+		assert.ErrorIs(t, err, errBadSendJoinResponse, name)
 	}
 
 	_, err := decodeChunks(t, stateDAGResponse(3)[:60], 10, 1<<20)
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, errBadStateDAGResponse, "a body cut off is a failed request, not a bad answer")
+	assert.NotErrorIs(t, err, errBadSendJoinResponse, "a body cut off is a failed request, not a bad answer")
 	assert.True(t, errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF), err)
 
 	stop := errors.New("staging failed")
 	err = decodeStateDAG(strings.NewReader(stateDAGResponse(5)), 2, 1<<20, func([]json.RawMessage) error { return stop })
 	assert.Equal(t, stop, err, "an error handling a chunk ends the decoding with it")
+}
+
+// A send_join response's state DAG is bounded in bytes as well as events, so that a server cannot
+// serve endless junk within the count
+func TestStateDAGJoinBoundsTheBytesServed(t *testing.T) {
+	var cfg config.BabbleConfig
+	cfg.Rooms.Ingest.MaxJoinEvents = 2
+	w := &stateDAGJoin{joinWork: joinWork{run: &jobRun{jobs: &Jobs{config: cfg}}}}
+	large := json.RawMessage(`"` + strings.Repeat("x", util.MaxPDUBytes+1) + `"`)
+	var failure *types.IngestFailure
+	require.ErrorAs(t, w.stage(context.Background(), []json.RawMessage{large, large}), &failure)
+	assert.Equal(t, mautrix.MTooLarge.ErrCode, failure.ErrCode)
+
+	w.received, w.receivedBytes = 0, 0
+	require.ErrorAs(t, w.stage(context.Background(), []json.RawMessage{[]byte(`1`), []byte(`2`), []byte(`3`)}), &failure)
+	assert.Equal(t, mautrix.MTooLarge.ErrCode, failure.ErrCode)
 }

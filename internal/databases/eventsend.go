@@ -84,9 +84,9 @@ func (d *Databases) NewStateDAGRemoteJoin(ctx context.Context, joinEv *types.Eve
 	return &RemoteJoin{RemoteJoin: join, d: d, joinEv: joinEv}, nil
 }
 
-// Publish publishes the join. While this server is not in the room the join takes the response
-// state as the room's state, otherwise it is sent like any federated event, against that state and
-// the room's current state.
+// Publish sends the join: while this server is not in the room it takes the response state as the
+// room's state, otherwise it is sent like any federated event, against that state and the room's
+// current state.
 func (j *RemoteJoin) Publish(ctx context.Context) (*rooms.SendEventsResult, error) {
 	res, err := j.RemoteJoin.Publish(ctx)
 	if err != nil {
@@ -112,12 +112,13 @@ func (j *RemoteJoin) Publish(ctx context.Context) (*rooms.SendEventsResult, erro
 			TransactionDevice:   &types.UserDevice{UserID: j.joinEv.Sender, DeviceID: remoteJoinDeviceID},
 			TransactionEndpoint: remoteJoinEndpoint,
 			TransactionID:       j.joinEv.ID.String(),
+			IngestJoinTarget:    j.joinEv.ID,
 		})
 	}
 	return res, nil
 }
 
-// Scope the transaction ID of a remote join's local fallback, which no client device sees
+// Scopes the transaction ID of a remote join's local fallback, which no client device sees
 const (
 	remoteJoinDeviceID = id.DeviceID("BABBLESERV_REMOTE_JOIN")
 	remoteJoinEndpoint = "remote-join"

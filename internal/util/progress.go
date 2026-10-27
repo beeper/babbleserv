@@ -1,6 +1,10 @@
 package util
 
-import "context"
+import (
+	"context"
+	"sync"
+	"time"
+)
 
 type progressKey struct{}
 
@@ -16,4 +20,25 @@ func ReportProgress(ctx context.Context) {
 	if fn, ok := ctx.Value(progressKey{}).(func()); ok {
 		fn()
 	}
+}
+
+// ReportProgressEvery reports progress every interval until stopped, for a wait that its own timeout
+// bounds rather than the job's watchdog
+func ReportProgressEvery(ctx context.Context, interval time.Duration) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ReportProgress(ctx)
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() { close(done) })
 }

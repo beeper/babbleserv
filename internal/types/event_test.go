@@ -412,6 +412,7 @@ func TestStateDAGEventFormatRefused(t *testing.T) {
 		"mixed prev_state_events":           set("prev_state_events", `["$abc", 1]`),
 		"null in prev_state_events":         set("prev_state_events", `["$abc", null]`),
 		"too many prev_events":              set("prev_events", string(tooManyJSON)),
+		"too many prev_state_events":        set("prev_state_events", string(tooManyJSON)),
 		"case variant of prev_state_events": set("Prev_State_Events", `[]`),
 	}
 	require.NoError(t, json.Unmarshal([]byte(valid), &types.Event{RoomVersion: stateDAGsVersion}))
@@ -428,13 +429,7 @@ func TestStateDAGEventFormatRefused(t *testing.T) {
 		}
 	}
 
-	pdu, err := sjson.SetRaw(valid, "prev_state_events", string(tooManyJSON))
-	require.NoError(t, err)
-	ev := &types.Event{RoomVersion: stateDAGsVersion}
-	require.NoError(t, json.Unmarshal([]byte(pdu), ev), "the Synapse fork cites every state extremity")
-	assert.Len(t, ev.PrevStateEventIDs, types.MaxStateDAGPrevEvents+1)
-
-	pdu, err = sjson.SetRaw(valid, "prev_events", string(tooManyJSON))
+	pdu, err := sjson.SetRaw(valid, "prev_events", string(tooManyJSON))
 	require.NoError(t, err)
 	pdu, err = sjson.Set(pdu, "auth_events", []string{"$power"})
 	require.NoError(t, err)

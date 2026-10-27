@@ -78,16 +78,29 @@ type RoomsDatabase struct {
 	// (EventID, UserID, DeviceID) -> TransactionID
 	eventTransactionIDs subspace.Subspace
 
-	// Ingest jobs, see docs/event-sending.md#ingest-jobs
+	// A room's ingest job, holding the room version, present while the room has targets,
+	// see docs/event-sending.md#ingest-jobs
 	//
-	// ijb: RoomID -> types.IngestJob
-	// ijt: (RoomID, EventID) -> types.IngestTarget
-	// iju: (RoomID, UserID) -> types.IngestJoin
-	// ijq: (RoomID, "pdus" | "bytes") -> little-endian int64, the PDU targets queued
-	ingestJobs    subspace.Subspace
+	// key: RoomID
+	// value: types.IngestJob (msgpack)
+	ingestJobs subspace.Subspace
+	// Events the room's job publishes once the state they need is stored, a local user's
+	// join or a PDU
+	//
+	// key: (RoomID, EventID)
+	// value: types.IngestTarget (msgpack)
 	ingestTargets subspace.Subspace
-	ingestJoins   subspace.Subspace
-	ingestQueues  subspace.Subspace
+	// The join target of a local user's pending join, or why it failed, which the user's
+	// /join watches
+	//
+	// key: (RoomID, UserID)
+	// value: types.IngestJoin (msgpack)
+	ingestJoins subspace.Subspace
+	// The PDU targets queued and their event bytes, kept with atomic adds
+	//
+	// key: (RoomID, "pdus" | "bytes")
+	// value: little-endian int64
+	ingestQueues subspace.Subspace
 
 	// BabbleBot's direct message room with each local user
 	//

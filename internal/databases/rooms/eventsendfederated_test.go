@@ -55,14 +55,9 @@ func TestEndsHeldMembership(t *testing.T) {
 			outlierMemberEvent("$leave", stateDAGs, "@mallory:there", event.MembershipLeave, "$invite"),
 			false,
 		},
-		"a kick rejects a knock citing it in a state DAG room": {
+		"a knock rejected citing it in a state DAG room, as Synapse takes none": {
 			outlierMemberEvent("$knock", stateDAGs, "@alice:here", event.MembershipKnock, "$power"),
 			outlierMemberEvent("$leave", stateDAGs, "@charlie:there", event.MembershipLeave, "$knock"),
-			true,
-		},
-		"a kick rejects a knock not citing it in a state DAG room": {
-			outlierMemberEvent("$knock", stateDAGs, "@alice:here", event.MembershipKnock, "$power"),
-			outlierMemberEvent("$leave", stateDAGs, "@charlie:there", event.MembershipLeave, "$power"),
 			false,
 		},
 		"a leave the user holds already ends nothing": {

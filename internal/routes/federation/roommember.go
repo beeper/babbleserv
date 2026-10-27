@@ -2,10 +2,15 @@ package federation
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"sync"
+	"time"
 
+	"github.com/beeper/libserv/pkg/requestlog"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
@@ -112,14 +117,23 @@ func (f *FederationRoutes) MakeJoin(w http.ResponseWriter, r *http.Request) {
 
 // https://spec.matrix.org/v1.11/server-server-api/#put_matrixfederationv2send_joinroomideventid
 func (f *FederationRoutes) SendJoin(w http.ResponseWriter, r *http.Request) {
+	release := func() {}
+	defer func() { release() }()
 	f.sendMembershipEventFromOtherServer(w, r, event.MembershipJoin, membershipResponse{
 		// A state DAG too large to serve with the join refuses the join before it is sent, rather
 		// than leave the joiner joined here alone. A join stored already counts in it, so is answered
-		// again as the first was.
+		// again as the first was. A server served as many state DAGs as it may at once waits for
+		// one to end before its join is sent, holding no transaction.
 		beforeSend: func(room *types.Room, ev *types.Event) error {
 			if !util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs) {
 				return nil
-			} else if stored, err := f.db.Rooms.GetStoredEventIDs(r.Context(), []id.EventID{ev.ID}); err != nil || len(stored) > 0 {
+			}
+			acquired, err := f.stateDAGJoins.acquire(r.Context(), middleware.GetRequestServer(r))
+			if err != nil {
+				return err
+			}
+			release = acquired
+			if stored, err := f.db.Rooms.GetStoredEventIDs(r.Context(), []id.EventID{ev.ID}); err != nil || len(stored) > 0 {
 				return err
 			}
 			return f.db.Rooms.CheckServedStateDAG(r.Context(), room.ID)
@@ -155,8 +169,9 @@ type stateDAGJoinResponse struct {
 	ev   *types.Event
 }
 
-// write streams the response. Should reading the state DAG fail part way, the body is left
-// unfinished, so the joining server takes it for a failed request and sends the join again.
+// write streams the response. Should reading the state DAG fail part way, or the joining server stop
+// reading it for stateDAGWriteTimeout, the body is left unfinished, so the joining server takes it
+// for a failed request and sends the join again.
 func (resp stateDAGJoinResponse) write(w http.ResponseWriter, r *http.Request) {
 	log := hlog.FromRequest(r)
 	head, err := json.Marshal(struct {
@@ -169,11 +184,19 @@ func (resp stateDAGJoinResponse) write(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	body := bufio.NewWriter(w)
+	conn := http.NewResponseController(connWriter(w))
+	var out io.Writer = w
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		log.Warn().Err(err).Msg("Serving the state DAG of a join without write deadlines")
+	} else {
+		out = deadlineWriter{w, conn}
+		defer conn.SetWriteDeadline(time.Time{})
+	}
+	body := bufio.NewWriterSize(out, stateDAGWriteBuffer)
 	body.Write(head[:len(head)-1])
 	body.WriteString(`,"state_dag":[`)
 	served := 0
-	err = resp.f.db.Rooms.StreamServedStateDAG(r.Context(), resp.room.ID, func(evs []*types.Event) error {
+	err = resp.f.db.Rooms.StreamServedStateDAG(r.Context(), resp.room.ID, resp.ev.ID, func(evs []*types.Event) error {
 		for _, ev := range evs {
 			b, err := json.Marshal(ev)
 			if err != nil {
@@ -215,4 +238,102 @@ func (f *FederationRoutes) SendKnock(w http.ResponseWriter, r *http.Request) {
 			}{strippedState}, nil
 		},
 	})
+}
+
+var errTooManyStateDAGJoins = errors.New("the server has as many state DAGs of joins served and waiting as it may")
+
+// Most time a write of a send_join response's state DAG may take, so that a joining server no longer
+// reading it ends the response, and the bytes buffered between writes
+const (
+	stateDAGWriteTimeout = 30 * time.Second
+	stateDAGWriteBuffer  = 64 << 10
+)
+
+type deadlineWriter struct {
+	w    http.ResponseWriter
+	conn *http.ResponseController
+}
+
+func (d deadlineWriter) Write(p []byte) (int, error) {
+	if err := d.conn.SetWriteDeadline(time.Now().Add(stateDAGWriteTimeout)); err != nil {
+		return 0, err
+	}
+	return d.w.Write(p)
+}
+
+// connWriter is the writer of the response's connection, which the access log's writer hides from
+// http.ResponseController
+func connWriter(w http.ResponseWriter) http.ResponseWriter {
+	if counting, ok := w.(*requestlog.CountingResponseWriter); ok {
+		return counting.ResponseWriter
+	}
+	return w
+}
+
+// originLimiter bounds the requests of each origin served at once, as Synapse's rc_federation does:
+// more wait for a turn, in a queue of a bounded length past which they are refused
+type originLimiter struct {
+	limit, queue int
+	mu           sync.Mutex
+	origins      map[string]*originTurns
+}
+
+type originTurns struct {
+	turns   chan struct{}
+	waiting int
+}
+
+func newOriginLimiter(limit, queue int) *originLimiter {
+	return &originLimiter{limit: limit, queue: queue, origins: make(map[string]*originTurns)}
+}
+
+// acquire takes one of the origin's turns, returning its release, waiting for one while ctx lasts,
+// unless the origin's queue is full, which fails with errTooManyStateDAGJoins
+func (l *originLimiter) acquire(ctx context.Context, origin string) (func(), error) {
+	l.mu.Lock()
+	o := l.origins[origin]
+	if o == nil {
+		o = &originTurns{turns: make(chan struct{}, l.limit)}
+		l.origins[origin] = o
+	}
+	select {
+	case o.turns <- struct{}{}:
+		l.mu.Unlock()
+		return l.release(origin, o), nil
+	default:
+	}
+	if o.waiting >= l.queue {
+		l.mu.Unlock()
+		return nil, errTooManyStateDAGJoins
+	}
+	o.waiting++
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		o.waiting--
+		l.forgetIdle(origin, o)
+	}()
+	select {
+	case o.turns <- struct{}{}:
+		return l.release(origin, o), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (l *originLimiter) release(origin string, o *originTurns) func() {
+	return sync.OnceFunc(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		<-o.turns
+		l.forgetIdle(origin, o)
+	})
+}
+
+// forgetIdle drops the turns of an origin no request holds or waits for, under the lock
+func (l *originLimiter) forgetIdle(origin string, o *originTurns) {
+	if len(o.turns) == 0 && o.waiting == 0 {
+		delete(l.origins, origin)
+	}
 }

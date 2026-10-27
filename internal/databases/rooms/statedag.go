@@ -69,6 +69,15 @@ func citedPrevStateEvents(extremities []id.EventID, superseded id.EventID) (cite
 	return append(cited, superseded), false
 }
 
+// rescindedMembership returns the membership a leave of its target rescinds, held in current state
+func rescindedMembership(held types.StateEntry) id.EventID {
+	switch held.Membership {
+	case event.MembershipInvite, event.MembershipKnock:
+		return held.EventID
+	}
+	return ""
+}
+
 // changesRemoteMembership reports whether a member event changes the membership of a user of a
 // server other than serverName, sent by someone else: an out-of-band change, should the target's
 // server not be in the room. A make_* template is the target's own event, sent back by its server.
@@ -102,13 +111,19 @@ func (r *RoomsDatabase) CheckServedStateDAG(ctx context.Context, roomID id.RoomI
 // Events of a state DAG that send_join serves per transaction
 const servedStateDAGPage = 500
 
-// StreamServedStateDAG hands each a state DAG room's state DAG as published, every accepted state
-// event in the order it was published, a page per transaction. It reads on to the end, so a state
-// event published meanwhile may be among them, harmlessly: it cites only events before it.
-func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.RoomID, each func([]*types.Event) error) error {
+// ErrJoinNotInStateDAG fails serving a state DAG for a join that is not in it, which every join
+// accepted here is
+var ErrJoinNotInStateDAG = errors.New("join is not in the room's state DAG")
+
+// StreamServedStateDAG hands each the part of a state DAG room's state DAG served with a join: every
+// accepted state event published before the join, in the order it was published, a page per
+// transaction. Neither the join nor what was published after it are served, as Synapse serves only
+// the join's ancestors, and would otherwise store the join itself without state first.
+func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.RoomID, joinID id.EventID, each func([]*types.Event) error) error {
 	type page struct {
-		evs  []*types.Event
-		next fdb.Key
+		evs    []*types.Event
+		next   fdb.Key
+		atJoin bool
 	}
 	var after fdb.Key
 	for {
@@ -117,15 +132,21 @@ func (r *RoomsDatabase) StreamServedStateDAG(ctx context.Context, roomID id.Room
 			if err != nil {
 				return page{}, err
 			}
+			i := slices.Index(eventIDs, joinID)
+			if i >= 0 {
+				eventIDs = eventIDs[:i]
+			}
 			evs, err := r.events.NewTxnEventsProvider(ctx, txn).GetAll(eventIDs)
-			return page{evs, next}, err
+			return page{evs, next, i >= 0}, err
 		})
 		if err != nil {
 			return err
 		} else if err := each(pg.evs); err != nil {
 			return err
-		} else if pg.next == nil {
+		} else if pg.atJoin {
 			return nil
+		} else if pg.next == nil {
+			return fmt.Errorf("%w: %s", ErrJoinNotInStateDAG, joinID)
 		}
 		after = pg.next
 	}

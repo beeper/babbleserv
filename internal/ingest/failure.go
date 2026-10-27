@@ -66,7 +66,7 @@ func failureFromError(err error) *types.IngestFailure {
 			ErrCode: mautrix.MUnsupportedRoomVersion.ErrCode,
 			Message: err.Error(),
 		}
-	case errors.Is(err, errNoProgress), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, errNoProgress), errors.Is(err, errJoinTimedOut), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return &types.IngestFailure{
 			Status:  http.StatusInternalServerError,
 			ErrCode: mautrix.MUnknown.ErrCode,
@@ -106,7 +106,7 @@ func incompleteStateDAGFailure() *types.IngestFailure {
 	}
 }
 
-// tooLargeFailure is a join refused for the events the resident gives with it, of what is given
+// tooLargeFailure is a join refused for too many of some kind of event (what) the resident gave with it
 func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,

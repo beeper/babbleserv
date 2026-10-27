@@ -59,7 +59,7 @@ func isPulled(ev *types.Event, pulled map[id.EventID]struct{}) bool {
 	return found
 }
 
-// splitConnected splits events in topological order, keeping it in both parts
+// splitConnected splits events in topological order, keeping that order in both parts
 func splitConnected(evs []*types.Event, stored, prevStateInPlace, pulled map[id.EventID]struct{}) (connected, rest []*types.Event) {
 	earlier := make(map[id.EventID]struct{}, len(evs))
 	missingFrom := func(inPlace map[id.EventID]struct{}) func(id.EventID) bool {

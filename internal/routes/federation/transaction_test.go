@@ -1,13 +1,20 @@
 package federation
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/types"
@@ -80,4 +87,25 @@ func TestTransactionsWithoutIngestingRoomsDoNotWait(t *testing.T) {
 
 	txnRooms.rooms["!joining:example.com"] = pduRoom{version: "11", ingesting: true}
 	assert.True(t, txnRooms.anyIngesting())
+}
+
+// A transaction over the spec's 50 PDUs or 100 EDUs is refused whole, as Synapse refuses it
+func TestSendTransactionRefusesTooManyPDUsOrEDUs(t *testing.T) {
+	send := func(pdus, edus int) int {
+		body, err := json.Marshal(map[string]any{
+			"origin": "remote.example",
+			"pdus":   slices.Repeat([]json.RawMessage{json.RawMessage(`{}`)}, pdus),
+			"edus":   slices.Repeat([]map[string]any{{"edu_type": "m.presence"}}, edus),
+		})
+		require.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPut, "/v1/send/txn", bytes.NewReader(body))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("txnID", "txn")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+		w := httptest.NewRecorder()
+		(&FederationRoutes{}).SendTransaction(w, req)
+		return w.Code
+	}
+	assert.Equal(t, http.StatusBadRequest, send(maxTransactionPDUs+1, 0))
+	assert.Equal(t, http.StatusBadRequest, send(0, maxTransactionEDUs+1))
 }

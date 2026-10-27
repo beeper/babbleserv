@@ -27,6 +27,8 @@ type FederationRoutes struct {
 	datastores *util.Datastores
 	notifiers  *notifier.Notifiers
 	ingestJobs *ingest.Jobs
+	// The send_join responses of state DAG rooms served to each server
+	stateDAGJoins *originLimiter
 }
 
 func NewFederationRoutes(
@@ -54,6 +56,8 @@ func NewFederationRoutes(
 		datastores: datastores,
 		notifiers:  notifiers,
 		ingestJobs: ingestJobs,
+
+		stateDAGJoins: newOriginLimiter(cfg.Federation.MaxStateDAGJoinsPerOrigin, cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin),
 	}
 }
 

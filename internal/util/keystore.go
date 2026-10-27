@@ -166,12 +166,16 @@ func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, 
 	return errors.Join(errs...)
 }
 
+// VerifyJSONs verifies each request's signature, failing whole only once ctx ends: a caller giving up
+// waiting for a server's keys says nothing of what the server signed
 func (k *KeyStore) VerifyJSONs(ctx context.Context, requests []gomatrixserverlib.VerifyJSONRequest) ([]gomatrixserverlib.VerifyJSONResult, error) {
 	results := make([]gomatrixserverlib.VerifyJSONResult, len(requests))
 	for i, request := range requests {
 		serverName := string(request.ServerName)
 		keys, err := k.GetServerKeys(ctx, serverName)
-		if err != nil {
+		if err != nil && ctx.Err() != nil {
+			return nil, err
+		} else if err != nil {
 			results[i].Error = err
 			continue
 		}

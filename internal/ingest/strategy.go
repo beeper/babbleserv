@@ -22,9 +22,26 @@ type strategy interface {
 	collect(ctx context.Context, run *jobRun, targets []*types.IngestTarget) ([]ingestWork, error)
 }
 
+// workKind is what a unit of work does, which bounds how many of its kind the process runs at once
+type workKind int
+
+const (
+	workConnected workKind = iota
+	workGapFill
+	workJoin
+)
+
+func pduWorkKind(gap bool) workKind {
+	if gap {
+		return workGapFill
+	}
+	return workConnected
+}
+
 // ingestWork publishes some of a room's targets: a join, or PDUs. A phase ending the work early, its
 // targets failed or replaced, returns errWorkDone.
 type ingestWork interface {
+	kind() workKind
 	// Phase A: fetch from other servers what the targets need, verify it and stage it
 	fetch(ctx context.Context) error
 	// Phase B: give the staged events and the targets the state they need

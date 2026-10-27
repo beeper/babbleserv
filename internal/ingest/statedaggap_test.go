@@ -46,7 +46,7 @@ type stateDAGServers struct {
 }
 
 func newStateDAGServers(cites map[id.EventID][]id.EventID, published ...id.EventID) *stateDAGServers {
-	s := &stateDAGServers{cites: cites, published: make(map[id.EventID]bool), stored: make(map[id.EventID]bool), maxEvents: maxStateDAGLimit}
+	s := &stateDAGServers{cites: cites, published: make(map[id.EventID]bool), stored: make(map[id.EventID]bool), maxEvents: MaxStateDAGMissingEvents}
 	for _, eventID := range append(published, "$createhash") {
 		s.published[eventID] = true
 	}
@@ -145,7 +145,7 @@ func (s *stateDAGServers) fill(t *testing.T, maxPerPDU int, budget *int, servers
 	t.Helper()
 	gap, err := s.walk(context.Background())
 	require.NoError(t, err)
-	fill := newStateDAGFill(s.pdus, gap, maxPerPDU, budget)
+	fill := newStateDAGFill(s.pdus, gap, maxPerPDU, budget, time.Now().Add(time.Hour))
 	require.NoError(t, fill.run(context.Background(), servers, s.request, s.walk))
 	return fill
 }
@@ -192,7 +192,7 @@ func TestStateDAGFillSplitsLatestEvents(t *testing.T) {
 	assert.Len(t, servers.requests[0].latestIDs, 100)
 	assert.Len(t, servers.requests[1].latestIDs, 50)
 	for _, req := range servers.requests {
-		assert.LessOrEqual(t, len(req.latestIDs), maxStateDAGRequestIDs)
+		assert.LessOrEqual(t, len(req.latestIDs), MaxStateDAGRequestIDs)
 	}
 	assert.Empty(t, fill.open(), "the limit, which counts events in all, grows until the gaps are filled")
 }
@@ -266,7 +266,7 @@ func TestStateDAGFillBounds(t *testing.T) {
 	budget := 12
 	gap, err := servers.walk(context.Background())
 	require.NoError(t, err)
-	err = newStateDAGFill(servers.pdus, gap, 10_000, &budget).run(context.Background(), []string{"origin.example"}, servers.request, servers.walk)
+	err = newStateDAGFill(servers.pdus, gap, 10_000, &budget, time.Now().Add(time.Hour)).run(context.Background(), []string{"origin.example"}, servers.request, servers.walk)
 	assert.ErrorIs(t, err, errGapBudgetSpent)
 }
 
@@ -319,8 +319,10 @@ func TestSendFailedAfterAServerAnswered(t *testing.T) {
 	var cfg config.BabbleConfig
 	cfg.Rooms.Ingest.JoinTimeout = time.Hour
 	w := &joinWork{
-		run:    &jobRun{jobs: &Jobs{config: cfg}},
-		target: &types.IngestTarget{Kind: types.IngestTargetJoin, Event: testTarget(types.IngestTargetJoin, "$join", 0).Event, Enqueued: time.Now().UnixMilli()},
+		run: &jobRun{jobs: &Jobs{config: cfg}},
+		// Its timeout counts from its first send, not from when it was enqueued
+		target:    &types.IngestTarget{Kind: types.IngestTargetJoin, Event: testTarget(types.IngestTargetJoin, "$join", 0).Event, Enqueued: time.Now().Add(-2 * time.Hour).UnixMilli()},
+		firstSent: time.Now(),
 	}
 	before := &types.IngestTarget{MayHaveLanded: true}
 	refused := gomatrix.HTTPError{Code: http.StatusForbidden}
@@ -334,13 +336,13 @@ func TestSendFailedAfterAServerAnswered(t *testing.T) {
 
 func TestDecodeStateDAGBoundsEachValue(t *testing.T) {
 	// Over the bound by more than what the decoder may have read ahead of the value
-	large := strings.Repeat("x", 2*maxStateDAGValueBytes)
+	large := strings.Repeat("x", 2*maxSendJoinValueBytes)
 	_, err := decodeChunks(t, `{"state_dag":[{"event_id":"$0","content":{"body":"`+large+`"}}]}`, 10, 1<<30)
-	assert.ErrorIs(t, err, errBadStateDAGResponse, "an event")
+	assert.ErrorIs(t, err, errBadSendJoinResponse, "an event")
 	_, err = decodeChunks(t, `{"origin":"`+large+`","state_dag":[]}`, 10, 1<<30)
-	assert.ErrorIs(t, err, errBadStateDAGResponse, "a member skipped")
+	assert.ErrorIs(t, err, errBadSendJoinResponse, "a member skipped")
 
-	half := large[:maxStateDAGValueBytes/2]
+	half := large[:maxSendJoinValueBytes/2]
 	chunks, err := decodeChunks(t, `{"origin":"`+half+`","state_dag":[{"event_id":"$0","content":{"body":"`+half+`"}},{"event_id":"$1"}]}`, 10, 1<<30)
 	require.NoError(t, err, "each value is bounded on its own")
 	assert.Equal(t, [][]string{{"$0", "$1"}}, chunks)
@@ -359,7 +361,9 @@ func TestStateDAGFillIgnoresEventsOutsideTheGap(t *testing.T) {
 	assert.Equal(t, unfilledGapFailure(), failures["$pdu"])
 }
 
-// A server giving the gap an event at a time is asked a bounded number of rounds, then left
+// A server giving the gap an event at a time is asked a bounded number of rounds, then left. Still
+// giving it, the server may give the rest when asked again, so the PDU is held back rather than
+// failed, as Synapse caps its answers at 20 events.
 func TestStateDAGFillBoundsTheRoundsAServerIsAsked(t *testing.T) {
 	servers := newStateDAGServers(chain(99), "$base")
 	servers.maxEvents = 1
@@ -369,8 +373,45 @@ func TestStateDAGFillBoundsTheRoundsAServerIsAsked(t *testing.T) {
 	assert.Equal(t, 10, stateDAGRounds(1000), "7 growing the limit, 2 at 1,000, 1 from the frontier")
 	assert.NotEmpty(t, fill.open())
 	failures, held := fill.outcome()
-	assert.Equal(t, unfilledGapFailure(), failures["$pdu"])
-	assert.Empty(t, held)
+	assert.Empty(t, failures)
+	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}}, held)
+}
+
+// A fill past its time asks no more servers, holding back the PDUs whose gap is open
+func TestStateDAGFillHoldsPDUsPastItsTime(t *testing.T) {
+	servers := newStateDAGServers(chain(5), "$base")
+	servers.pdu("$pdu", "$s05")
+	servers.pdu("$connected", "$base")
+	gap, err := servers.walk(context.Background())
+	require.NoError(t, err)
+	fill := newStateDAGFill(servers.pdus, gap, 10_000, unlimited(), time.Now())
+	require.NoError(t, fill.run(context.Background(), []string{"origin.example"}, servers.request, servers.walk))
+	assert.Empty(t, servers.requests)
+	failures, held := fill.outcome()
+	assert.Empty(t, failures)
+	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}}, held)
+}
+
+// A request walking from the frontier names at most 100 of its events, however many there are
+func TestStateDAGFillNamesPartOfALargeFrontier(t *testing.T) {
+	servers := newStateDAGServers(map[id.EventID][]id.EventID{"$base": nil}, "$base")
+	servers.maxEvents = 1
+	for i := range 150 {
+		deep, near := id.EventID(fmt.Sprintf("$d%03d", i)), id.EventID(fmt.Sprintf("$n%03d", i))
+		servers.cites[deep] = []id.EventID{"$base"}
+		servers.cites[near] = []id.EventID{deep}
+		servers.pdu(id.EventID(fmt.Sprintf("$pdu%03d", i)), near)
+	}
+	servers.fill(t, 10_000, unlimited(), "origin.example")
+	frontierRequests := 0
+	for _, req := range servers.requests {
+		assert.LessOrEqual(t, len(req.latestIDs), MaxStateDAGRequestIDs)
+		if !strings.HasPrefix(req.latestIDs[0].String(), "$pdu") {
+			frontierRequests++
+		}
+	}
+	require.NotZero(t, frontierRequests)
+	assert.LessOrEqual(t, len(servers.requests)-frontierRequests, 2*stateDAGRounds(10_000), "each round names the open PDUs, 100 a request")
 }
 
 // A PDU reaching another target of the job, through events served, is held back for it to publish

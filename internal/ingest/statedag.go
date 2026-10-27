@@ -60,13 +60,14 @@ const maxStateDAGJoinTips = 1000
 type stateDAGJoin struct {
 	joinWork
 	// Of the last response: its state DAG's events, and whether any of them cites each, which
-	// leaves the tips uncited; the events it gave, and those verified; its name and alias events;
-	// the events not staged, the join and those citing it or another not staged
-	served   map[id.EventID]bool
-	received int
-	seen     map[id.EventID]struct{}
-	naming   []*types.Event
-	skipped  map[id.EventID]struct{}
+	// leaves the tips uncited; the events it gave, their bytes, and those verified; its name and
+	// alias events; the events not staged, the join and those citing it or another not staged
+	served        map[id.EventID]bool
+	received      int
+	receivedBytes int
+	seen          map[id.EventID]struct{}
+	naming        []*types.Event
+	skipped       map[id.EventID]struct{}
 	// Whether this server was in the room as the join's state was built
 	member bool
 }
@@ -136,10 +137,10 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		w.served, w.received, w.seen, w.naming = make(map[id.EventID]bool), 0, make(map[id.EventID]struct{}), nil
+		w.served, w.received, w.receivedBytes, w.seen, w.naming = make(map[id.EventID]bool), 0, 0, make(map[id.EventID]struct{}), nil
 		w.skipped = map[id.EventID]struct{}{w.target.Event.ID: {}}
 		var stageErr error
-		err = w.run.jobs.fetcher.SendJoinStateDAG(ctx, server, w.target.Event, func(raws []json.RawMessage) error {
+		err = w.run.jobs.fetcher.SendJoinStateDAG(ctx, server, w.target.Event, w.timesOut(), func(raws []json.RawMessage) error {
 			stageErr = w.stage(ctx, raws)
 			return stageErr
 		})
@@ -149,7 +150,7 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 			return w.run.fail(ctx, w.target, failure)
 		case stageErr != nil:
 			return stageErr
-		case errors.Is(err, errBadStateDAGResponse):
+		case errors.Is(err, errBadSendJoinResponse):
 			log.Warn().Err(err).Str("server", server).Msg("Server answered the join with no state DAG")
 			w.answered = true
 			incomplete[server] = struct{}{}
@@ -184,14 +185,24 @@ func (w *stateDAGJoin) sendJoin(ctx context.Context) error {
 // skipping, before their signatures are checked, those stored already. Events citing the join, or
 // one skipped so, are newer than it: they cannot have state before it publishes, so arrive as PDUs
 // rather than being staged. It records what the state DAG cites, for its tips, and names the room
-// for BabbleBot's notices.
+// for BabbleBot's notices. Only a chunk holding events of the room reports progress, so that a
+// server serving junk cannot keep the job going.
 func (w *stateDAGJoin) stage(ctx context.Context, raws []json.RawMessage) error {
-	defer util.ReportProgress(ctx)
+	limit := w.run.jobs.config.Rooms.Ingest.MaxJoinEvents
 	w.received += len(raws)
-	if limit := w.run.jobs.config.Rooms.Ingest.MaxJoinEvents; w.received > limit {
-		return tooLargeFailure("state DAG has over", limit, limit)
+	for _, raw := range raws {
+		w.receivedBytes += len(raw)
 	}
-	parsed := w.skipNewerThanJoin(parseStateDAGEvents(ctx, raws, w.target.Event.RoomVersion, w.run.roomID))
+	if w.received > limit {
+		return tooLargeFailure("state DAG has over", limit, limit)
+	} else if w.receivedBytes > limit*util.MaxPDUBytes {
+		return tooLargeFailure("state DAG has over the bytes of", limit, limit)
+	}
+	roomEvs := parseStateDAGEvents(ctx, raws, w.target.Event.RoomVersion, w.run.roomID)
+	if len(roomEvs) > 0 {
+		defer util.ReportProgress(ctx)
+	}
+	parsed := w.skipNewerThanJoin(roomEvs)
 	staged, stored, err := w.run.stageUnstored(ctx, parsed, w.seen, 0)
 	if err != nil {
 		return err
@@ -231,7 +242,6 @@ func (w *stateDAGJoin) skipNewerThanJoin(evs []*types.Event) []*types.Event {
 	})
 }
 
-// cite records a served state DAG event and the events it cites
 func (w *stateDAGJoin) cite(ev *types.Event) {
 	if _, found := w.served[ev.ID]; !found {
 		w.served[ev.ID] = false
@@ -317,6 +327,10 @@ func (w *stateDAGPDUs) targets() []*types.IngestTarget {
 	return w.pdus
 }
 
+func (w *stateDAGPDUs) kind() workKind {
+	return pduWorkKind(w.gap)
+}
+
 func (w *stateDAGPDUs) fetch(ctx context.Context) error {
 	if !w.gap {
 		return nil
@@ -346,6 +360,9 @@ func (w *stateDAGPDUs) pullPrevEvents(ctx context.Context) error {
 		return err
 	}
 	zerolog.Ctx(ctx).Info().Int("pulled", len(pulled)).Msg("Pulled prev events missing here")
+	for _, target := range pulled {
+		w.run.targets[target.Event.ID] = struct{}{}
+	}
 	w.pdus = sortTargetsTopologically(append(w.pdus, pulled...))
 	return nil
 }

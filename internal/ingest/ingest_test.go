@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,29 @@ func TestClassifySendJoinError(t *testing.T) {
 			assert.Equal(t, tc.want, classifySendJoinError(tc.err))
 		})
 	}
+}
+
+func TestDecodeLegacySendJoin(t *testing.T) {
+	body := `{"origin":"resident.example","state":[{"a":1},{"b":2}],"event":{"x":[1,{}]},"auth_chain":[{"c":3}]}`
+	state, authChain, err := decodeLegacySendJoin(strings.NewReader(body), 3)
+	require.NoError(t, err)
+	assert.Equal(t, []json.RawMessage{json.RawMessage(`{"a":1}`), json.RawMessage(`{"b":2}`)}, state)
+	assert.Equal(t, []json.RawMessage{json.RawMessage(`{"c":3}`)}, authChain)
+
+	var failure *types.IngestFailure
+	_, _, err = decodeLegacySendJoin(strings.NewReader(body), 2)
+	require.ErrorAs(t, err, &failure, "state and auth chain count together")
+	assert.Equal(t, mautrix.MTooLarge.ErrCode, failure.ErrCode)
+
+	_, _, err = decodeLegacySendJoin(strings.NewReader(`{"state":[1,2,3,`), 2)
+	require.ErrorAs(t, err, &failure, "counted as decoded, before the rest of the body is read")
+
+	_, _, err = decodeLegacySendJoin(strings.NewReader(`{"state":[1},"auth_chain":[]}`), 10)
+	assert.ErrorIs(t, err, errBadSendJoinResponse)
+
+	tooLarge := errors.New("too large")
+	_, _, err = decodeLegacySendJoin(&limitedReader{r: strings.NewReader(body), limit: 40, err: tooLarge}, 10)
+	assert.Equal(t, tooLarge, err, "a body past its bytes fails with the reader's error")
 }
 
 func TestFailureFromError(t *testing.T) {
@@ -394,4 +418,43 @@ func TestJobsForgetARunnerThatPanicked(t *testing.T) {
 	jobs.Run("!room:example.com")
 	jobs.wg.Wait()
 	assert.Empty(t, jobs.running, "nothing runs once stopped")
+}
+
+// fakeWork records that it ran, its phases doing nothing
+type fakeWork struct {
+	workKind workKind
+	target   *types.IngestTarget
+	ran      *[]id.EventID
+}
+
+func (w *fakeWork) kind() workKind                 { return w.workKind }
+func (w *fakeWork) targets() []*types.IngestTarget { return []*types.IngestTarget{w.target} }
+func (w *fakeWork) fetch(context.Context) error {
+	*w.ran = append(*w.ran, w.target.Event.ID)
+	return nil
+}
+func (w *fakeWork) build(context.Context) error   { return nil }
+func (w *fakeWork) publish(context.Context) error { return nil }
+
+// A round ends after the first join it runs, so that the next collects the PDUs written meanwhile
+// and puts them ahead of the other joins
+func TestRoundEndsAfterAJoin(t *testing.T) {
+	var ran []id.EventID
+	work := func(kind workKind, eventID id.EventID) ingestWork {
+		return &fakeWork{workKind: kind, target: testTarget(types.IngestTargetPDU, eventID, 1), ran: &ran}
+	}
+	heldJoin := work(workJoin, "$heldJoin").(*fakeWork)
+	heldJoin.target.FailedAt = time.Now().UnixMilli()
+	run := &jobRun{jobs: &Jobs{}}
+	held, errs, err := run.runWorks(context.Background(), []ingestWork{
+		work(workConnected, "$connected"),
+		heldJoin,
+		work(workJoin, "$join1"),
+		work(workJoin, "$join2"),
+		work(workGapFill, "$citesJoin"),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, errs)
+	assert.Equal(t, []id.EventID{"$connected", "$join1"}, ran, "a join held back does not end the round")
+	assert.Equal(t, map[id.EventID]struct{}{"$heldJoin": {}}, held)
 }

@@ -171,3 +171,20 @@ func TestGapPlanStopsWithItsContext(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, context.Canceled)
 }
+
+// The PDUs reaching, through the events pulled, a prev event whose state was not fetched are held
+// back, as the pulled events citing it would be dropped, and the PDUs with them
+func TestReachingPrevs(t *testing.T) {
+	pulled := []*types.Event{
+		testPDU("$pulledOld", []id.EventID{"$unfetched"}),
+		testPDU("$pulledNew", []id.EventID{"$pulledOld"}),
+		testPDU("$pulledFetched", []id.EventID{"$fetched"}),
+	}
+	pdus := []*types.Event{
+		testPDU("$pdu", []id.EventID{"$pulledNew"}),
+		testPDU("$citesPDU", []id.EventID{"$pdu"}),
+		testPDU("$other", []id.EventID{"$pulledFetched"}),
+	}
+	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}, "$citesPDU": {}}, reachingPrevs(pdus, pulled, map[id.EventID]struct{}{"$unfetched": {}}))
+	assert.Empty(t, reachingPrevs(pdus, pulled, nil))
+}

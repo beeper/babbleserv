@@ -54,10 +54,23 @@ type ingestConfig struct {
 	// it. The runner stops itself then too.
 	// Default: 2m
 	LeaseTimeout time.Duration `yaml:"leaseTimeout"`
-	// How long after a join is enqueued its send_join keeps being sent again after failures that may
-	// be transient, before the join fails
+	// How long after a join's first send_join it is sent again after failures that may be transient,
+	// and its response read, before the join fails
 	// Default: 10m
 	JoinTimeout time.Duration `yaml:"joinTimeout"`
+	// How long a send_join waits for its response to start: the resident builds the state it serves
+	// first, which for a large room takes minutes
+	// Default: 5m
+	SendJoinResponseTimeout time.Duration `yaml:"sendJoinResponseTimeout"`
+	// Most joins and gap fills the process runs at once across rooms' jobs, as each holds what it
+	// fetched, up to hundreds of megabytes for a large room's join; jobs wait for a turn
+	// Default: 4 and 16
+	MaxConcurrentJoins    int `yaml:"maxConcurrentJoins"`
+	MaxConcurrentGapFills int `yaml:"maxConcurrentGapFills"`
+	// How long a state DAG room's gap fill asks servers for a chunk of PDUs, past which the PDUs
+	// whose gap is open are held back for the job's next round
+	// Default: 5m
+	GapFillTimeout time.Duration `yaml:"gapFillTimeout"`
 	// Most events a join accepts from the resident server: state and auth chain events, or in a
 	// state DAG room (MSC4242) the state DAG
 	// Default: 1000000
@@ -107,7 +120,7 @@ type BabbleConfig struct {
 		DefaultVersion string         `yaml:"defaultVersion"`
 
 		// Offer the unstable state DAG room version (MSC4242): advertise it, create rooms of it, join
-		// and take invites to them. Filling gaps in their state DAGs is not supported yet.
+		// and take invites to them.
 		UnstableStateDAGs bool `yaml:"unstableStateDAGs"`
 
 		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
@@ -193,6 +206,12 @@ type BabbleConfig struct {
 		// joins before taking them, rather than leave the joining server joined here alone.
 		// Default: 1000000
 		MaxServedStateDAG int `yaml:"maxServedStateDAG"`
+		// Most send_join responses of state DAG rooms served to one server at once, each streaming
+		// the whole state DAG, and its further send_joins waiting for one to end before their join is
+		// taken, as Synapse's rc_federation has; more are refused with a 429
+		// Default: 3 and 50
+		MaxStateDAGJoinsPerOrigin       int `yaml:"maxStateDAGJoinsPerOrigin"`
+		MaxQueuedStateDAGJoinsPerOrigin int `yaml:"maxQueuedStateDAGJoinsPerOrigin"`
 	} `yaml:"federation"`
 
 	// For development usage - serve the .well-known client/server endpoints
@@ -315,6 +334,24 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	if cfg.Rooms.Ingest.QueueWait <= 0 {
 		cfg.Rooms.Ingest.QueueWait = 50 * time.Second
 	}
+	if cfg.Rooms.Ingest.SendJoinResponseTimeout <= 0 {
+		cfg.Rooms.Ingest.SendJoinResponseTimeout = 5 * time.Minute
+	}
+	if cfg.Rooms.Ingest.MaxConcurrentJoins <= 0 {
+		cfg.Rooms.Ingest.MaxConcurrentJoins = 4
+	}
+	if cfg.Rooms.Ingest.MaxConcurrentGapFills <= 0 {
+		cfg.Rooms.Ingest.MaxConcurrentGapFills = 16
+	}
+	if cfg.Rooms.Ingest.GapFillTimeout <= 0 {
+		cfg.Rooms.Ingest.GapFillTimeout = 5 * time.Minute
+	}
+	if cfg.Federation.MaxStateDAGJoinsPerOrigin <= 0 {
+		cfg.Federation.MaxStateDAGJoinsPerOrigin = 3
+	}
+	if cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin <= 0 {
+		cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin = 50
+	}
 	if cfg.BabbleBot.Localpart == "" {
 		cfg.BabbleBot.Localpart = "babblebot"
 	}
@@ -344,11 +381,11 @@ func (c *BabbleConfig) RoomVersions() map[string]bool {
 }
 
 // JoinsRoomVersion reports whether this server joins rooms of a version and takes invites to them:
-// any gomatrixserverlib implements in the event format this server hashes, the unstable state DAG
-// version only once enabled
+// those it creates rooms of. gomatrixserverlib implements more, such as pseudo IDs (MSC4014), whose
+// events this server can neither build nor verify.
 func (c *BabbleConfig) JoinsRoomVersion(version string) bool {
-	impl, err := gomatrixserverlib.GetRoomVersion(gomatrixserverlib.RoomVersion(version))
-	return err == nil && impl.EventFormat() == gomatrixserverlib.EventFormatV2 && (!impl.StateDAGs() || c.Rooms.UnstableStateDAGs)
+	_, found := c.RoomVersions()[version]
+	return found
 }
 
 func (c *BabbleConfig) MustGetSigningKey(keyID string) ed25519.PrivateKey {

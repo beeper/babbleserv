@@ -224,6 +224,9 @@ func responseMembershipError(w http.ResponseWriter, r *http.Request, err error) 
 	if errors.Is(err, rooms.ErrStateDAGTooLarge) {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MTooLarge, err.Error())
 		return
+	} else if errors.Is(err, errTooManyStateDAGJoins) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MLimitExceeded, err.Error())
+		return
 	}
 	util.ResponseErrorUnknownJSON(w, r, err)
 }

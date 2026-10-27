@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"sync"
@@ -30,17 +31,14 @@ const (
 	maxPrevEventStatesFetched = 10
 	// Events of a prev event's state fetched concurrently when too few are missing to fetch it whole
 	prevEventStatesFetchConcurrency = 5
-	// Each request of a gap fill, bounded as when /send ran it within the minute its sender waits
-	getMissingEventsTimeout     = 20 * time.Second
-	prevEventStatesFetchTimeout = 30 * time.Second
 	// PDUs a get_missing_events request names. Synapse answers at most 20 events a request and pulls
 	// 10 for a PDU it fills the gap of, so each PDU named gets that many.
 	gapPDUsPerRequest = 2
 	// The limit of a get_missing_events request the spec has a server take when none is given
 	defaultMissingEventsLimit = 10
-	// The largest get_missing_events response read, room for maxStateDAGLimit events of the largest
+	// The largest get_missing_events response read, room for MaxStateDAGMissingEvents events of the largest
 	// size a PDU may have: a server answering with more is taken to refuse
-	maxMissingEventsResponseBytes = maxStateDAGLimit * 64 << 10
+	maxMissingEventsResponseBytes = MaxStateDAGMissingEvents * util.MaxPDUBytes
 )
 
 // Fetcher pulls from other servers the events and state that a room's events need and this server
@@ -64,12 +62,19 @@ func NewFetcher(cfg config.BabbleConfig, db *databases.Databases, fedclient *fed
 	return &Fetcher{config: cfg, db: db, fedclient: fedclient, streamClient: &streamClient, gapClient: &gapClient, keyStore: keyStore}
 }
 
+// requestTimeout bounds each request of a gap fill: half a lease, so that the progress reported
+// after it refreshes the job's lease before its watchdog stops it
+func (f *Fetcher) requestTimeout() time.Duration {
+	return f.config.Rooms.Ingest.LeaseTimeout / 2
+}
+
 // GapFill is what a gap fill pulled for PDUs citing events missing here
 type GapFill struct {
 	Pulled []*types.Event
 	Given  *rooms.GivenStates
 	// The PDUs whose gap is still open because a server failed to answer for them, other than by
-	// refusing, so asking again may fill it, and why
+	// refusing, so asking again may fill it, and why: a get_missing_events request, or the state at
+	// a prev event the PDUs reach, which the fill's bound on those may also have left unfetched
 	Unanswered map[id.EventID]struct{}
 	Errs       []error
 }
@@ -120,14 +125,39 @@ func (f *Fetcher) GapFill(
 		fill.Pulled = append(fill.Pulled, plan.pulledFrom[server]...)
 	}
 	evs := slices.Concat(pdus, fill.Pulled)
+	states := &prevEventStates{unfetched: make(map[id.EventID]struct{})}
 	for _, server := range servers {
-		fill.Given = f.prevEventStates(ctx, server, roomID, roomVersion, evs, plan.pulledFrom[server], fill.Given)
+		if err := f.addPrevEventStates(ctx, server, roomID, roomVersion, evs, plan.pulledFrom[server], states); err != nil {
+			return nil, err
+		}
 	}
+	fill.Given, fill.Errs = states.given, append(fill.Errs, states.errs...)
+	maps.Copy(fill.Unanswered, reachingPrevs(pdus, fill.Pulled, states.unfetched))
 	return fill, nil
 }
 
-// missingEventsFunc pulls from a server the events missing before the latest events, given those
-// pulled already
+// reachingPrevs returns the PDUs reaching, along prev_events through the events pulled, one of the
+// prev events, without which the events citing them are dropped
+func reachingPrevs(pdus, pulled []*types.Event, prevIDs map[id.EventID]struct{}) map[id.EventID]struct{} {
+	reaching := make(map[id.EventID]struct{}, len(prevIDs))
+	maps.Copy(reaching, prevIDs)
+	for _, ev := range rooms.SortEventsTopologically(slices.Concat(pulled, pdus)) {
+		if slices.ContainsFunc(ev.PrevEventIDs, func(prevID id.EventID) bool {
+			_, found := reaching[prevID]
+			return found
+		}) {
+			reaching[ev.ID] = struct{}{}
+		}
+	}
+	pdusReaching := make(map[id.EventID]struct{})
+	for _, ev := range pdus {
+		if _, found := reaching[ev.ID]; found {
+			pdusReaching[ev.ID] = struct{}{}
+		}
+	}
+	return pdusReaching
+}
+
 type missingEventsFunc func(ctx context.Context, server string, latestIDs, pulledIDs []id.EventID) ([]*types.Event, error)
 
 // gapPlan is the get_missing_events requests of a gap fill. A PDU's gap is open while it cites a
@@ -141,9 +171,8 @@ type gapPlan struct {
 	pulledFrom map[string][]*types.Event
 	pulledIDs  []id.EventID
 	pulled     map[id.EventID]struct{}
-	// The PDUs each server was asked for
-	asked   map[string]map[id.EventID]struct{}
-	dropped map[string]struct{}
+	asked      map[string]map[id.EventID]struct{}
+	dropped    map[string]struct{}
 	// PDUs a server failed to answer for, other than by refusing
 	failed map[id.EventID]struct{}
 	errs   []error
@@ -248,7 +277,6 @@ func (p *gapPlan) open(ev *types.Event) bool {
 	})
 }
 
-// unanswered returns the PDUs whose gap is open and that a server failed to answer for
 func (p *gapPlan) unanswered() map[id.EventID]struct{} {
 	unanswered := make(map[id.EventID]struct{})
 	for _, ev := range p.pdus {
@@ -277,7 +305,6 @@ func refusedRequest(err error) bool {
 	return status < http.StatusInternalServerError && status != http.StatusTooManyRequests
 }
 
-// missingEvents pulls from a server the events missing between the earliest and the latest events
 func (f *Fetcher) missingEvents(
 	ctx context.Context,
 	server string,
@@ -287,7 +314,7 @@ func (f *Fetcher) missingEvents(
 	minDepth int64,
 	seenIDs map[id.EventID]struct{},
 ) ([]*types.Event, error) {
-	ctx, cancel := context.WithTimeout(ctx, getMissingEventsTimeout)
+	ctx, cancel := context.WithTimeout(ctx, f.requestTimeout())
 	defer cancel()
 	// Events from before this server's earliest timeline event, such as its join, are kept out of the
 	// timeline as Synapse does, and the state at them fetched instead
@@ -313,69 +340,89 @@ func (f *Fetcher) missingEvents(
 	}), nil
 }
 
-// prevEventStates adds to given, fetched from a server, the state before the prev events of the
-// events it pulled that have none here, within what a gap fill fetches
-func (f *Fetcher) prevEventStates(
+// prevEventStates are the states a gap fill fetched at prev events of the events it pulled: those
+// given, and the prev events a server failed to give the state at, other than by refusing, or that
+// the fill's bound left unfetched
+type prevEventStates struct {
+	given     *rooms.GivenStates
+	unfetched map[id.EventID]struct{}
+	errs      []error
+}
+
+// addPrevEventStates adds to the states, fetched from a server, the state before the prev events of
+// the events it pulled that have none here, within what a gap fill fetches
+func (f *Fetcher) addPrevEventStates(
 	ctx context.Context,
 	server string,
 	roomID id.RoomID,
 	roomVersion string,
 	evs, pulled []*types.Event,
-	given *rooms.GivenStates,
-) *rooms.GivenStates {
+	states *prevEventStates,
+) error {
 	log := zerolog.Ctx(ctx).With().
 		Stringer("room_id", roomID).
 		Str("server", server).
 		Logger()
 
 	if len(pulled) == 0 {
-		return given
+		return nil
 	}
 	prevIDs, err := f.db.Rooms.GetPrevEventsWithoutState(ctx, roomID, evs, pulled)
 	if err != nil {
-		log.Err(err).Msg("Failed to get prev events without state")
-		return given
-	} else if given != nil {
+		return err
+	} else if states.given != nil {
 		prevIDs = slices.DeleteFunc(prevIDs, func(prevID id.EventID) bool {
-			_, found := given.BeforePrevs[prevID]
+			_, found := states.given.BeforePrevs[prevID]
 			return found
 		})
 	}
 	if len(prevIDs) == 0 {
-		return given
-	} else if given == nil {
-		given = &rooms.GivenStates{BeforePrevs: make(map[id.EventID][]id.EventID, len(prevIDs))}
+		return nil
+	} else if states.given == nil {
+		states.given = &rooms.GivenStates{BeforePrevs: make(map[id.EventID][]id.EventID, len(prevIDs))}
 	}
-	if budget := maxPrevEventStatesFetched - len(given.BeforePrevs); len(prevIDs) > budget {
+	if budget := max(maxPrevEventStatesFetched-len(states.given.BeforePrevs), 0); len(prevIDs) > budget {
 		log.Warn().
 			Int("prev_events", len(prevIDs)).
 			Msg("Too many prev events without state, fetching the state at some of them")
-		prevIDs = prevIDs[:max(budget, 0)]
+		for _, prevID := range prevIDs[budget:] {
+			states.unfetched[prevID] = struct{}{}
+		}
+		prevIDs = prevIDs[:budget]
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, prevEventStatesFetchTimeout)
-	defer cancel()
-
-	known := make(map[id.EventID]struct{}, len(evs)+len(given.Events))
-	for _, ev := range slices.Concat(evs, given.Events) {
+	known := make(map[id.EventID]struct{}, len(evs)+len(states.given.Events))
+	for _, ev := range slices.Concat(evs, states.given.Events) {
 		known[ev.ID] = struct{}{}
 	}
 	for _, prevID := range prevIDs {
-		stateIDs, fetched, err := f.fetchPrevEventState(ctx, server, roomID, roomVersion, prevID, known)
-		if err != nil {
-			log.Warn().Err(err).Stringer("prev_event_id", prevID).Msg("Failed to fetch the state at prev event")
+		stateIDs, fetched, fetchErr, err := f.fetchPrevEventState(ctx, server, roomID, roomVersion, prevID, known)
+		util.ReportProgress(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		} else if err != nil {
+			return err
+		} else if fetchErr != nil {
+			log.Warn().Err(fetchErr).Stringer("prev_event_id", prevID).Msg("Failed to fetch the state at prev event")
+			if !refusedRequest(fetchErr) {
+				states.unfetched[prevID] = struct{}{}
+				states.errs = append(states.errs, fmt.Errorf("%s: state at %s: %w", server, prevID, fetchErr))
+			}
 			continue
 		}
-		util.ReportProgress(ctx)
-		given.BeforePrevs[prevID] = stateIDs
-		given.Events = append(given.Events, fetched...)
+		delete(states.unfetched, prevID)
+		states.given.BeforePrevs[prevID] = stateIDs
+		states.given.Events = append(states.given.Events, fetched...)
 		for _, ev := range fetched {
 			known[ev.ID] = struct{}{}
 		}
 	}
-	return given
+	return nil
 }
 
+// fetchPrevEventState fetches from a server the state at a prev event, with the events of it that
+// are neither stored here nor known. The first error is the server failing to give it, the second
+// this server's own failing.
 func (f *Fetcher) fetchPrevEventState(
 	ctx context.Context,
 	server string,
@@ -383,12 +430,14 @@ func (f *Fetcher) fetchPrevEventState(
 	roomVersion string,
 	prevID id.EventID,
 	known map[id.EventID]struct{},
-) ([]id.EventID, []*types.Event, error) {
-	stateIDs, err := f.fedclient.GetStateIDs(ctx, server, roomID, prevID)
+) ([]id.EventID, []*types.Event, error, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, f.requestTimeout())
+	defer cancel()
+	stateIDs, err := f.fedclient.GetStateIDs(reqCtx, server, roomID, prevID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err, nil
 	} else if stateIDs == nil {
-		return nil, nil, fmt.Errorf("null state_ids response for %s", prevID)
+		return nil, nil, fmt.Errorf("null state_ids response for %s", prevID), nil
 	}
 	wanted := slices.DeleteFunc(
 		slices.Concat([]id.EventID{prevID}, stateIDs.PDUs, stateIDs.AuthChain),
@@ -400,7 +449,7 @@ func (f *Fetcher) fetchPrevEventState(
 	slices.Sort(wanted)
 	missing, err := f.db.Rooms.GetUnstoredEventIDs(ctx, slices.Compact(wanted))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	unfetched := make(map[id.EventID]struct{}, len(missing))
 	for _, eventID := range missing {
@@ -411,24 +460,24 @@ func (f *Fetcher) fetchPrevEventState(
 	// Fetching each event has a lot of overhead, so as Synapse does the whole state is fetched when
 	// many are missing
 	if len(missing)*10 >= len(stateIDs.PDUs)+len(stateIDs.AuthChain) {
-		resp, err := f.fedclient.GetState(ctx, server, roomID, prevID)
+		resp, err := f.fedclient.GetState(reqCtx, server, roomID, prevID)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, err, nil
 		} else if resp == nil {
-			return nil, nil, fmt.Errorf("null state response for %s", prevID)
+			return nil, nil, fmt.Errorf("null state response for %s", prevID), nil
 		}
 		pdus = slices.Concat(resp.PDUs, resp.AuthChain)
 		if _, found := unfetched[prevID]; found {
-			pdus = append(pdus, f.fetchEvents(ctx, server, []id.EventID{prevID})...)
+			pdus = append(pdus, f.fetchEvents(reqCtx, server, []id.EventID{prevID})...)
 		}
 	} else {
-		pdus = f.fetchEvents(ctx, server, missing)
+		pdus = f.fetchEvents(reqCtx, server, missing)
 	}
 
 	pdus = wantedPDUs(ctx, pdus, roomVersion, unfetched)
-	remoteEvs, err := util.VerifyRemoteEvents(ctx, pdus, roomVersion, f.keyStore, make(map[id.EventID]struct{}))
+	remoteEvs, err := util.VerifyRemoteEvents(reqCtx, pdus, roomVersion, f.keyStore, make(map[id.EventID]struct{}))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err, nil
 	}
 	fetched := make([]*types.Event, 0, len(missing))
 	for _, ev := range eventsInRoom(ctx, remoteEvs, roomID) {
@@ -438,20 +487,21 @@ func (f *Fetcher) fetchPrevEventState(
 		}
 	}
 	if _, found := unfetched[prevID]; found {
-		return nil, nil, fmt.Errorf("failed to fetch prev event %s", prevID)
+		return nil, nil, fmt.Errorf("failed to fetch prev event %s", prevID), nil
 	} else if len(unfetched) > 0 {
 		zerolog.Ctx(ctx).Warn().
 			Stringer("prev_event_id", prevID).
 			Int("events", len(unfetched)).
 			Msg("Failed to fetch some events of the state at prev event")
 	}
-	return stateIDs.PDUs, fetched, nil
+	return stateIDs.PDUs, fetched, nil, nil
 }
 
 // StateBefore fetches the state before an event of the room another server holds, with its auth
 // chain, as a send_join response gives the state before a join. Every event is fetched, stored here
 // or not, as a remote join takes the state from the events given. More events than the limit fail
-// with a tooLargeFailure before any is verified.
+// with a tooLargeFailure before any is verified. The server may take as long to answer as for a
+// send_join, meanwhile reporting progress.
 func (f *Fetcher) StateBefore(
 	ctx context.Context,
 	server string,
@@ -460,7 +510,11 @@ func (f *Fetcher) StateBefore(
 	eventID id.EventID,
 	limit int,
 ) (stateEvs, authEvs []*types.Event, err error) {
-	resp, err := f.fedclient.GetState(ctx, server, roomID, eventID)
+	fetchCtx, cancel := context.WithTimeout(ctx, f.config.Rooms.Ingest.SendJoinResponseTimeout)
+	defer cancel()
+	waited := reportProgressEvery(fetchCtx, f.config)
+	resp, err := f.streamClient.GetState(fetchCtx, server, roomID, eventID)
+	waited()
 	if err != nil {
 		return nil, nil, err
 	} else if resp == nil {

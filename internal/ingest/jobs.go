@@ -63,6 +63,8 @@ type Jobs struct {
 	mu sync.Mutex
 	// Rooms whose job this process runs, and whether it was asked to run it again meanwhile
 	running map[id.RoomID]*roomRunner
+	// The turns of joins and gap fills, of which the process runs a bounded number at once
+	turns map[workKind]chan struct{}
 }
 
 type roomRunner struct {
@@ -91,7 +93,39 @@ func NewJobs(
 		ctx:      ctx,
 		cancel:   cancel,
 		running:  make(map[id.RoomID]*roomRunner),
+		turns: map[workKind]chan struct{}{
+			workJoin:    make(chan struct{}, cfg.Rooms.Ingest.MaxConcurrentJoins),
+			workGapFill: make(chan struct{}, cfg.Rooms.Ingest.MaxConcurrentGapFills),
+		},
 	}
+}
+
+// turn takes a turn to run work of the kind, waiting for one while the process runs as many as it
+// may. Waiting reports progress, so that the job keeps its lease.
+func (j *Jobs) turn(ctx context.Context, kind workKind) (release func(), err error) {
+	turns := j.turns[kind]
+	if turns == nil {
+		return func() {}, nil
+	}
+	select {
+	case turns <- struct{}{}:
+		return func() { <-turns }, nil
+	default:
+	}
+	zerolog.Ctx(ctx).Debug().Msg("Waiting for a turn to run ingest work")
+	defer reportProgressEvery(ctx, j.config)()
+	select {
+	case turns <- struct{}{}:
+		return func() { <-turns }, nil
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+}
+
+// reportProgressEvery keeps a job's lease through a wait bounded otherwise, refreshing it as often
+// as progress does
+func reportProgressEvery(ctx context.Context, cfg config.BabbleConfig) (stop func()) {
+	return util.ReportProgressEvery(ctx, cfg.Rooms.Ingest.LeaseTimeout/4)
 }
 
 // Stop ends the jobs this process runs, releasing their locks for other processes to resume them
@@ -234,7 +268,8 @@ type jobRun struct {
 	roomVersion string
 	lock        lock.Lock
 	cancel      context.CancelCauseFunc
-	// The round's targets, and the state DAG events the run's gap fills may fetch still
+	// The round's targets not published or failed yet, and the state DAG events the run's gap fills
+	// may fetch still
 	targets   map[id.EventID]struct{}
 	gapBudget int
 
@@ -316,7 +351,8 @@ func (run *jobRun) ended(ctx context.Context, err error) error {
 // them into. Work failing holds back its targets, and work whose targets failed within the retry
 // pause or cite a target held back is held back too, until a later round after the pause: asking
 // again at once, as each PDU enqueued meanwhile would, could fail the targets within seconds. The
-// rest of the work goes on.
+// rest of the work goes on, but for the work after a join: a join can take minutes, so the round
+// ends after one, and the next collects the targets written meanwhile, putting their PDUs first.
 func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) error {
 	strategy, err := strategyFor(run.roomVersion)
 	if err != nil {
@@ -331,6 +367,20 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 	if err != nil {
 		return err
 	}
+	held, errs, err := run.runWorks(ctx, works)
+	if err != nil {
+		return err
+	} else if len(held) == 0 {
+		return nil
+	} else if len(errs) == 0 {
+		return fmt.Errorf("%w: %d targets", errWorkHeld, len(held))
+	}
+	return fmt.Errorf("%w: %d targets: %w", errWorkHeld, len(held), errors.Join(errs...))
+}
+
+// runWorks runs a round's work in order, up to and including the first join run, returning the
+// targets held back and why, or what ended the job's context
+func (run *jobRun) runWorks(ctx context.Context, works []ingestWork) (map[id.EventID]struct{}, []error, error) {
 	now := time.Now()
 	held := make(map[id.EventID]struct{})
 	var errs []error
@@ -339,20 +389,18 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 			hold(work.targets(), held)
 			continue
 		}
-		err := run.runWork(ctx, work)
+		err := run.runTurn(ctx, work)
 		if cause := context.Cause(ctx); cause != nil {
-			return cause
+			return nil, nil, cause
 		} else if err != nil {
 			errs = append(errs, err)
 			hold(work.targets(), held)
 		}
+		if work.kind() == workJoin {
+			break
+		}
 	}
-	if len(held) == 0 {
-		return nil
-	} else if len(errs) == 0 {
-		return fmt.Errorf("%w: %d targets", errWorkHeld, len(held))
-	}
-	return fmt.Errorf("%w: %d targets: %w", errWorkHeld, len(held), errors.Join(errs...))
+	return held, errs, nil
 }
 
 // heldBack reports whether a target of work failed within the retry pause or cites one held back
@@ -366,6 +414,24 @@ func hold(targets []*types.IngestTarget, held map[id.EventID]struct{}) {
 	for _, target := range targets {
 		held[target.Event.ID] = struct{}{}
 	}
+}
+
+// untarget stops counting targets as the round's once published or failed, so that other targets'
+// gap fills reach them as published, or as missing
+func (run *jobRun) untarget(eventIDs ...id.EventID) {
+	for _, eventID := range eventIDs {
+		delete(run.targets, eventID)
+	}
+}
+
+// runTurn runs a unit of work once the process has a turn for its kind
+func (run *jobRun) runTurn(ctx context.Context, work ingestWork) error {
+	release, err := run.jobs.turn(ctx, work.kind())
+	if err != nil {
+		return err
+	}
+	defer release()
+	return run.runWork(ctx, work)
 }
 
 // runWork runs a unit of work through its phases. A failure counts against its targets, unless the
@@ -426,7 +492,9 @@ func (run *jobRun) fail(ctx context.Context, target *types.IngestTarget, failure
 	failed, err := run.jobs.db.Rooms.FailIngestTarget(ctx, run.roomID, target.Event.ID, failure)
 	if err != nil {
 		return err
-	} else if failed {
+	}
+	run.untarget(target.Event.ID)
+	if failed {
 		zerolog.Ctx(ctx).Warn().
 			Stringer("event_id", target.Event.ID).
 			Str("kind", string(target.Kind)).

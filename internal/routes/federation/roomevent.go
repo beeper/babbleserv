@@ -12,6 +12,7 @@ import (
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
 )
@@ -66,26 +67,14 @@ func (f *FederationRoutes) GetEventAuth(w http.ResponseWriter, r *http.Request) 
 	}{authChain})
 }
 
-// federation.ReqGetMissingEvents with MSC4242's flag walking the state DAG, which mautrix lacks
-type reqGetMissingEvents struct {
-	federation.ReqGetMissingEvents
-	StateDAG bool `json:"org.matrix.msc4242.state_dag"`
-}
-
-// MSC4242's bound on either list of a state DAG walk's request
-const maxStateDAGMissingEventsRequestIDs = 100
-
-// The most events, and bytes of them, a state DAG walk answers with, which its requester walks
-// further from as it does from any it did not have
-const (
-	maxStateDAGMissingEvents      = 1000
-	maxStateDAGMissingEventsBytes = 8 << 20
-)
+// The most bytes of events a state DAG walk answers with, at most ingest.MaxStateDAGMissingEvents of
+// them, which its requester walks further from as it does from any it did not have
+const maxStateDAGMissingEventsBytes = 8 << 20
 
 // https://spec.matrix.org/v1.10/server-server-api/#post_matrixfederationv1get_missing_eventsroomid
 func (f *FederationRoutes) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	roomID := util.RoomIDFromRequestURLParam(r, "roomID")
-	req, respErr := util.ParseRequestJSON[reqGetMissingEvents](r)
+	req, respErr := util.ParseRequestJSON[ingest.ReqGetMissingEvents](r)
 	if respErr != nil {
 		util.ResponseErrorJSON(w, r, *respErr)
 		return
@@ -174,14 +163,14 @@ func (f *FederationRoutes) GetMissingEvents(w http.ResponseWriter, r *http.Reque
 
 // getMissingStateDAGEvents walks a state DAG room's state DAG from the latest events, as MSC4242 has
 // get_missing_events do with its flag, see rooms.GetMissingStateDAGEvents
-func (f *FederationRoutes) getMissingStateDAGEvents(w http.ResponseWriter, r *http.Request, roomID id.RoomID, req reqGetMissingEvents) {
-	if len(req.EarliestEvents) > maxStateDAGMissingEventsRequestIDs || len(req.LatestEvents) > maxStateDAGMissingEventsRequestIDs {
+func (f *FederationRoutes) getMissingStateDAGEvents(w http.ResponseWriter, r *http.Request, roomID id.RoomID, req ingest.ReqGetMissingEvents) {
+	if len(req.EarliestEvents) > ingest.MaxStateDAGRequestIDs || len(req.LatestEvents) > ingest.MaxStateDAGRequestIDs {
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf(
-			"A state DAG walk takes at most %d earliest and latest events", maxStateDAGMissingEventsRequestIDs,
+			"A state DAG walk takes at most %d earliest and latest events", ingest.MaxStateDAGRequestIDs,
 		))
 		return
 	}
-	evs, err := f.db.Rooms.GetMissingStateDAGEvents(r.Context(), roomID, req.EarliestEvents, req.LatestEvents, min(req.Limit, maxStateDAGMissingEvents))
+	evs, err := f.db.Rooms.GetMissingStateDAGEvents(r.Context(), roomID, req.EarliestEvents, req.LatestEvents, min(req.Limit, ingest.MaxStateDAGMissingEvents))
 	if err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return

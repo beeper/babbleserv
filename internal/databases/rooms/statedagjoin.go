@@ -194,8 +194,8 @@ func replayOrder(walk *stateDAGWalk) (order []id.EventID, unreplayable int) {
 	return order, len(eventIDs) - len(order)
 }
 
-// Most events a replay transaction gives contexts, and how long it goes on giving them, well within
-// FoundationDB's five seconds
+// maxReplayBatch bounds how many events a replay transaction gives contexts to, and replayTxnTime how
+// long it keeps doing so, both kept well within FoundationDB's five-second transaction limit.
 const (
 	maxReplayBatch = 1000
 	replayTxnTime  = 2 * time.Second

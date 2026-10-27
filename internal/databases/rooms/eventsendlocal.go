@@ -43,6 +43,10 @@ type SendLocalEventsOptions struct {
 
 	// Records the room the send creates as BabbleBot's room with this user, see txnClaimBotRoom
 	BotRoomUser id.UserID
+
+	// The ingest job's join target the send stands in for, which its publish takes, failing with
+	// ErrIngestTargetGone once another runner of the room's job failed or replaced it
+	IngestJoinTarget id.EventID
 }
 
 // RequiredEventRejectedError fails a send requiring all its events once one is rejected, storing
@@ -172,6 +176,11 @@ func (s *localEventSender) txnPrepareLocal(ctx context.Context, txn fdb.ReadTran
 		if options.PublishRoom {
 			s.r.txnSetRoomPublished(txn, room, true)
 		}
+		if options.IngestJoinTarget != "" && len(plan.evs) > 0 {
+			if err := s.r.txnTakeIngestJoinTarget(txn, room.ID, options.IngestJoinTarget); err != nil {
+				return err
+			}
+		}
 		if options.BotRoomUser != "" {
 			if err := s.r.txnClaimBotRoom(txn, options.BotRoomUser, room.ID); err != nil {
 				return err
@@ -286,7 +295,7 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	var resolver *eventsendutil.Resolver
 	if stateDAGs {
 		stateExtremities = s.r.events.TxnLookupCurrentRoomStateExtremEventIDs(txn, room.ID)
-		eventsProvider.WillGet(stateExtremities...)
+		eventsProvider.WillGet(citedExtremities(stateExtremities)...)
 		if len(prevEventIDs) > types.MaxStateDAGPrevEvents {
 			prevEventIDs = s.r.events.TxnOrderByStoredVersion(txn, prevEventIDs)
 		}
@@ -323,14 +332,34 @@ func (s *localEventSender) txnPrepareLocalEvents(
 			if err != nil || request != nil {
 				return nil, s.workFor(prepared, request, room), err
 			}
-			var citesCurrent bool
-			ev.PrevStateEventIDs, citesCurrent = citedPrevStateEvents(stateExtremities, superseded)
-			citesOther = !citesCurrent
-			if citesOther || before.IsZero() {
-				if before, request, err = resolver.Resolve(ev.PrevStateEventIDs); err != nil || request != nil {
+			cite := func(membership id.EventID) (request *eventsendutil.ResolutionRequest, err error) {
+				var citesCurrent bool
+				ev.PrevStateEventIDs, citesCurrent = citedPrevStateEvents(stateExtremities, membership)
+				citesOther, before = !citesCurrent, steps.current
+				if citesOther || before.IsZero() {
+					if before, request, err = resolver.Resolve(ev.PrevStateEventIDs); err == nil && request == nil && citesCurrent {
+						steps.current = before
+					}
+				}
+				return request, err
+			}
+			if request, err := cite(superseded); err != nil || request != nil {
+				return nil, s.workFor(prepared, request, room), err
+			} else if superseded != "" && !slices.Contains(citedExtremities(stateExtremities), superseded) {
+				// Resolution orders a membership behind the extremities by more than ancestry, so it
+				// can come out after later state, and the rescind would make older state current
+				// everywhere. Sent without the citation, the target's server may refuse it.
+				current, request, err := currentState()
+				if err != nil || request != nil {
 					return nil, s.workFor(prepared, request, room), err
-				} else if citesCurrent {
-					steps.current = before
+				} else if before != current {
+					zerolog.Ctx(ctx).Warn().
+						Stringer("superseded_event_id", superseded).
+						Str("state_key", *ev.StateKey).
+						Msg("Rescind citing the membership it ends would change current state, citing the state extremities alone")
+					if request, err := cite(""); err != nil || request != nil {
+						return nil, s.workFor(prepared, request, room), err
+					}
 				}
 			}
 		}
@@ -466,17 +495,17 @@ func (s *localEventSender) txnPrepareLocalEvents(
 	return prepared, nil, nil
 }
 
-// txnSupersededMembership returns the target's membership in current state when a member event of a
-// state DAG room changes it out of band: the target's server is not in the room, so holds that
-// membership without the state DAG, and can tell the event supersedes it only should the event cite
-// it (MSC4242).
+// txnSupersededMembership returns the invite or knock in current state that a leave of a state DAG
+// room rescinds out of band: the target's server is not in the room, so holds that membership
+// without the state DAG, and can tell the leave supersedes it only should the leave cite it
+// (MSC4242). Other changes of a remote user's membership cite the state extremities alone.
 func (s *localEventSender) txnSupersededMembership(
 	txn fdb.ReadTransaction,
 	stateBatch *state.Batch,
 	ev *types.Event,
 	currentState func() (types.StateHash, *eventsendutil.ResolutionRequest, error),
 ) (id.EventID, *eventsendutil.ResolutionRequest, error) {
-	if !changesRemoteMembership(ev, s.r.config.ServerName) {
+	if !changesRemoteMembership(ev, s.r.config.ServerName) || ev.Membership() != event.MembershipLeave {
 		return "", nil, nil
 	}
 	target := id.UserID(*ev.StateKey)
@@ -489,7 +518,10 @@ func (s *localEventSender) txnSupersededMembership(
 	}
 	tup := types.MemberStateTup(target)
 	entries, err := stateBatch.TxnLookupEntries(txn, current, []types.StateTup{tup})
-	return entries[tup].EventID, nil, err
+	if err != nil {
+		return "", nil, err
+	}
+	return rescindedMembership(entries[tup]), nil, nil
 }
 
 func (s *localEventSender) workFor(prepared *preparedEvents, request *eventsendutil.ResolutionRequest, room *types.Room) preparationWork {

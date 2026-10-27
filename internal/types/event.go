@@ -93,7 +93,6 @@ type Event struct {
 	IsForClientAPI      bool   `msgpack:"-" json:"-"`
 	IsDuplicate         bool   `msgpack:"-" json:"-"`
 
-	// Whether the JSON the event was parsed from had an auth_events member
 	authEventsMember bool
 }
 
@@ -375,15 +374,14 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 	return ev.CheckStateDAGFormat()
 }
 
-// The most prev_events an event of a state DAG room may cite, and the most prev_state_events one
-// sent here cites. Received events may cite more: the MSC's cap is not an auth or format rule, and
-// the Synapse fork cites every state extremity.
+// The most prev_events and prev_state_events an event of a state DAG room may cite. Synapse drops
+// events citing more of either, so a room taking one would diverge from it.
 const MaxStateDAGPrevEvents = 20
 
 // CheckStateDAGFormat refuses an event of a state DAG room (MSC4242) parsed with an auth_events
 // member, which would otherwise be taken for its calculated auth events, one without a list of
-// prev_state_events, and one citing more than MaxStateDAGPrevEvents prev events. Events of other
-// room versions, or of a version not known yet, pass.
+// prev_state_events, and one citing more than MaxStateDAGPrevEvents prev events or prev state events.
+// Events of other room versions, or of a version not known yet, pass.
 func (ev *Event) CheckStateDAGFormat() error {
 	switch {
 	case !ev.StateDAGs():
@@ -394,6 +392,8 @@ func (ev *Event) CheckStateDAGFormat() error {
 		return errors.New("state DAG event has no prev_state_events list")
 	case len(ev.PrevEventIDs) > MaxStateDAGPrevEvents:
 		return fmt.Errorf("state DAG event cites %d prev_events, over %d", len(ev.PrevEventIDs), MaxStateDAGPrevEvents)
+	case len(ev.PrevStateEventIDs) > MaxStateDAGPrevEvents:
+		return fmt.Errorf("state DAG event cites %d prev_state_events, over %d", len(ev.PrevStateEventIDs), MaxStateDAGPrevEvents)
 	}
 	return nil
 }

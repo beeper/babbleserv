@@ -29,6 +29,8 @@ type IngestTarget struct {
 	// A send_join was sent that the resident server may have accepted, so refusing a later one
 	// does not mean the join was refused
 	MayHaveLanded bool `msgpack:"mhl,omitempty"`
+	// When the join's first send_join was sent, which its JoinTimeout counts from
+	FirstSent int64 `msgpack:"fst,omitempty"`
 	// Rounds whose work for the target failed, other than by the job ending, and when the last did,
 	// which holds the target back for the job's retry pause
 	Failures int   `msgpack:"fls,omitempty"`

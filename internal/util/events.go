@@ -166,7 +166,8 @@ func VerifyRemoteEvent(ctx context.Context, ev *types.Event, keyStore *KeyStore)
 	return ev, nil, nil
 }
 
-// Events VerifyRemoteEvents verifies between reports of its progress, besides each key fetch
+// verifyProgressEvents bounds how many events VerifyRemoteEvents verifies between its own progress
+// reports, on top of the report each key fetch makes
 const verifyProgressEvents = 100
 
 // Parses and verifies events fetched from another server, skipping those that cannot be parsed or
@@ -278,7 +279,10 @@ func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keySto
 		}
 		verifyErr = results[0].Error
 	}
-	if verifyErr != nil {
+	if verifyErr != nil && ctx.Err() != nil {
+		// The caller gave up waiting for the signing keys, which says nothing of the event
+		return nil, verifyErr
+	} else if verifyErr != nil {
 		return verifyErr, nil
 	}
 

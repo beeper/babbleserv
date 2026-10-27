@@ -43,6 +43,12 @@ type respTransaction struct {
 	PDUs map[id.EventID]respTransactionResult `json:"pdus"`
 }
 
+// The most PDUs and EDUs a transaction carries, as the spec has it and Synapse refuses more
+const (
+	maxTransactionPDUs = 50
+	maxTransactionEDUs = 100
+)
+
 func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	arrived := time.Now()
 	var req reqTransaction
@@ -54,6 +60,11 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 	txnID := chi.URLParam(r, "txnID")
 	if txnID == "" {
 		util.ResponseErrorJSON(w, r, mautrix.MInvalidParam)
+		return
+	} else if len(req.PDUs) > maxTransactionPDUs || len(req.EDUs) > maxTransactionEDUs {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, fmt.Sprintf(
+			"A transaction carries at most %d PDUs and %d EDUs", maxTransactionPDUs, maxTransactionEDUs,
+		))
 		return
 	}
 
@@ -73,12 +84,17 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 
 	log.Debug().Msg("Processing incoming federation transaction")
 
+	// The sender has an answer within the minute it waits, so as not to send the transaction again
+	// while it is processed
+	deadline := arrived.Add(f.config.Rooms.Ingest.QueueWait)
 	var resp *respTransaction
 	pduErr, eduErr := runTransaction(&log, func(admitted *admission) (err error) {
-		resp, err = f.processTransactionPDUs(r, arrived, req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
+		resp, err = f.processTransactionPDUs(r, deadline, req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
 		return err
 	}, func() error {
-		return f.processTransactionEDUs(r, req.Origin, req.EDUs)
+		ctx, cancel := context.WithDeadline(r.Context(), deadline)
+		defer cancel()
+		return f.processTransactionEDUs(ctx, r, req.Origin, req.EDUs)
 	})
 
 	if errors.Is(pduErr, errQueueFull) {
@@ -121,7 +137,10 @@ func runTransaction(log *zerolog.Logger, pdus func(*admission) error, edus func(
 
 const remoteDeviceIngestConcurrency = 4
 
-func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string, edus []*types.EDU) error {
+// processTransactionEDUs processes a transaction's EDUs by type, failing only for to-device messages
+// it failed to store, which are lost unless the transaction is sent again: the other types are
+// idempotent or ephemeral
+func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.Request, origin string, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 
 	edusByType := make(map[types.EDUType][]*types.EDU, 3)
@@ -132,22 +151,23 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string
 	}
 
 	var wg sync.WaitGroup
+	var toDeviceErr error
 	for eduType, edus := range edusByType {
 		wg.Go(func() {
 			defer util.RecoverPanic(log, nil)
 
 			switch eduType {
 			case types.EDUTypeDeviceListUpdate, types.EDUTypeSigningKeyUpdate:
-				f.processTransactionDeviceListEDUs(r, origin, eduType, edus)
+				f.processTransactionDeviceListEDUs(ctx, r, origin, eduType, edus)
 
 			case types.EDUTypeReceipt:
 				// TODO
 
 			case types.EDUTypePresence:
-				f.processTransactionPresenceEDUs(r, origin, eduType, edus)
+				f.processTransactionPresenceEDUs(ctx, r, origin, eduType, edus)
 
 			case types.EDUTypeToDevice:
-				f.processTransactionToDeviceEDUs(r, origin, eduType, edus)
+				toDeviceErr = f.processTransactionToDeviceEDUs(ctx, r, origin, eduType, edus)
 
 			default:
 				log.Error().Str("type", string(eduType)).Msg("Ignoring unknown EDU type")
@@ -156,10 +176,10 @@ func (f *FederationRoutes) processTransactionEDUs(r *http.Request, origin string
 	}
 
 	wg.Wait()
-	return nil
+	return toDeviceErr
 }
 
-func (f *FederationRoutes) processTransactionDeviceListEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+func (f *FederationRoutes) processTransactionDeviceListEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
 	log := hlog.FromRequest(r)
 	userEDUs := make(map[id.UserID][]types.RemoteDeviceEDU)
 	for _, edu := range edus {
@@ -193,7 +213,7 @@ func (f *FederationRoutes) processTransactionDeviceListEDUs(r *http.Request, ori
 			log := log.With().Stringer("user_id", userID).Logger()
 			defer util.RecoverPanic(&log, nil)
 
-			notified, err := f.db.Accounts.IngestRemoteDeviceUpdates(r.Context(), userID, updates)
+			notified, err := f.db.Accounts.IngestRemoteDeviceUpdates(ctx, userID, updates)
 			if err != nil {
 				log.Err(err).Msg("Failed to ingest remote device updates")
 				return
@@ -204,7 +224,7 @@ func (f *FederationRoutes) processTransactionDeviceListEDUs(r *http.Request, ori
 	ingests.Wait()
 }
 
-func (f *FederationRoutes) processTransactionPresenceEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+func (f *FederationRoutes) processTransactionPresenceEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
 	log := hlog.FromRequest(r)
 	for _, edu := range edus {
 		var content types.PresenceEDUContent
@@ -239,7 +259,7 @@ func (f *FederationRoutes) processTransactionPresenceEDUs(r *http.Request, origi
 				LastActive: lastActive,
 			}
 
-			if err := f.db.Transient.UpdateUserPresence(r.Context(), presenceItem.UserID, presence); err != nil {
+			if err := f.db.Transient.UpdateUserPresence(ctx, presenceItem.UserID, presence); err != nil {
 				log.Err(err).
 					Str("user_id", presenceItem.UserID.String()).
 					Msg("Failed to store remote presence")
@@ -253,7 +273,7 @@ func (f *FederationRoutes) processTransactionPresenceEDUs(r *http.Request, origi
 	}
 }
 
-func (f *FederationRoutes) processTransactionToDeviceEDUs(r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+func (f *FederationRoutes) processTransactionToDeviceEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 	tds := make([]*types.ToDevice, 0, len(edus))
 	for _, edu := range edus {
@@ -290,9 +310,11 @@ func (f *FederationRoutes) processTransactionToDeviceEDUs(r *http.Request, origi
 			}
 		}
 	}
-	if _, err := f.db.SendToDeviceEvents(r.Context(), tds, transient.SendToDeviceOptions{}); err != nil {
+	if _, err := f.db.SendToDeviceEvents(ctx, tds, transient.SendToDeviceOptions{}); err != nil {
 		log.Err(err).Msg("Failed to store remote to-device messages")
+		return err
 	}
+	return nil
 }
 
 func checkEDUOrigin(log *zerolog.Logger, origin string, eduType types.EDUType, userID id.UserID) bool {
@@ -356,7 +378,7 @@ func newPDURooms(ctx context.Context, db pduRoomLookups, serverName string, crea
 }
 
 // roomVersion returns the version of the PDU's room. A room without a record takes the version of
-// its create event, or for a leave of a local user, the version of the invite or knock it ends.
+// its create event, or for a leave of a local user, the version of the invite it ends.
 func (p *pduRooms) roomVersion(ev *types.Event) (string, error) {
 	room, found := p.rooms[ev.RoomID]
 	if !found {
@@ -407,7 +429,7 @@ func (p *pduRooms) heldMembershipVersion(ev *types.Event) (string, error) {
 	membershipTup, membershipEv, err := p.db.GetCurrentMembershipAndEvent(p.ctx, targetUserID, ev.RoomID)
 	if err != nil || membershipTup == nil {
 		return "", err
-	} else if membershipTup.Membership != event.MembershipInvite && membershipTup.Membership != event.MembershipKnock {
+	} else if membershipTup.Membership != event.MembershipInvite {
 		return "", nil
 	}
 	return membershipEv.RoomVersion, nil
@@ -415,7 +437,7 @@ func (p *pduRooms) heldMembershipVersion(ev *types.Event) (string, error) {
 
 func (f *FederationRoutes) processTransactionPDUs(
 	r *http.Request,
-	arrived time.Time,
+	deadline time.Time,
 	origin string,
 	pdus []*types.Event,
 	admitted *admission,
@@ -471,7 +493,7 @@ func (f *FederationRoutes) processTransactionPDUs(
 		roomToEvs[verifiedEv.RoomID] = append(roomToEvs[verifiedEv.RoomID], verifiedEv)
 	}
 
-	waits := f.waitForQueues(r, txnRooms, roomToEvs, arrived.Add(f.config.Rooms.Ingest.QueueWait))
+	waits := f.waitForQueues(r, txnRooms, roomToEvs, deadline)
 
 	var wg sync.WaitGroup
 	resultsCh := make(chan *rooms.SendEventsResult, len(roomToEvs))
@@ -611,7 +633,6 @@ func (f *FederationRoutes) enqueueRoomPDUs(
 // A transaction whose PDUs for a room with a full ingest queue waited too long fails with it
 var errQueueFull = errors.New("the room's ingest queue stayed full")
 
-// How often a full ingest queue is read again
 const queuePollInterval = time.Second
 
 // admission tells a transaction's EDUs whether its PDUs, which may wait on rooms' ingest queues and
@@ -638,7 +659,7 @@ func (a *admission) wait() bool {
 	return a.ok
 }
 
-// queueWait is the wait of a transaction's PDUs for room in the queue of their room's ingest job
+// queueWait is the wait of a transaction's PDUs for capacity in their room's ingest queue
 type queueWait struct {
 	done chan struct{}
 	err  error

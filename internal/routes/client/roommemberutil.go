@@ -32,25 +32,42 @@ func makeMembershipContent(membership event.Membership, reason string) map[strin
 	return content
 }
 
-func getOtherServers(r *http.Request, roomID id.RoomID) []string {
-	// User provided ?via query, or the ?server_name it replaced in spec 1.12
+// getOtherServers returns the servers asked to join or knock on a room this server is not in, as
+// Synapse asks them: those the request names with ?via, or ?server_name which it replaced in spec
+// 1.12, those the room alias lookup gave, and the room ID's domain, unless domainless as in v12 rooms
+func getOtherServers(r *http.Request, roomID id.RoomID, aliasServers []string) []string {
 	query := r.URL.Query()
-	otherServers := slices.Concat(query["via"], query["server_name"])
-
-	// TODO: don't blindly use roomID server here - but use what? Alias?
-	// TODO: use invite sender!
-	// A domainless room ID, as v12 rooms have, names no server
+	otherServers := slices.Concat(query["via"], query["server_name"], aliasServers)
 	if _, server, found := strings.Cut(roomID.String(), ":"); found {
 		otherServers = append(otherServers, server)
 	}
 	return otherServers
-
 }
 
-func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) id.RoomID {
+// remoteMembershipServers returns the servers getOtherServers gives, then that of the user's inviter,
+// without repeats or this server
+func (c *ClientRoutes) remoteMembershipServers(r *http.Request, roomID id.RoomID, userID id.UserID, aliasServers []string) ([]string, error) {
+	otherServers := getOtherServers(r, roomID, aliasServers)
+	if mtup, ev, err := c.db.Rooms.GetCurrentMembershipAndEvent(r.Context(), userID, roomID); err != nil {
+		return nil, err
+	} else if mtup != nil && mtup.Membership == event.MembershipInvite && ev != nil {
+		otherServers = append(otherServers, ev.Sender.Homeserver())
+	}
+	servers := make([]string, 0, len(otherServers))
+	for _, server := range otherServers {
+		if server != "" && server != c.config.ServerName && !slices.Contains(servers, server) {
+			servers = append(servers, server)
+		}
+	}
+	return servers, nil
+}
+
+// getRoomIDFromRequest returns the room the request names, looking up a room alias over federation,
+// with the servers the lookup gave. An alias that cannot be looked up gives no room ID.
+func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) (id.RoomID, []string) {
 	roomID := util.RoomIDFromRequestURLParam(r, param)
 	if strings.HasPrefix(roomID.String(), "!") {
-		return roomID
+		return roomID, nil
 	}
 
 	roomAlias := util.RoomAliasFromRequestURLParam(r, param)
@@ -63,10 +80,14 @@ func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) id.Ro
 		string(roomAlias),
 	)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 
-	return id.RoomID(aliasResp.RoomID)
+	servers := []string{otherServer}
+	for _, server := range aliasResp.Servers {
+		servers = append(servers, string(server))
+	}
+	return id.RoomID(aliasResp.RoomID), servers
 }
 
 type federatedMakeResp struct {
@@ -87,8 +108,9 @@ var (
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
 // none does, an errIncompatibleRoomVersion is returned if a server gave a room version this server
-// does not join, else the error of the last server whose request failed, or else an
-// errInvalidMembershipTemplate, or errNoKnownServers without servers.
+// does not join, else an util.ErrRestrictedJoinUnsupported if a server gave a restricted join, else
+// the error of the last server whose request failed, or else an errInvalidMembershipTemplate, or
+// errNoKnownServers without servers.
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
 	roomID id.RoomID,
@@ -98,7 +120,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 ) (*types.Event, string, error) {
 	log := hlog.FromRequest(r)
 
-	var versionErr, requestErr, templateErr error
+	var versionErr, unsupportedErr, requestErr, templateErr error
 	for _, otherServer := range otherServers {
 		serverLog := log.With().
 			Stringer("room_id", roomID).
@@ -124,12 +146,15 @@ func (c *ClientRoutes) makeFederatedEvent(
 		if err != nil {
 			serverLog.Warn().Err(err).Msg("Server gave an invalid membership event template")
 			templateErr = fmt.Errorf("%w from %s: %w", errInvalidMembershipTemplate, otherServer, err)
+			if errors.Is(err, util.ErrRestrictedJoinUnsupported) {
+				unsupportedErr = templateErr
+			}
 			continue
 		}
 		serverLog.Debug().Msg("Making federated event via server")
 		return ev, otherServer, nil
 	}
-	return nil, "", cmp.Or(versionErr, requestErr, templateErr, errNoKnownServers)
+	return nil, "", cmp.Or(versionErr, unsupportedErr, requestErr, templateErr, errNoKnownServers)
 }
 
 func membershipTemplateEvent(

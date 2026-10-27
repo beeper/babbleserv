@@ -347,7 +347,7 @@ func (fs *FederationSender) syncRoomsForServer(
 	}
 
 	if len(allEvs) > 0 || len(allReceipts) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allReceipts); err != nil {
+		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, util.EventsToJSONs(allEvs), allReceipts); err != nil {
 			return false, fmt.Errorf("failed to send rooms transaction: %w", err)
 		}
 	}
@@ -387,7 +387,7 @@ func (fs *FederationSender) syncTransientForServer(
 		return false, nil
 	}
 
-	allEvs := make([]*types.Event, 0)
+	allPDUs := make([]json.RawMessage, 0)
 	allEDUs := make([]*types.EDU, 0, 100)
 
 	for _, td := range toDevice {
@@ -421,13 +421,13 @@ func (fs *FederationSender) syncTransientForServer(
 				Msg("Sending remote presence update")
 			continue
 		case types.BabbleservRemoteOutlierEvent:
-			var ev *types.Event
-			exerrors.PanicIfNotNil(json.Unmarshal(td.Content, &ev))
-			allEvs = append(allEvs, ev)
+			// Sent as stored: parsed without its room version, the event would be written back in
+			// another version's format
+			allPDUs = append(allPDUs, td.Content)
 			log.Debug().
-				Stringer("event_id", ev.ID).
-				Stringer("type", ev.Type).
-				Stringer("sender", ev.Sender).
+				Str("room_id", gjson.GetBytes(td.Content, "room_id").String()).
+				Str("type", gjson.GetBytes(td.Content, "type").String()).
+				Str("sender", gjson.GetBytes(td.Content, "sender").String()).
 				Msg("Sending remote outlier event")
 			continue
 		}
@@ -463,8 +463,8 @@ func (fs *FederationSender) syncTransientForServer(
 			Msg("Sending remote to-device event")
 	}
 
-	if len(allEDUs) > 0 || len(allEvs) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allEDUs); err != nil {
+	if len(allEDUs) > 0 || len(allPDUs) > 0 {
+		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allPDUs, allEDUs); err != nil {
 			return false, fmt.Errorf("failed to send transient transaction: %w", err)
 		}
 	}
@@ -477,7 +477,7 @@ func (fs *FederationSender) sendTransactionToServer(
 	ctx context.Context,
 	serverName string,
 	version tuple.Versionstamp,
-	pdus []*types.Event,
+	pdus []json.RawMessage,
 	edus []*types.EDU,
 ) error {
 	log := zerolog.Ctx(ctx)
@@ -506,7 +506,7 @@ func (fs *FederationSender) sendTransactionToServer(
 		Origin:         spec.ServerName(fs.config.ServerName),
 		Destination:    spec.ServerName(serverName),
 		OriginServerTS: spec.Timestamp(time.Now().UnixMilli()),
-		PDUs:           util.EventsToJSONs(pdus),
+		PDUs:           pdus,
 		EDUs:           gedus,
 	}); err != nil {
 		return err

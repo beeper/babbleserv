@@ -128,13 +128,13 @@ func (j *RemoteJoin) Stage(ctx context.Context) error {
 	return j.runUntil(ctx, stagingDone)
 }
 
-// BuildState builds the state before the join and its diff from the room's current state, or any
+// BuildState assembles the state before the join and its diff from the room's current state, or any
 // resolution a join sent as a member's needs (phase B)
 func (j *RemoteJoin) BuildState(ctx context.Context) error {
 	return j.runUntil(ctx, workDone)
 }
 
-// Publish publishes the join (phase C). A join stored already reports its stored outcome.
+// Publish ends the join (phase C). A join stored already reports its stored outcome.
 func (j *RemoteJoin) Publish(ctx context.Context) (*SendEventsResult, error) {
 	return j.sender.send(j.log.WithContext(ctx))
 }
