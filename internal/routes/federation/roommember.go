@@ -9,6 +9,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/types"
 	"github.com/beeper/babbleserv/internal/util"
@@ -73,7 +74,7 @@ func (f *FederationRoutes) SignInvite(w http.ResponseWriter, r *http.Request) {
 	// For a room this server is not in, the invite is stored as an outlier, so the target local user
 	// sees it in sync without it forming part of the room. Otherwise it is sent as any federated event,
 	// and received a second time over federation as a duplicate.
-	if res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{req.Event}, nil); err != nil {
+	if res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{req.Event}, nil, rooms.SendFederatedEventsOptions{}); err != nil {
 		util.ResponseErrorUnknownJSON(w, r, err)
 		return
 	} else if len(res.Rejected) > 0 {

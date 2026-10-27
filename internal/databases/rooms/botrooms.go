@@ -1,0 +1,40 @@
+package rooms
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/babbleserv/internal/util"
+)
+
+// ErrBotRoomExists fails creating BabbleBot's room with a user that has one already
+var ErrBotRoomExists = errors.New("the user has a BabbleBot room already")
+
+func (r *RoomsDatabase) keyForBotRoom(userID id.UserID) fdb.Key {
+	return r.botRooms.Pack(tuple.Tuple{userID.String()})
+}
+
+// GetBotRoom returns BabbleBot's direct message room with a local user, if created
+func (r *RoomsDatabase) GetBotRoom(ctx context.Context, userID id.UserID) (id.RoomID, error) {
+	return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (id.RoomID, error) {
+		b, err := txn.Get(r.keyForBotRoom(userID)).Get()
+		return id.RoomID(b), err
+	})
+}
+
+// txnClaimBotRoom records the room a send creates as BabbleBot's room with the user, failing with
+// ErrBotRoomExists when another send created one first
+func (r *RoomsDatabase) txnClaimBotRoom(txn fdb.Transaction, userID id.UserID, roomID id.RoomID) error {
+	if b, err := txn.Get(r.keyForBotRoom(userID)).Get(); err != nil {
+		return err
+	} else if b != nil && id.RoomID(b) != roomID {
+		return fmt.Errorf("%w: %s", ErrBotRoomExists, b)
+	}
+	txn.Set(r.keyForBotRoom(userID), []byte(roomID))
+	return nil
+}

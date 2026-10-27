@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/beeper/babbleserv/internal/types"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 // Stage writes the given contexts that are pending in this batch and every pending page they reach,
@@ -27,6 +28,7 @@ func (b *Batch) Stage(ctx context.Context, budget int, ctxs ...types.StateHash) 
 			return fmt.Errorf("failed to stage room state: %w", err)
 		}
 		b.committed(chunk.unwrittenRecords)
+		util.ReportProgress(ctx)
 	}
 	return nil
 }

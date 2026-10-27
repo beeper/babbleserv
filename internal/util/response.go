@@ -131,6 +131,14 @@ func ResponseErrorJSON(w http.ResponseWriter, r *http.Request, error mautrix.Res
 	ResponseErrorMessageJSON(w, r, error, "")
 }
 
+// ErrorStatus is the HTTP status a response with the error has
+func ErrorStatus(error mautrix.RespError) int {
+	if meta, found := errorToMeta[error.ErrCode]; found {
+		return meta.statusCode
+	}
+	return http.StatusInternalServerError
+}
+
 func ResponseErrorMessageJSON(w http.ResponseWriter, r *http.Request, error mautrix.RespError, message string) {
 	meta, found := errorToMeta[error.ErrCode]
 	if !found {

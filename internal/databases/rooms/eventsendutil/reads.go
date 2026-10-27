@@ -10,6 +10,7 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms/events"
+	"github.com/beeper/babbleserv/internal/util"
 )
 
 // An artifact job reads in a new transaction once its current one is this old (ahead of fdb's 5s limit)
@@ -95,6 +96,7 @@ func (a *ArtifactReads) Do(reads func() error) error {
 	if time.Since(a.started) >= artifactJobTxnAge {
 		// Event reads started in the current transaction finish there, while it is young enough
 		a.provider.Settle()
+		util.ReportProgress(a.ctx)
 		if err := a.start(a.provider); err != nil {
 			return err
 		}

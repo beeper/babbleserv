@@ -44,6 +44,31 @@ type stateBudgetConfig struct {
 	InlineResolutionStateTuples int `yaml:"inlineResolutionStateTuples"`
 }
 
+// Bounds on a room's ingest job, which joins the room and publishes the events whose state it needs
+type ingestConfig struct {
+	// How long a job runs without progress before its lease expires and another runner may resume
+	// it. The runner stops itself then too.
+	// Default: 2m
+	LeaseTimeout time.Duration `yaml:"leaseTimeout"`
+	// How long after a join is enqueued its send_join keeps being sent again after failures that may
+	// be transient, before the join fails
+	// Default: 10m
+	JoinTimeout time.Duration `yaml:"joinTimeout"`
+	// Most state and auth chain events a join accepts from the resident server
+	// Default: 1000000
+	MaxJoinEvents int `yaml:"maxJoinEvents"`
+}
+
+type babbleBotConfig struct {
+	// Default: babblebot
+	Localpart string `yaml:"localpart"`
+	// Default: BabbleBot
+	DisplayName string `yaml:"displayName"`
+	// How long a join is pending before BabbleBot tells the joining user it is under way
+	// Default: 60s
+	JoinNoticeAfter time.Duration `yaml:"joinNoticeAfter"`
+}
+
 type NotifierConfig struct {
 	RedisAddr    string `yaml:"redisAddr"`
 	RedisChannel string `yaml:"redisChannel"`
@@ -80,6 +105,7 @@ type BabbleConfig struct {
 		MaxCreateRoomInvites int `yaml:"maxCreateRoomInvites"`
 
 		StateBudget stateBudgetConfig `yaml:"stateBudget"`
+		Ingest      ingestConfig      `yaml:"ingest"`
 	} `yaml:"rooms"`
 
 	Accounts struct {
@@ -131,6 +157,9 @@ type BabbleConfig struct {
 	Routes struct {
 		Servers []serverConfig `yaml:"servers"`
 	} `yaml:"routes"`
+
+	// A server-owned local user telling local users about work on their behalf, such as slow joins
+	BabbleBot babbleBotConfig `yaml:"babbleBot"`
 
 	Federation struct {
 		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
@@ -226,6 +255,24 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 	if cfg.Rooms.StateBudget.InlineResolutionStateTuples <= 0 {
 		cfg.Rooms.StateBudget.InlineResolutionStateTuples = 10_000
+	}
+	if cfg.Rooms.Ingest.LeaseTimeout <= 0 {
+		cfg.Rooms.Ingest.LeaseTimeout = 2 * time.Minute
+	}
+	if cfg.Rooms.Ingest.JoinTimeout <= 0 {
+		cfg.Rooms.Ingest.JoinTimeout = 10 * time.Minute
+	}
+	if cfg.Rooms.Ingest.MaxJoinEvents <= 0 {
+		cfg.Rooms.Ingest.MaxJoinEvents = 1_000_000
+	}
+	if cfg.BabbleBot.Localpart == "" {
+		cfg.BabbleBot.Localpart = "babblebot"
+	}
+	if cfg.BabbleBot.DisplayName == "" {
+		cfg.BabbleBot.DisplayName = "BabbleBot"
+	}
+	if cfg.BabbleBot.JoinNoticeAfter <= 0 {
+		cfg.BabbleBot.JoinNoticeAfter = time.Minute
 	}
 
 	return cfg

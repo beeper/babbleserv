@@ -173,7 +173,7 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 
 	// For a room this server is not in, none is taken, as a remote user's membership is never an
 	// outlier
-	res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, nil)
+	res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, nil, rooms.SendFederatedEventsOptions{})
 	var rejection error
 	if err == nil && len(res.Rejected) > 0 {
 		rejection = res.Rejected[0].Error

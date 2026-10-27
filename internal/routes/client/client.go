@@ -14,6 +14,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/types"
@@ -33,6 +34,7 @@ type ClientRoutes struct {
 	keyStore    *util.KeyStore
 	datastores  *util.Datastores
 	notifiers   *notifier.Notifiers
+	ingestJobs  *ingest.Jobs
 }
 
 func NewClientRoutes(
@@ -44,6 +46,7 @@ func NewClientRoutes(
 	keyStore *util.KeyStore,
 	datastores *util.Datastores,
 	notifiers *notifier.Notifiers,
+	ingestJobs *ingest.Jobs,
 ) *ClientRoutes {
 	log := log.With().
 		Str("routes", "client").
@@ -73,6 +76,7 @@ func NewClientRoutes(
 		keyStore:    keyStore,
 		datastores:  datastores,
 		notifiers:   notifiers,
+		ingestJobs:  ingestJobs,
 	}
 }
 

@@ -42,15 +42,24 @@ func NewKeyStore(fclient fclient.FederationClient) *KeyStore {
 }
 
 func (k *KeyStore) GetServerKeys(ctx context.Context, serverName string) (serverKeys, error) {
+	keys, fetched, err := k.getServerKeys(ctx, serverName)
+	if fetched {
+		// A fetch can take seconds, a dead server the request's whole timeout
+		ReportProgress(ctx)
+	}
+	return keys, err
+}
+
+func (k *KeyStore) getServerKeys(ctx context.Context, serverName string) (serverKeys, bool, error) {
 	k.lock.Lock()
 	defer k.lock.Unlock()
 
 	if cached, found := k.cache[serverName]; found && cached.validUntil.After(time.Now()) {
-		return cached, nil
+		return cached, false, nil
 	}
 
 	if cachedErr, found := k.errCache[serverName]; found && cachedErr.validUntil.After(time.Now()) {
-		return serverKeys{}, cachedErr.err
+		return serverKeys{}, false, cachedErr.err
 	}
 
 	zerolog.Ctx(ctx).Info().
@@ -65,7 +74,7 @@ func (k *KeyStore) GetServerKeys(ctx context.Context, serverName string) (server
 			validUntil: time.Now().Add(time.Minute),
 		}
 		// TODO: fallback to querying other, allowed, servers here if we can't get keys directly
-		return serverKeys{}, err
+		return serverKeys{}, true, err
 	}
 
 	// Convert gomatrixserverlib unncessary types -> stdlib types
@@ -80,7 +89,7 @@ func (k *KeyStore) GetServerKeys(ctx context.Context, serverName string) (server
 	}
 
 	k.cache[serverName] = serverKeys
-	return serverKeys, nil
+	return serverKeys, true, nil
 }
 
 func (k *KeyStore) VerifyJSONFromServer(ctx context.Context, serverName string, b []byte) error {

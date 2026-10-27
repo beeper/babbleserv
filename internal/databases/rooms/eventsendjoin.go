@@ -52,15 +52,94 @@ type boundaryChanges struct {
 	changes     []types.StateChange
 }
 
-// remoteJoinIn returns the join of a batch that is a local user's join with a given before-state,
-// nil for any other batch
-func (r *RoomsDatabase) remoteJoinIn(evs []*types.Event, given *GivenStates) *remoteJoin {
-	if given == nil || len(evs) != 1 || evs[0].StateKey == nil || !isJoinEvent(evs[0]) {
-		return nil
-	} else if stateIDs, found := given.BeforeEvents[evs[0].ID]; found && r.isLocalUser(id.UserID(*evs[0].StateKey)) {
-		return &remoteJoin{ev: evs[0], stateIDs: stateIDs}
+// RemoteJoin is a local user's join to a room this server is not in, with the state before it and
+// its auth chain as the resident server's send_join response gives them. The room's ingest job runs
+// it in phases: each runs the join's attempts until they reach the next phase's work, and Publish
+// runs them through, redoing any earlier work a change to the room meanwhile invalidated. Should
+// another join get this server into the room first, the join is sent as a member's.
+type RemoteJoin struct {
+	sender *remoteJoinSender
+	log    zerolog.Logger
+}
+
+// NewRemoteJoin prepares the join of a local user, a target of the room's ingest job, which its
+// publish clears. The events are the state before the join and its auth chain, in any order.
+func (r *RoomsDatabase) NewRemoteJoin(
+	ctx context.Context,
+	joinEv *types.Event,
+	stateIDs []id.EventID,
+	evs []*types.Event,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
+) (*RemoteJoin, error) {
+	if joinEv.StateKey == nil || !isJoinEvent(joinEv) || !r.isLocalUser(id.UserID(*joinEv.StateKey)) {
+		return nil, fmt.Errorf("event %s is not a local user's join", joinEv.ID)
 	}
-	return nil
+	roomID := joinEv.RoomID
+	push := pushContext{rules: userPushRules, rooms: userRoomContext}
+	p := &federatedEventSender{
+		eventSender: r.newEventSender(roomID, push),
+		evs:         []*types.Event{joinEv},
+		given:       givenStates{beforeEvents: map[id.EventID][]id.EventID{joinEv.ID: stateIDs}},
+		fetched:     evs,
+		join:        &remoteJoin{ev: joinEv, stateIDs: stateIDs},
+		options: SendFederatedEventsOptions{
+			Targets: map[id.EventID]types.IngestTargetKind{joinEv.ID: types.IngestTargetJoin},
+		},
+	}
+	p.build = p.executePreparationWork
+	log := r.getTxnLogContext(ctx, "RemoteJoin").
+		Stringer("room_id", roomID).
+		Stringer("event_id", joinEv.ID).
+		Logger()
+	return &RemoteJoin{sender: &remoteJoinSender{federatedEventSender: p}, log: log}, nil
+}
+
+// Stage checks the join and the response events against their own auth events, and the join against
+// the state before it, then stages the response events (phase A)
+func (j *RemoteJoin) Stage(ctx context.Context) error {
+	return j.runUntil(ctx, stagingDone)
+}
+
+// BuildState builds the state before the join and its diff from the room's current state, or any
+// resolution a join sent as a member's needs (phase B)
+func (j *RemoteJoin) BuildState(ctx context.Context) error {
+	return j.runUntil(ctx, workDone)
+}
+
+// Publish publishes the join (phase C). A join stored already reports its stored outcome.
+func (j *RemoteJoin) Publish(ctx context.Context) (*SendEventsResult, error) {
+	return j.sender.send(j.log.WithContext(ctx))
+}
+
+func (j *RemoteJoin) runUntil(ctx context.Context, stopAt func(preparationOutcome) bool) error {
+	s := j.sender
+	s.stopAt = stopAt
+	defer func() { s.stopAt = nil }()
+	_, err := s.run(j.log.WithContext(ctx), s.prepare)
+	if errors.Is(err, errJoinStored) {
+		s.join.stored = true
+		return nil
+	} else if errors.Is(err, errPhaseReached) {
+		return nil
+	}
+	return err
+}
+
+// stagingDone reports whether a preparation asks for anything but staging
+func stagingDone(outcome preparationOutcome) bool {
+	needs, ok := outcome.(needsWork)
+	if !ok {
+		return true
+	}
+	_, staging := needs.work.(stageEventsWork)
+	return !staging
+}
+
+// workDone reports whether a preparation asks for no more preparatory work
+func workDone(outcome preparationOutcome) bool {
+	_, ok := outcome.(needsWork)
+	return !ok
 }
 
 // inJoinMode reports whether a send publishes a remote join that replaces the room's state
@@ -87,21 +166,12 @@ type remoteJoinSender struct {
 }
 
 func (s *remoteJoinSender) send(ctx context.Context) (*SendEventsResult, error) {
-	res, err := s.sendInJoinTurn(ctx)
+	res, err := s.run(ctx, s.prepare)
 	if errors.Is(err, errJoinStored) {
 		s.join.stored = true
 		return s.run(ctx, s.prepare)
 	}
 	return res, err
-}
-
-func (s *remoteJoinSender) sendInJoinTurn(ctx context.Context) (*SendEventsResult, error) {
-	unlock, err := s.r.lockJoin(ctx, s.roomID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	return s.run(ctx, s.prepare)
 }
 
 func (s *remoteJoinSender) prepare(ctx context.Context) (preparationOutcome, error) {

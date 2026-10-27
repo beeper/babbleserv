@@ -26,6 +26,7 @@ var (
 	errNeedsStaging             = errors.New("the send needs staging")
 	errGuardFailed              = errors.New("the room changed since the send was prepared")
 	errEventsStoredConcurrently = fmt.Errorf("%w: events were stored concurrently", errGuardFailed)
+	errPhaseReached             = errors.New("the send reached the outcome it runs until")
 )
 
 // Event sending timeouts & retries
@@ -33,7 +34,6 @@ const (
 	firstSendRetryPause   = 10 * time.Millisecond
 	longestSendRetryPause = 250 * time.Millisecond
 	sendTimeout           = 60 * time.Second
-	remoteJoinTimeout     = 10 * time.Minute
 )
 
 // sendGuard is room data checked at publish time to ensure no other process has mutated the room
@@ -41,6 +41,8 @@ type sendGuard struct {
 	revision uint64
 	joined   bool
 	unstored []id.EventID
+	// The room must have no ingest job, see SendFederatedEventsOptions.RefuseWhileIngesting
+	noIngestJob bool
 }
 
 // publishPlan contains everything needed to complete (publish) an event send
@@ -86,6 +88,9 @@ type eventSender struct {
 	build   func(context.Context, preparationWork) error
 	after   func(context.Context, *SendEventsResult)
 	pause   func(context.Context, int) error
+	// Ends the send's attempts with errPhaseReached once a preparation's outcome satisfies it, before
+	// acting on it, so a job can run a send's preparatory work in phases
+	stopAt func(preparationOutcome) bool
 }
 
 func (r *RoomsDatabase) newEventSender(roomID id.RoomID, push pushContext) eventSender {
@@ -146,6 +151,8 @@ func (s *eventSender) attempt(ctx context.Context, prepare prepareEvents) (*Send
 	outcome, err := prepare(ctx)
 	if err != nil {
 		return nil, nil, err
+	} else if s.stopAt != nil && s.stopAt(outcome) {
+		return nil, nil, errPhaseReached
 	}
 	switch outcome := outcome.(type) {
 	case readyToPublish:
@@ -553,6 +560,10 @@ func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*ty
 		return nil, fmt.Errorf("%w: state revision %d, prepared at %d", errGuardFailed, revision, plan.guard.revision)
 	} else if joined := isServerJoined(stored); joined != plan.guard.joined {
 		return nil, fmt.Errorf("%w: this server joined %t, prepared %t", errGuardFailed, joined, plan.guard.joined)
+	} else if plan.guard.noIngestJob {
+		if err := s.r.txnCheckNoIngestJob(txn, plan.room.ID); err != nil {
+			return nil, err
+		}
 	}
 	if storedNow, err := s.r.txnGetStoredEventIDs(txn, plan.guard.unstored); err != nil {
 		return nil, err

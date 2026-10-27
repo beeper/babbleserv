@@ -38,6 +38,9 @@ type SendLocalEventsOptions struct {
 	RoomAlias        id.RoomAlias
 	RoomAliasOwner   id.UserID
 	RequireAllEvents bool
+
+	// Records the room the send creates as BabbleBot's room with this user, see txnClaimBotRoom
+	BotRoomUser id.UserID
 }
 
 // RequiredEventRejectedError fails a send requiring all its events once one is rejected, storing
@@ -164,6 +167,11 @@ func (s *localEventSender) txnPrepareLocal(ctx context.Context, txn fdb.ReadTran
 		}
 		if options.PublishRoom {
 			s.r.txnSetRoomPublished(txn, room, true)
+		}
+		if options.BotRoomUser != "" {
+			if err := s.r.txnClaimBotRoom(txn, options.BotRoomUser, room.ID); err != nil {
+				return err
+			}
 		}
 		if withTransactionID && len(plan.evs) > 0 {
 			s.r.txnStoreEventTransaction(txn, *options.TransactionDevice, room.ID, options.TransactionEndpoint, options.TransactionID, plan.evs[0].ID)

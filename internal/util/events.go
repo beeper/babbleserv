@@ -166,6 +166,9 @@ func VerifyRemoteEvent(ctx context.Context, ev *types.Event, keyStore *KeyStore)
 	return ev, nil, nil
 }
 
+// Events VerifyRemoteEvents verifies between reports of its progress, besides each key fetch
+const verifyProgressEvents = 100
+
 // Parses and verifies events fetched from another server, skipping those that cannot be parsed or
 // fail verification and any already seen. Redacted events are kept, redacted.
 func VerifyRemoteEvents[S ~[]E, E ~[]byte](
@@ -177,7 +180,10 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 ) ([]*types.Event, error) {
 	log := zerolog.Ctx(ctx)
 	evs := make([]*types.Event, 0, len(raws))
-	for _, b := range raws {
+	for i, b := range raws {
+		if i > 0 && i%verifyProgressEvents == 0 {
+			ReportProgress(ctx)
+		}
 		remoteEv := &types.Event{RoomVersion: roomVersion}
 		if err := json.Unmarshal(b, remoteEv); err != nil {
 			log.Warn().Err(err).Msg("Skipping remote event that cannot be parsed")

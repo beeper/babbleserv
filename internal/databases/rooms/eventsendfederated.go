@@ -112,12 +112,22 @@ type GivenStates struct {
 	Events []*types.Event
 }
 
+type SendFederatedEventsOptions struct {
+	// Fail with ErrRoomIngesting rather than send while the room has an ingest job, which publishes
+	// the room's events while it runs. The publish reads the job's record, so a job started meanwhile
+	// conflicts with it.
+	RefuseWhileIngesting bool
+	// The events that are targets of the room's ingest job, which the publish storing them clears
+	Targets map[id.EventID]types.IngestTargetKind
+}
+
 // Send federated events to a room after passing through all the required
 // authorization checks. (steps 4-6: https://spec.matrix.org/v1.10/server-server-api/#checks-performed-on-receipt-of-a-pdu)
 //
 // Every event fetched from other servers must be in evs or given: an event that cannot be evaluated
 // is dropped with an error wrapping ErrEventDropped. An event with a given before-state takes it
-// instead of the state after its prev events. Remote joins are passed to remoteJoinIn.
+// instead of the state after its prev events. A local user's join to a room this server is not in
+// is a RemoteJoin instead.
 func (r *RoomsDatabase) SendFederatedEvents(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -125,9 +135,10 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	given *GivenStates,
 	userPushRules types.UserPushRulesMap,
 	userRoomContext types.UserRoomContextMap,
+	options SendFederatedEventsOptions,
 ) (*SendEventsResult, error) {
 	push := pushContext{rules: userPushRules, rooms: userRoomContext}
-	p := &federatedEventSender{eventSender: r.newEventSender(roomID, push)}
+	p := &federatedEventSender{eventSender: r.newEventSender(roomID, push), options: options}
 	evs = p.sortEventsTopologically(evs)
 	p.evs = evs
 	log := r.getTxnLogContext(ctx, "SendFederatedEvents").
@@ -141,18 +152,10 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	}
 	p.build = p.executePreparationWork
 
-	if join := r.remoteJoinIn(evs, given); join != nil {
-		ctx, cancel := p.withSendTimeout(ctx, remoteJoinTimeout)
-		defer cancel()
-		p.join = join
-		p.given = givenStates{beforeEvents: map[id.EventID][]id.EventID{join.ev.ID: join.stateIDs}}
-		s := &remoteJoinSender{federatedEventSender: p}
-		return s.send(ctx)
-	}
 	if joined, err := r.IsServerJoined(ctx, roomID, r.config.ServerName); err != nil {
 		return nil, err
 	} else if !joined {
-		return r.sendOutlierMemberships(ctx, roomID, evs)
+		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
 
 	ctx, cancel := p.withSendTimeout(ctx, sendTimeout)
@@ -160,14 +163,27 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	res, err := p.send(ctx)
 	if errors.Is(err, ErrServerNotInRoom) {
 		log.Info().Err(err).Msg("This server left the room while sending events")
-		return r.sendOutlierMemberships(ctx, roomID, evs)
+		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
 	return res, err
 }
 
 // sendOutlierMemberships stores those of a batch's events for a room this server is not in that are
-// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom.
-func (r *RoomsDatabase) sendOutlierMemberships(ctx context.Context, roomID id.RoomID, evs []*types.Event) (*SendEventsResult, error) {
+// outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom. While
+// the room has an ingest job, which a join in progress has, the events are its instead.
+func (r *RoomsDatabase) sendOutlierMemberships(
+	ctx context.Context,
+	roomID id.RoomID,
+	evs []*types.Event,
+	options SendFederatedEventsOptions,
+) (*SendEventsResult, error) {
+	if options.RefuseWhileIngesting {
+		if job, err := r.GetIngestJob(ctx, roomID); err != nil {
+			return nil, err
+		} else if job != nil {
+			return nil, fmt.Errorf("%w: %s", ErrRoomIngesting, roomID)
+		}
+	}
 	res := &SendEventsResult{}
 	for _, ev := range evs {
 		if outlier, err := r.isOutlierMembership(ctx, roomID, ev); err != nil {
@@ -234,7 +250,8 @@ type federatedEventSender struct {
 	given   givenStates
 	fetched []*types.Event
 	// Set for a remote join, including after it switches to member mode
-	join *remoteJoin
+	join    *remoteJoin
+	options SendFederatedEventsOptions
 }
 
 func (p *federatedEventSender) send(ctx context.Context) (*SendEventsResult, error) {
@@ -406,8 +423,12 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 	stateBatch, authGraph := s.txnNewStateBatch(txn, eventsProvider, evs...)
 	plan := &publishPlan{
-		room:  room,
-		guard: sendGuard{revision: room.StateRevision, joined: !join.inJoinMode()},
+		room: room,
+		guard: sendGuard{
+			revision:    room.StateRevision,
+			joined:      !join.inJoinMode(),
+			noIngestJob: s.options.RefuseWhileIngesting,
+		},
 		preparedEvents: preparedEvents{
 			stateBatch:          stateBatch,
 			authGraph:           authGraph,
@@ -473,7 +494,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	if join != nil {
 		if i := slices.IndexFunc(evs, func(ev *types.Event) bool { return ev.ID == join.ev.ID }); i >= 0 && evs[i].IsDuplicate {
 			if join.inJoinMode() {
-				// Answered outside the room's join lock, see remoteJoinSender.send
+				// The send starts again answering the stored join, see remoteJoinSender.send
 				return nil, errJoinStored
 			}
 			join.stored = true
@@ -579,6 +600,11 @@ func (s *federatedEventSender) txnPrepareFederated(
 			Msg("Room has several extremities, current state is resolved")
 	}
 	plan.stateSteps = current.steps
+	if len(s.options.Targets) > 0 {
+		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
+			return s.r.txnClearPublishedTargets(txn, plan.evs, s.options.Targets)
+		}
+	}
 	return readyToPublish{plan: plan}, nil
 }
 
@@ -954,6 +980,7 @@ func (s *federatedEventSender) stageStatelessEvents(ctx context.Context, staging
 		}); err != nil {
 			return err
 		}
+		util.ReportProgress(ctx)
 	}
 	staging.staged = true
 	return nil
