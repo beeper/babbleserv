@@ -85,3 +85,23 @@ func TestChunkIngestTargets(t *testing.T) {
 	assert.Equal(t, [][]int{{200}, {10}}, chunkSizes(chunkIngestTargets(sized(200, 10), 90)), "a target over the bound has a chunk of its own")
 	assert.Empty(t, chunkIngestTargets(nil, 90))
 }
+
+// Read apart from a target written with them, targets citing it would have their gaps filled elsewhere
+func TestWithoutCitersOfUnreadTargets(t *testing.T) {
+	target := func(eventID id.EventID, prevIDs ...id.EventID) *types.IngestTarget {
+		ev := sendTestMember(eventID, "@remote:other.example")
+		ev.RoomVersion, ev.PrevEventIDs = "11", prevIDs
+		return &types.IngestTarget{Kind: types.IngestTargetPDU, Event: ev}
+	}
+	targets := []*types.IngestTarget{
+		target("$citesCiter", "$citesUnread"),
+		target("$citesUnread", "$unread"),
+		target("$independent", "$stored"),
+	}
+	var kept []id.EventID
+	for _, target := range withoutCitersOf(targets, map[id.EventID]struct{}{"$unread": {}}) {
+		kept = append(kept, target.Event.ID)
+	}
+	assert.Equal(t, []id.EventID{"$independent"}, kept)
+	assert.Len(t, withoutCitersOf(targets, nil), len(targets))
+}

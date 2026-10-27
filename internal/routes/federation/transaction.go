@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -84,11 +85,13 @@ func (f *FederationRoutes) SendTransaction(w http.ResponseWriter, r *http.Reques
 
 	log.Debug().Msg("Processing incoming federation transaction")
 
-	// Answer within the minute the sender waits, so it doesn't resend the transaction meanwhile
-	deadline := arrived.Add(f.config.Rooms.Ingest.QueueWait)
+	// Answer within the minute the sender waits, so it doesn't resend the transaction meanwhile. The
+	// PDUs stop waiting on a queue a fifth early, so that EDUs held for them still have time.
+	queueWait := f.config.Rooms.Ingest.QueueWait
+	deadline := arrived.Add(queueWait)
 	var resp *respTransaction
 	pduErr, eduErr := runTransaction(&log, func(admitted *admission) (err error) {
-		resp, err = f.processTransactionPDUs(r, deadline, req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
+		resp, err = f.processTransactionPDUs(r, deadline.Add(-queueWait/5), req.Origin, parseTransactionPDUs(&log, req.PDUs), admitted)
 		return err
 	}, func() error {
 		ctx, cancel := context.WithDeadline(r.Context(), deadline)
@@ -134,8 +137,9 @@ func runTransaction(log *zerolog.Logger, pdus func(*admission) error, edus func(
 
 const remoteDeviceIngestConcurrency = 4
 
-// processTransactionEDUs fails only for to-device messages it failed to store, which are lost unless
-// the transaction is resent: the other types are idempotent or ephemeral
+// processTransactionEDUs fails for to-device messages it failed to store, and for device list
+// updates the deadline left unstored, which are lost unless the transaction is resent: presence is
+// ephemeral
 func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.Request, origin string, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 
@@ -147,14 +151,17 @@ func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.R
 	}
 
 	var wg sync.WaitGroup
-	var toDeviceErr error
+	errs := make([]error, len(edusByType))
+	i := 0
 	for eduType, edus := range edusByType {
+		errp := &errs[i]
+		i++
 		wg.Go(func() {
 			defer util.RecoverPanic(log, nil)
 
 			switch eduType {
 			case types.EDUTypeDeviceListUpdate, types.EDUTypeSigningKeyUpdate:
-				f.processTransactionDeviceListEDUs(ctx, r, origin, eduType, edus)
+				*errp = f.processTransactionDeviceListEDUs(ctx, r, origin, eduType, edus)
 
 			case types.EDUTypeReceipt:
 				// TODO
@@ -163,7 +170,7 @@ func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.R
 				f.processTransactionPresenceEDUs(ctx, r, origin, eduType, edus)
 
 			case types.EDUTypeToDevice:
-				toDeviceErr = f.processTransactionToDeviceEDUs(ctx, r, origin, eduType, edus)
+				*errp = f.processTransactionToDeviceEDUs(ctx, r, origin, eduType, edus)
 
 			default:
 				log.Error().Str("type", string(eduType)).Msg("Ignoring unknown EDU type")
@@ -172,10 +179,12 @@ func (f *FederationRoutes) processTransactionEDUs(ctx context.Context, r *http.R
 	}
 
 	wg.Wait()
-	return toDeviceErr
+	return errors.Join(errs...)
 }
 
-func (f *FederationRoutes) processTransactionDeviceListEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {
+// processTransactionDeviceListEDUs fails only on the context ending: the sender would never resend
+// the updates, whereas an update failing otherwise would fail every resend
+func (f *FederationRoutes) processTransactionDeviceListEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) error {
 	log := hlog.FromRequest(r)
 	userEDUs := make(map[id.UserID][]types.RemoteDeviceEDU)
 	for _, edu := range edus {
@@ -201,6 +210,7 @@ func (f *FederationRoutes) processTransactionDeviceListEDUs(ctx context.Context,
 	}
 
 	var ingests sync.WaitGroup
+	var unstored atomic.Int32
 	running := make(chan struct{}, remoteDeviceIngestConcurrency)
 	for userID, updates := range userEDUs {
 		running <- struct{}{}
@@ -212,12 +222,19 @@ func (f *FederationRoutes) processTransactionDeviceListEDUs(ctx context.Context,
 			notified, err := f.db.Accounts.IngestRemoteDeviceUpdates(ctx, userID, updates)
 			if err != nil {
 				log.Err(err).Msg("Failed to ingest remote device updates")
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					unstored.Add(1)
+				}
 				return
 			}
 			log.Debug().Int("updates", len(updates)).Bool("notified", notified).Msg("Ingested remote device updates")
 		})
 	}
 	ingests.Wait()
+	if n := unstored.Load(); n > 0 {
+		return fmt.Errorf("%s updates of %d users were not stored in time: %w", eduType, n, ctx.Err())
+	}
+	return nil
 }
 
 func (f *FederationRoutes) processTransactionPresenceEDUs(ctx context.Context, r *http.Request, origin string, eduType types.EDUType, edus []*types.EDU) {

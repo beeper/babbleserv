@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,7 +39,7 @@ type ReqGetMissingEvents struct {
 
 var errGapBudgetSpent = errors.New("the job's run fetched as many state DAG events as its gap fills may")
 
-func (w *stateDAGPDUs) fillStateDAG(ctx context.Context, roomServers []string) error {
+func (w *stateDAGPDUs) fillStateDAG(ctx context.Context, roomServers []string, deadline time.Time) error {
 	db, roomID := w.run.jobs.db, w.run.roomID
 	evs := make([]*types.Event, len(w.pdus))
 	for i, target := range w.pdus {
@@ -52,8 +53,7 @@ func (w *stateDAGPDUs) fillStateDAG(ctx context.Context, roomServers []string) e
 	if err != nil {
 		return err
 	}
-	cfg := w.run.jobs.config.Rooms.Ingest
-	fill := newStateDAGFill(evs, gap, cfg.MaxGapEvents, &w.run.gapBudget, time.Now().Add(cfg.GapFillTimeout))
+	fill := newStateDAGFill(evs, gap, w.run.jobs.config.Rooms.Ingest.MaxGapEvents, &w.run.gapBudget, deadline)
 	if open := fill.open(); len(open) > 0 {
 		if err := w.askStateDAG(ctx, fill, open, roomServers, walk); err != nil {
 			return err
@@ -122,7 +122,9 @@ type stateDAGFill struct {
 	deadline  time.Time
 	// PDUs to hold back: a server failed without refusing, or still gave their gap at the bounds
 	unanswered map[id.EventID]struct{}
-	errs       []error
+	// How often requests named each frontier event
+	named map[id.EventID]int
+	errs  []error
 }
 
 // stateDAGRequest stages at most maxStaged of the events a server serves, returning how many
@@ -140,6 +142,7 @@ func newStateDAGFill(pdus []*types.Event, gap *rooms.StateDAGGap, maxPerPDU int,
 		maxRounds:  stateDAGRounds(maxPerPDU),
 		deadline:   deadline,
 		unanswered: make(map[id.EventID]struct{}),
+		named:      make(map[id.EventID]int),
 	}
 }
 
@@ -225,8 +228,7 @@ func (f *stateDAGFill) ask(ctx context.Context, server string, request stateDAGR
 		}
 		fromFrontier = fromFrontier || !filled
 		if latestIDs = f.open(); fromFrontier && len(latestIDs) > 0 {
-			frontier := f.frontier()
-			latestIDs = frontier[:min(len(frontier), MaxStateDAGRequestIDs)]
+			latestIDs = f.nameFrontier()
 		}
 	}
 	return nil
@@ -310,6 +312,20 @@ func (f *stateDAGFill) open() []id.EventID {
 		}
 	}
 	return open
+}
+
+// nameFrontier rotates through the frontier, the events named least in the fill first, so that junk
+// with low event IDs cannot keep the rest from being named
+func (f *stateDAGFill) nameFrontier() []id.EventID {
+	frontier := f.frontier()
+	slices.SortStableFunc(frontier, func(a, b id.EventID) int {
+		return cmp.Compare(f.named[a], f.named[b])
+	})
+	frontier = frontier[:min(len(frontier), MaxStateDAGRequestIDs)]
+	for _, eventID := range frontier {
+		f.named[eventID]++
+	}
+	return frontier
 }
 
 func (f *stateDAGFill) frontier() []id.EventID {
@@ -450,7 +466,7 @@ func publishChunks(
 
 // PrevEvents fetches the prev events a state DAG room's PDU targets miss as pulled targets, asking
 // only the origins: a prev event left missing only leaves the PDUs citing it room extremities.
-func (f *Fetcher) PrevEvents(ctx context.Context, roomID id.RoomID, roomVersion string, targets []*types.IngestTarget) ([]*types.IngestTarget, error) {
+func (f *Fetcher) PrevEvents(ctx context.Context, roomID id.RoomID, roomVersion string, targets []*types.IngestTarget, deadline time.Time) ([]*types.IngestTarget, error) {
 	evs := make([]*types.Event, len(targets))
 	seenIDs := make(map[id.EventID]struct{}, len(targets))
 	for i, target := range targets {
@@ -468,7 +484,7 @@ func (f *Fetcher) PrevEvents(ctx context.Context, roomID id.RoomID, roomVersion 
 	for _, target := range sent {
 		origins = append(origins, target.Servers...)
 	}
-	plan := newGapPlan(sent, missing.Missing)
+	plan := newGapPlan(sent, missing.Missing, deadline)
 	servers := gapFillServers(origins, nil, f.config.ServerName)
 	for _, server := range servers {
 		if err := plan.ask(ctx, server, true, func(ctx context.Context, server string, latestIDs, pulledIDs []id.EventID) ([]*types.Event, error) {

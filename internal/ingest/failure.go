@@ -102,6 +102,14 @@ func tooLargeFailure(what string, events, limit int) *types.IngestFailure {
 	}
 }
 
+func tooLargeResponseFailure(limit int) *types.IngestFailure {
+	return &types.IngestFailure{
+		Status:  http.StatusRequestEntityTooLarge,
+		ErrCode: mautrix.MTooLarge.ErrCode,
+		Message: fmt.Sprintf("the room's state and auth chain take over %d bytes, the most this server joins rooms with", limit),
+	}
+}
+
 func tooManyTipsFailure(tips, limit int) *types.IngestFailure {
 	return &types.IngestFailure{
 		Status:  http.StatusRequestEntityTooLarge,

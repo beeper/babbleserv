@@ -59,6 +59,12 @@ type ingestConfig struct {
 	// How long a send_join waits for its response to start, which for a large room takes minutes
 	// Default: 5m
 	SendJoinResponseTimeout time.Duration `yaml:"sendJoinResponseTimeout"`
+	// How long a send_join response may stream once it started, past JoinTimeout
+	// Default: 2h
+	JoinStreamTimeout time.Duration `yaml:"joinStreamTimeout"`
+	// Most bytes of a v1–v12 send_join response, which is held whole
+	// Default: 512 MiB
+	MaxJoinResponseBytes int `yaml:"maxJoinResponseBytes"`
 	// Most joins and gap fills run at once across jobs, each holding up to hundreds of MB it fetched
 	// Default: 4 and 16
 	MaxConcurrentJoins    int `yaml:"maxConcurrentJoins"`
@@ -77,7 +83,8 @@ type ingestConfig struct {
 	// Default: 2000 and 50000000
 	MaxQueuedPDUs     int   `yaml:"maxQueuedPDUs"`
 	MaxQueuedPDUBytes int64 `yaml:"maxQueuedPDUBytes"`
-	// How long /send waits on a full queue before failing, under Synapse's one minute response timeout
+	// How long /send takes at most, under Synapse's one minute response timeout: PDUs wait on a full
+	// queue for four fifths of it before failing, leaving the rest to the EDUs held for them
 	// Default: 50s
 	QueueWait time.Duration `yaml:"queueWait"`
 }
@@ -321,6 +328,12 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	}
 	if cfg.Rooms.Ingest.SendJoinResponseTimeout <= 0 {
 		cfg.Rooms.Ingest.SendJoinResponseTimeout = 5 * time.Minute
+	}
+	if cfg.Rooms.Ingest.JoinStreamTimeout <= 0 {
+		cfg.Rooms.Ingest.JoinStreamTimeout = 2 * time.Hour
+	}
+	if cfg.Rooms.Ingest.MaxJoinResponseBytes <= 0 {
+		cfg.Rooms.Ingest.MaxJoinResponseBytes = 512 << 20
 	}
 	if cfg.Rooms.Ingest.MaxConcurrentJoins <= 0 {
 		cfg.Rooms.Ingest.MaxConcurrentJoins = 4

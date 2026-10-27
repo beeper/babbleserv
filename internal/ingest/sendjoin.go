@@ -39,12 +39,14 @@ var (
 )
 
 // sendJoin allows SendJoinResponseTimeout for the response to start, as the resident builds it first,
-// then sendJoinStallTimeout per pause in the body. A refusal is a gomatrix.HTTPError, as fclient gives.
+// then sendJoinStallTimeout per pause in the body. A response starting before timesOut may stream for
+// JoinStreamTimeout, as a large room's takes long to read. A refusal is a gomatrix.HTTPError, as
+// fclient gives.
 func (f *Fetcher) sendJoin(ctx context.Context, server string, joinEv *types.Event, timesOut time.Time, read func(*stallReader) error) error {
-	ctx, cancelTimeout := context.WithDeadlineCause(ctx, timesOut, errJoinTimedOut)
-	defer cancelTimeout()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	timeout := time.AfterFunc(time.Until(timesOut), func() { cancel(errJoinTimedOut) })
+	defer timeout.Stop()
 	stall := time.AfterFunc(f.config.Rooms.Ingest.SendJoinResponseTimeout, func() { cancel(errSendJoinStalled) })
 	defer stall.Stop()
 
@@ -65,22 +67,23 @@ func (f *Fetcher) sendJoin(ctx context.Context, server string, joinEv *types.Eve
 		return stalledOr(ctx, err)
 	}
 	defer resp.Body.Close()
+	timeout.Reset(f.config.Rooms.Ingest.JoinStreamTimeout)
 	stall.Reset(sendJoinStallTimeout)
 	return stalledOr(ctx, read(&stallReader{r: resp.Body, stall: stall}))
 }
 
 // SendJoin is for rooms without a state DAG, whose response is held whole. A response over
-// rooms.ingest.maxJoinEvents events, or that many times 64 KiB, fails with a tooLargeFailure.
+// rooms.ingest.maxJoinEvents events or rooms.ingest.maxJoinResponseBytes fails with a 413 failure.
 func (f *Fetcher) SendJoin(ctx context.Context, server string, joinEv *types.Event, timesOut time.Time) (state, authChain []json.RawMessage, err error) {
-	limit := f.config.Rooms.Ingest.MaxJoinEvents
+	cfg := f.config.Rooms.Ingest
 	err = f.sendJoin(ctx, server, joinEv, timesOut, func(body *stallReader) error {
 		body.progress = func() { util.ReportProgress(ctx) }
 		capped := &limitedReader{
 			r:     body,
-			limit: limit * util.MaxPDUBytes,
-			err:   tooLargeFailure("state and auth chain have over the bytes of", limit, limit),
+			limit: cfg.MaxJoinResponseBytes,
+			err:   tooLargeResponseFailure(cfg.MaxJoinResponseBytes),
 		}
-		state, authChain, err = decodeLegacySendJoin(capped, limit)
+		state, authChain, err = decodeLegacySendJoin(capped, cfg.MaxJoinEvents)
 		return err
 	})
 	return state, authChain, err

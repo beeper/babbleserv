@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
@@ -318,15 +319,17 @@ func (w *stateDAGPDUs) fetch(ctx context.Context) error {
 	roomServers, err := db.Rooms.RoomServers(ctx, w.run.roomID)
 	if err != nil {
 		return err
-	} else if err := w.pullPrevEvents(ctx); err != nil {
+	}
+	deadline := time.Now().Add(w.run.jobs.config.Rooms.Ingest.GapFillTimeout)
+	if err := w.pullPrevEvents(ctx, deadline); err != nil {
 		return err
 	}
-	return w.fillStateDAG(ctx, roomServers)
+	return w.fillStateDAG(ctx, roomServers, deadline)
 }
 
 // pullPrevEvents makes missing prev events targets, marked pulled so theirs are not pulled in turn
-func (w *stateDAGPDUs) pullPrevEvents(ctx context.Context) error {
-	pulled, err := w.run.jobs.fetcher.PrevEvents(ctx, w.run.roomID, w.run.roomVersion, w.pdus)
+func (w *stateDAGPDUs) pullPrevEvents(ctx context.Context, deadline time.Time) error {
+	pulled, err := w.run.jobs.fetcher.PrevEvents(ctx, w.run.roomID, w.run.roomVersion, w.pdus, deadline)
 	if err != nil || len(pulled) == 0 {
 		return err
 	} else if err := w.run.jobs.db.Rooms.EnqueuePulledIngestPDUs(ctx, w.run.roomID, pulled); err != nil {

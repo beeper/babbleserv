@@ -416,3 +416,21 @@ func TestStateDAGFillHoldsPDUsReachingOtherTargets(t *testing.T) {
 	assert.Empty(t, failures)
 	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}, "$citing": {}}, held)
 }
+
+// Hostile frontier events with the lowest IDs do not keep the others from being named
+func TestStateDAGFillRotatesThroughTheFrontier(t *testing.T) {
+	gap := &rooms.StateDAGGap{Cites: make(map[id.EventID][]id.EventID), Missing: map[id.EventID]struct{}{"$missing": {}}}
+	for i := range MaxStateDAGRequestIDs + 50 {
+		gap.Cites[id.EventID(fmt.Sprintf("$f%03d", i))] = []id.EventID{"$missing"}
+	}
+	fill := newStateDAGFill(nil, gap, 10_000, unlimited(), time.Now().Add(time.Hour))
+
+	first := fill.nameFrontier()
+	require.Len(t, first, MaxStateDAGRequestIDs)
+	assert.Equal(t, id.EventID("$f000"), first[0])
+	second := fill.nameFrontier()
+	require.Len(t, second, MaxStateDAGRequestIDs)
+	assert.Equal(t, id.EventID("$f100"), second[0], "the events not named yet go first")
+	assert.Equal(t, id.EventID("$f000"), second[50], "then those named least")
+	assert.Equal(t, id.EventID("$f050"), fill.nameFrontier()[0])
+}

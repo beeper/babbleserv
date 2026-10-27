@@ -25,7 +25,8 @@ import (
 
 var (
 	errWorkDone = errors.New("the work's targets are done")
-	errWorkHeld = errors.New("the job held back work that failed")
+	errWorkHeld = errors.New("the job held back work")
+	errNoTurn   = errors.New("no turn was free to run the work")
 	// Causes of ending a job's context
 	errLeaseLost  = errors.New("the job's lock lease was lost")
 	errNoProgress = errors.New("the job made no progress for its lease timeout")
@@ -33,8 +34,12 @@ var (
 
 const maxTargetFailures = 3
 
-// Retries failed work and errored jobs sooner than the IngestJobWorker's scan
-const jobRetryPause = 10 * time.Second
+// Retries failed work and errored jobs sooner than the IngestJobWorker's scan, and work that found
+// no turn free sooner still
+const (
+	jobRetryPause  = 10 * time.Second
+	turnRetryPause = 2 * time.Second
+)
 
 func lockName(roomID id.RoomID) string {
 	return "room-ingest/" + roomID.String()
@@ -94,24 +99,17 @@ func NewJobs(
 	}
 }
 
-// turn reports progress while waiting, so the job keeps its lease
-func (j *Jobs) turn(ctx context.Context, kind workKind) (release func(), err error) {
+// tryTurn does not wait, as a job waiting would hold up the room's other work
+func (j *Jobs) tryTurn(kind workKind) (release func(), ok bool) {
 	turns := j.turns[kind]
 	if turns == nil {
-		return func() {}, nil
+		return func() {}, true
 	}
 	select {
 	case turns <- struct{}{}:
-		return func() { <-turns }, nil
+		return func() { <-turns }, true
 	default:
-	}
-	zerolog.Ctx(ctx).Debug().Msg("Waiting for a turn to run ingest work")
-	defer reportProgressEvery(ctx, j.config)()
-	select {
-	case turns <- struct{}{}:
-		return func() { <-turns }, nil
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
+		return nil, false
 	}
 }
 
@@ -166,7 +164,7 @@ func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner
 		finished, err := j.runOnce(ctx, roomID)
 		held := errors.Is(err, errWorkHeld)
 		if held {
-			zerolog.Ctx(ctx).Info().Err(err).Msg("Ingest job held back failed work, it runs again after a pause")
+			zerolog.Ctx(ctx).Info().Err(err).Msg("Ingest job held back work, it runs again after a pause")
 		} else if err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Ingest job stopped, it resumes later")
 		}
@@ -182,7 +180,11 @@ func (j *Jobs) runRoom(ctx context.Context, roomID id.RoomID, runner *roomRunner
 			delete(j.running, roomID)
 			j.mu.Unlock()
 			if err != nil && !errors.Is(err, errLeaseLost) && ctx.Err() == nil {
-				time.AfterFunc(jobRetryPause, func() { j.Run(roomID) })
+				pause := jobRetryPause
+				if errors.Is(err, errNoTurn) {
+					pause = turnRetryPause
+				}
+				time.AfterFunc(pause, func() { j.Run(roomID) })
 			}
 			return
 		}
@@ -330,7 +332,8 @@ func (run *jobRun) ended(ctx context.Context, err error) error {
 
 // round holds back failed work, and work whose targets failed within the retry pause or cite a held
 // target, until a round after the pause, as asking again at once could fail targets within seconds.
-// A join can take minutes, so the round ends after one and the next puts PDUs written meanwhile first.
+// Work finding no turn free is held back too, without counting a failure. A join can take minutes, so
+// the round ends after one and the next puts PDUs written meanwhile first.
 func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) error {
 	strategy, err := strategyFor(run.roomVersion)
 	if err != nil {
@@ -356,16 +359,31 @@ func (run *jobRun) round(ctx context.Context, targets []*types.IngestTarget) err
 	return fmt.Errorf("%w: %d targets: %w", errWorkHeld, len(held), errors.Join(errs...))
 }
 
+// Once a kind of work finds no turn free, the round's later work of the kind is held back too, so
+// it keeps its order
 func (run *jobRun) runWorks(ctx context.Context, works []ingestWork) (map[id.EventID]struct{}, []error, error) {
 	now := time.Now()
 	held := make(map[id.EventID]struct{})
 	var errs []error
+	noTurn := make(map[workKind]bool)
 	for _, work := range works {
 		if heldBack(work.targets(), held, now) {
 			hold(work.targets(), held)
 			continue
 		}
-		err := run.runTurn(ctx, work)
+		var release func()
+		ok := false
+		if kind := work.kind(); !noTurn[kind] {
+			if release, ok = run.jobs.tryTurn(kind); !ok {
+				noTurn[kind] = true
+				errs = append(errs, errNoTurn)
+			}
+		}
+		if !ok {
+			hold(work.targets(), held)
+			continue
+		}
+		err := run.runTurn(ctx, work, release)
 		if cause := context.Cause(ctx); cause != nil {
 			return nil, nil, cause
 		} else if err != nil {
@@ -398,11 +416,7 @@ func (run *jobRun) untarget(eventIDs ...id.EventID) {
 	}
 }
 
-func (run *jobRun) runTurn(ctx context.Context, work ingestWork) error {
-	release, err := run.jobs.turn(ctx, work.kind())
-	if err != nil {
-		return err
-	}
+func (run *jobRun) runTurn(ctx context.Context, work ingestWork, release func()) error {
 	defer release()
 	return run.runWork(ctx, work)
 }

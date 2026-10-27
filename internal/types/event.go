@@ -29,7 +29,7 @@ type PartialEvent struct {
 	Sender    id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
 	StateKey  *string         `msgpack:"sky" json:"state_key,omitzero"`
 	Content   json.RawMessage `msgpack:"cnt" json:"content"`
-	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
+	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v11
 	Timestamp int64           `msgpack:"ots" json:"origin_server_ts,omitzero"`
 
 	// event.Type doesn't implement msgpack marshalling, so we use TypeStr

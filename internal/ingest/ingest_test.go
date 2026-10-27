@@ -455,3 +455,29 @@ func TestRoundEndsAfterAJoin(t *testing.T) {
 	assert.Equal(t, []id.EventID{"$connected", "$join1"}, ran, "a join held back does not end the round")
 	assert.Equal(t, map[id.EventID]struct{}{"$heldJoin": {}}, held)
 }
+
+// A unit finding no turn free is held back without a failure counted, the round's other work going on
+func TestWorkFindingNoTurnIsHeldBack(t *testing.T) {
+	var ran []id.EventID
+	work := func(kind workKind, eventID id.EventID) ingestWork {
+		return &fakeWork{workKind: kind, target: testTarget(types.IngestTargetPDU, eventID, 1), ran: &ran}
+	}
+	busy := make(chan struct{}, 1)
+	busy <- struct{}{}
+	jobs := &Jobs{turns: map[workKind]chan struct{}{workGapFill: busy, workJoin: make(chan struct{}, 1)}}
+	run := &jobRun{jobs: jobs}
+	gap := work(workGapFill, "$gap")
+	held, errs, err := run.runWorks(context.Background(), []ingestWork{
+		work(workConnected, "$connected"),
+		gap,
+		work(workGapFill, "$laterGap"),
+		work(workJoin, "$join"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []id.EventID{"$connected", "$join"}, ran)
+	assert.Equal(t, map[id.EventID]struct{}{"$gap": {}, "$laterGap": {}}, held, "later work of the kind keeps its order")
+	require.Len(t, errs, 1)
+	assert.ErrorIs(t, errs[0], errNoTurn)
+	assert.Zero(t, gap.targets()[0].FailedAt)
+	assert.Empty(t, jobs.turns[workJoin], "the join's turn is released")
+}

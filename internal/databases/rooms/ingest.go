@@ -5,11 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -323,29 +325,44 @@ func (r *RoomsDatabase) IngestJobRoomIDs(ctx context.Context, after id.RoomID, l
 // FoundationDB's transaction_too_old: a read version past the five seconds it keeps
 const fdbTransactionTooOld = 1007
 
+const ingestTargetsAttemptsAtOneVersion = 3
+
 // GetIngestTargets reads the targets over several transactions at the first one's read version, so
 // targets written together, as a /send's PDUs, are seen all or none; a round seeing only some would
-// fill the gaps of those citing the others. Reads outlasting that version start again.
+// fill the gaps of those citing the others. Reads outlasting that version start again, a few times,
+// before each page is read at its own version and the targets citing one not read are left out.
 func (r *RoomsDatabase) GetIngestTargets(ctx context.Context, roomID id.RoomID) (*types.IngestJob, []*types.IngestTarget, error) {
 	job, err := r.GetIngestJob(ctx, roomID)
 	if err != nil || job == nil {
 		return nil, nil, err
 	}
-	for {
-		targets, err := r.readIngestTargets(ctx, roomID)
+	for range ingestTargetsAttemptsAtOneVersion {
+		targets, err := r.readIngestTargets(ctx, roomID, true)
 		var fdbErr fdb.Error
-		if errors.As(err, &fdbErr) && fdbErr.Code == fdbTransactionTooOld {
-			continue
+		if !errors.As(err, &fdbErr) || fdbErr.Code != fdbTransactionTooOld {
+			return job, targets, err
 		}
-		return job, targets, err
 	}
+	zerolog.Ctx(ctx).Warn().Msg("Ingest targets take longer to read than a read version lasts, reading them a page at a time")
+	targets, err := r.readIngestTargets(ctx, roomID, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	unread, err := r.unreadIngestTargets(ctx, roomID, targets)
+	if err != nil {
+		return nil, nil, err
+	}
+	return job, withoutCitersOf(targets, unread), nil
 }
 
-func (r *RoomsDatabase) readIngestTargets(ctx context.Context, roomID id.RoomID) ([]*types.IngestTarget, error) {
+func (r *RoomsDatabase) readIngestTargets(ctx context.Context, roomID id.RoomID, oneVersion bool) ([]*types.IngestTarget, error) {
 	var version int64
 	var targets []*types.IngestTarget
 	begin, end := r.ingestTargets.Sub(roomID.String()).FDBRangeKeys()
 	for {
+		if !oneVersion {
+			version = 0
+		}
 		page, err := r.readIngestTargetsPage(ctx, &version, fdb.KeyRange{Begin: begin, End: end})
 		if err != nil {
 			return nil, err
@@ -359,7 +376,7 @@ func (r *RoomsDatabase) readIngestTargets(ctx context.Context, roomID id.RoomID)
 	}
 }
 
-// Pages after the first are not retried, as a retry would read at the same version
+// Pages after the first retry at the first's version, but for transaction_too_old, which would recur
 func (r *RoomsDatabase) readIngestTargetsPage(ctx context.Context, version *int64, keys fdb.KeyRange) ([]*types.IngestTarget, error) {
 	if *version == 0 {
 		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) ([]*types.IngestTarget, error) {
@@ -369,16 +386,86 @@ func (r *RoomsDatabase) readIngestTargetsPage(ctx context.Context, version *int6
 			}
 			return r.txnIngestTargetsPage(txn, keys)
 		})
-	} else if err := ctx.Err(); err != nil {
-		return nil, err
 	}
 	txn, err := r.db.CreateTransaction()
 	if err != nil {
 		return nil, err
 	}
 	defer txn.Cancel()
-	txn.SetReadVersion(*version)
-	return r.txnIngestTargetsPage(txn.Snapshot(), keys)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		txn.SetReadVersion(*version)
+		page, err := r.txnIngestTargetsPage(txn.Snapshot(), keys)
+		var fdbErr fdb.Error
+		if !errors.As(err, &fdbErr) || fdbErr.Code == fdbTransactionTooOld {
+			return page, err
+		} else if err := txn.OnError(fdbErr).Get(); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// unreadIngestTargets returns the targets those read cite that were not read with them
+func (r *RoomsDatabase) unreadIngestTargets(ctx context.Context, roomID id.RoomID, targets []*types.IngestTarget) (map[id.EventID]struct{}, error) {
+	read := make(map[id.EventID]struct{}, len(targets))
+	for _, target := range targets {
+		read[target.Event.ID] = struct{}{}
+	}
+	var cited []id.EventID
+	for _, target := range targets {
+		for _, eventID := range slices.Concat(target.Event.PrevEventIDs, target.Event.AuthDependencyIDs()) {
+			if _, found := read[eventID]; !found {
+				cited = append(cited, eventID)
+			}
+		}
+	}
+	slices.Sort(cited)
+	unread := make(map[id.EventID]struct{})
+	for chunk := range slices.Chunk(slices.Compact(cited), ingestTargetsPage) {
+		if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
+			futures := make([]fdb.FutureByteSlice, len(chunk))
+			for i, eventID := range chunk {
+				futures[i] = txn.Get(r.keyForIngestTarget(roomID, eventID))
+			}
+			for i, future := range futures {
+				if b, err := future.Get(); err != nil {
+					return nil, err
+				} else if b != nil {
+					unread[chunk[i]] = struct{}{}
+				}
+			}
+			return nil, nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return unread, nil
+}
+
+// withoutCitersOf leaves out the targets citing an unread one, directly or through those left out
+func withoutCitersOf(targets []*types.IngestTarget, unread map[id.EventID]struct{}) []*types.IngestTarget {
+	if len(unread) == 0 {
+		return targets
+	}
+	out := maps.Clone(unread)
+	evs := make([]*types.Event, len(targets))
+	for i, target := range targets {
+		evs[i] = target.Event
+	}
+	for _, ev := range SortEventsTopologically(evs) {
+		if slices.ContainsFunc(slices.Concat(ev.PrevEventIDs, ev.AuthDependencyIDs()), func(eventID id.EventID) bool {
+			_, found := out[eventID]
+			return found
+		}) {
+			out[ev.ID] = struct{}{}
+		}
+	}
+	return slices.DeleteFunc(slices.Clone(targets), func(target *types.IngestTarget) bool {
+		_, found := out[target.Event.ID]
+		return found
+	})
 }
 
 func (r *RoomsDatabase) txnIngestTargetsPage(txn fdb.ReadTransaction, keys fdb.KeyRange) ([]*types.IngestTarget, error) {

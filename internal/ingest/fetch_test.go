@@ -2,9 +2,11 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,6 +15,10 @@ import (
 
 	"github.com/beeper/babbleserv/internal/types"
 )
+
+func noDeadline() time.Time {
+	return time.Now().Add(time.Hour)
+}
 
 func gapTarget(eventID id.EventID, origin string, prevIDs ...id.EventID) *types.IngestTarget {
 	return &types.IngestTarget{Kind: types.IngestTargetPDU, Event: testPDU(eventID, prevIDs), Servers: []string{origin}}
@@ -61,7 +67,7 @@ func TestGapPlanAsksEachOriginForItsOwnPDUs(t *testing.T) {
 	plan := newGapPlan([]*types.IngestTarget{
 		gapTarget("$a", "a.example", "$beforeA"),
 		gapTarget("$b", "b.example", "$beforeB"),
-	}, []id.EventID{"$beforeA", "$beforeB"})
+	}, []id.EventID{"$beforeA", "$beforeB"}, noDeadline())
 	require.NoError(t, plan.run(context.Background(), []string{"a.example", "b.example", "c.example"}, servers.missingEvents))
 
 	assert.Equal(t, []gapRequest{
@@ -83,7 +89,7 @@ func TestGapPlanAsksEveryOrigin(t *testing.T) {
 		origins = append(origins, origin)
 		targets = append(targets, gapTarget(id.EventID(fmt.Sprintf("$pdu%d", i)), origin, "$missing"))
 	}
-	plan := newGapPlan(targets, []id.EventID{"$missing"})
+	plan := newGapPlan(targets, []id.EventID{"$missing"}, noDeadline())
 	require.NoError(t, plan.run(context.Background(), gapFillServers(origins, nil, "self.example"), servers.missingEvents))
 
 	asked := make(map[string]int)
@@ -99,7 +105,7 @@ func TestGapPlanAsksOtherServersForGapsStillOpen(t *testing.T) {
 	servers := &gapServers{before: map[string]map[id.EventID][]id.EventID{
 		"b.example": {"$a": {"$beforeA"}},
 	}}
-	plan := newGapPlan([]*types.IngestTarget{gapTarget("$a", "a.example", "$beforeA")}, []id.EventID{"$beforeA"})
+	plan := newGapPlan([]*types.IngestTarget{gapTarget("$a", "a.example", "$beforeA")}, []id.EventID{"$beforeA"}, noDeadline())
 	require.NoError(t, plan.run(context.Background(), []string{"a.example", "b.example"}, servers.missingEvents))
 
 	assert.Equal(t, []gapRequest{
@@ -119,7 +125,7 @@ func TestGapPlanSplitsRequests(t *testing.T) {
 		gapTarget("$p3", "a.example", "$m1"),
 		gapTarget("$p4", "a.example", "$m4"),
 		gapTarget("$p5", "a.example", "$m5"),
-	}, []id.EventID{"$m1", "$m2", "$m4", "$m5"})
+	}, []id.EventID{"$m1", "$m2", "$m4", "$m5"}, noDeadline())
 	require.NoError(t, plan.run(context.Background(), []string{"a.example"}, servers.missingEvents))
 
 	var latest [][]id.EventID
@@ -138,7 +144,7 @@ func TestGapPlanUnanswered(t *testing.T) {
 		gapTarget("$a2", "a.example", "$beforeA2"),
 	}
 	run := func(servers *gapServers) *gapPlan {
-		plan := newGapPlan(targets, []id.EventID{"$beforeA", "$beforeA2"})
+		plan := newGapPlan(targets, []id.EventID{"$beforeA", "$beforeA2"}, noDeadline())
 		require.NoError(t, plan.run(context.Background(), []string{"a.example", "b.example"}, servers.missingEvents))
 		return plan
 	}
@@ -162,7 +168,7 @@ func TestGapPlanUnanswered(t *testing.T) {
 
 func TestGapPlanStopsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	plan := newGapPlan([]*types.IngestTarget{gapTarget("$a", "a.example", "$beforeA")}, []id.EventID{"$beforeA"})
+	plan := newGapPlan([]*types.IngestTarget{gapTarget("$a", "a.example", "$beforeA")}, []id.EventID{"$beforeA"}, noDeadline())
 	err := plan.run(ctx, []string{"a.example", "b.example"}, func(context.Context, string, []id.EventID, []id.EventID) ([]*types.Event, error) {
 		cancel()
 		return nil, context.Canceled
@@ -184,4 +190,34 @@ func TestReachingPrevs(t *testing.T) {
 	}
 	assert.Equal(t, map[id.EventID]struct{}{"$pdu": {}, "$citesPDU": {}}, reachingPrevs(pdus, pulled, map[id.EventID]struct{}{"$unfetched": {}}))
 	assert.Empty(t, reachingPrevs(pdus, pulled, nil))
+}
+
+// A fill past its deadline, or a server asked as often as it may be, leaves the open PDUs held back
+func TestGapPlanBounds(t *testing.T) {
+	var targets []*types.IngestTarget
+	var missing []id.EventID
+	for i := range 2 * (maxGapRequestsPerServer + 1) * gapPDUsPerRequest {
+		missingID := id.EventID(fmt.Sprintf("$missing%d", i))
+		missing = append(missing, missingID)
+		targets = append(targets, gapTarget(id.EventID(fmt.Sprintf("$pdu%d", i)), "a.example", missingID))
+	}
+
+	servers := &gapServers{}
+	plan := newGapPlan(targets, missing, noDeadline())
+	require.NoError(t, plan.run(context.Background(), []string{"a.example", "b.example"}, servers.missingEvents))
+	asked := make(map[string]int)
+	for _, req := range servers.requests {
+		asked[req.server]++
+	}
+	assert.Equal(t, map[string]int{"a.example": maxGapRequestsPerServer, "b.example": maxGapRequestsPerServer}, asked)
+	unanswered := plan.unanswered()
+	assert.Len(t, unanswered, len(targets)-maxGapRequestsPerServer*gapPDUsPerRequest, "PDUs no server was asked about are held back")
+	assert.NotContains(t, unanswered, id.EventID("$pdu0"), "one every server asked answered for is not")
+	assert.ErrorIs(t, errors.Join(plan.errs...), errGapFillBounds)
+
+	servers = &gapServers{}
+	plan = newGapPlan(targets[:1], missing[:1], time.Now())
+	require.NoError(t, plan.run(context.Background(), []string{"a.example"}, servers.missingEvents))
+	assert.Empty(t, servers.requests, "no request starts past the deadline")
+	assert.Equal(t, map[id.EventID]struct{}{"$pdu0": {}}, plan.unanswered())
 }

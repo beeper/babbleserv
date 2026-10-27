@@ -49,7 +49,7 @@ func (w *joinWork) kind() workKind {
 	return workJoin
 }
 
-// timesOut bounds reading the join's response as well as sending it
+// timesOut bounds the join's sends and the wait for a response to start
 func (w *joinWork) timesOut() time.Time {
 	return w.firstSent.Add(w.run.jobs.config.Rooms.Ingest.JoinTimeout)
 }
@@ -309,7 +309,8 @@ func (w *legacyPDUs) fetch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.fill, err = w.run.jobs.fetcher.GapFill(ctx, w.run.roomID, w.run.roomVersion, w.pdus, roomServers)
+	deadline := time.Now().Add(w.run.jobs.config.Rooms.Ingest.GapFillTimeout)
+	w.fill, err = w.run.jobs.fetcher.GapFill(ctx, w.run.roomID, w.run.roomVersion, w.pdus, roomServers, deadline)
 	return err
 }
 

@@ -30,11 +30,15 @@ const (
 	prevEventStatesFetchConcurrency = 5
 	// Synapse answers at most 20 events a request and pulls 10 per PDU
 	gapPDUsPerRequest = 2
+	// Per server and gap fill, which leaves the PDUs still open for a later fill
+	maxGapRequestsPerServer = 10
 	// The spec's default get_missing_events limit
 	defaultMissingEventsLimit = 10
 	// A larger get_missing_events response counts as a refusal
 	maxMissingEventsResponseBytes = MaxStateDAGMissingEvents * util.MaxPDUBytes
 )
+
+var errGapFillBounds = errors.New("asked as often or as long as a gap fill may")
 
 // Fetcher pulls missing events and state from other servers for a room's ingest job
 type Fetcher struct {
@@ -70,13 +74,15 @@ type GapFill struct {
 
 // GapFill pulls the events missing between a joined room's extremities and the targets, asking each
 // PDU's origin first, then the first maxGapFillServers servers. As Synapse does, it fetches the state
-// only at the pulled events' prev events, never the PDUs' own. Remote failures go in Errs.
+// only at the pulled events' prev events, never the PDUs' own. Remote failures go in Errs. Requests
+// start until the deadline; the PDUs it leaves open are Unanswered.
 func (f *Fetcher) GapFill(
 	ctx context.Context,
 	roomID id.RoomID,
 	roomVersion string,
 	targets []*types.IngestTarget,
 	roomServers []string,
+	deadline time.Time,
 ) (*GapFill, error) {
 	pdus := make([]*types.Event, len(targets))
 	var origins []string
@@ -95,7 +101,7 @@ func (f *Fetcher) GapFill(
 	for _, ev := range pdus {
 		seenIDs[ev.ID] = struct{}{}
 	}
-	plan := newGapPlan(targets, missing.Missing)
+	plan := newGapPlan(targets, missing.Missing, deadline)
 	servers := gapFillServers(origins, roomServers, f.config.ServerName)
 	err = plan.run(ctx, servers, func(ctx context.Context, server string, latestIDs, pulledIDs []id.EventID) ([]*types.Event, error) {
 		// Already pulled events bound the walk like the extremities
@@ -113,7 +119,7 @@ func (f *Fetcher) GapFill(
 	evs := slices.Concat(pdus, fill.Pulled)
 	states := &prevEventStates{unfetched: make(map[id.EventID]struct{})}
 	for _, server := range servers {
-		if err := f.addPrevEventStates(ctx, server, roomID, roomVersion, evs, plan.pulledFrom[server], states); err != nil {
+		if err := f.addPrevEventStates(ctx, server, roomID, roomVersion, evs, plan.pulledFrom[server], states, deadline); err != nil {
 			return nil, err
 		}
 	}
@@ -147,27 +153,31 @@ type missingEventsFunc func(ctx context.Context, server string, latestIDs, pulle
 
 // gapPlan tracks a gap fill's get_missing_events requests; a server that fails or refuses once is not asked again
 type gapPlan struct {
-	pdus    []*types.Event
-	origins map[id.EventID]string
-	missing map[id.EventID]struct{}
+	pdus     []*types.Event
+	origins  map[id.EventID]string
+	missing  map[id.EventID]struct{}
+	deadline time.Time
 
 	pulledFrom map[string][]*types.Event
 	pulledIDs  []id.EventID
 	pulled     map[id.EventID]struct{}
 	asked      map[string]map[id.EventID]struct{}
+	requests   map[string]int
 	dropped    map[string]struct{}
 	failed     map[id.EventID]struct{}
 	errs       []error
 }
 
-func newGapPlan(targets []*types.IngestTarget, missingIDs []id.EventID) *gapPlan {
+func newGapPlan(targets []*types.IngestTarget, missingIDs []id.EventID, deadline time.Time) *gapPlan {
 	plan := &gapPlan{
 		pdus:       make([]*types.Event, len(targets)),
 		origins:    make(map[id.EventID]string, len(targets)),
 		missing:    make(map[id.EventID]struct{}, len(missingIDs)),
+		deadline:   deadline,
 		pulledFrom: make(map[string][]*types.Event),
 		pulled:     make(map[id.EventID]struct{}),
 		asked:      make(map[string]map[id.EventID]struct{}),
+		requests:   make(map[string]int),
 		dropped:    make(map[string]struct{}),
 		failed:     make(map[id.EventID]struct{}),
 	}
@@ -197,7 +207,8 @@ func (p *gapPlan) run(ctx context.Context, servers []string, missingEvents missi
 	return nil
 }
 
-// With own set, ask only asks for the gaps of the PDUs the server sent
+// With own set, ask only asks for the gaps of the PDUs the server sent. Past the plan's bounds the
+// PDUs it would ask for are failed, so those still open are held back rather than dropped.
 func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvents missingEventsFunc) error {
 	asked := p.asked[server]
 	if asked == nil {
@@ -217,11 +228,17 @@ func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvent
 		}
 		if len(open) == 0 {
 			return nil
+		} else if p.requests[server] == maxGapRequestsPerServer || !time.Now().Before(p.deadline) {
+			zerolog.Ctx(ctx).Warn().Str("server", server).Int("requests", p.requests[server]).Msg("Gap fill asked the server as often or as long as it may, holding back the PDUs whose gap is open")
+			p.errs = append(p.errs, fmt.Errorf("%s: %w", server, errGapFillBounds))
+			p.fail(open)
+			return nil
 		}
 		latestIDs := open[:min(len(open), gapPDUsPerRequest)]
 		for _, eventID := range latestIDs {
 			asked[eventID] = struct{}{}
 		}
+		p.requests[server]++
 		evs, err := missingEvents(ctx, server, latestIDs, p.pulledIDs)
 		util.ReportProgress(ctx)
 		if ctx.Err() != nil {
@@ -231,9 +248,7 @@ func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvent
 			p.errs = append(p.errs, fmt.Errorf("%s: %w", server, err))
 			p.dropped[server] = struct{}{}
 			if !refusedRequest(err) {
-				for _, eventID := range open {
-					p.failed[eventID] = struct{}{}
-				}
+				p.fail(open)
 			}
 			return nil
 		}
@@ -244,6 +259,12 @@ func (p *gapPlan) ask(ctx context.Context, server string, own bool, missingEvent
 				p.pulledFrom[server] = append(p.pulledFrom[server], ev)
 			}
 		}
+	}
+}
+
+func (p *gapPlan) fail(eventIDs []id.EventID) {
+	for _, eventID := range eventIDs {
+		p.failed[eventID] = struct{}{}
 	}
 }
 
@@ -331,6 +352,7 @@ func (f *Fetcher) addPrevEventStates(
 	roomVersion string,
 	evs, pulled []*types.Event,
 	states *prevEventStates,
+	deadline time.Time,
 ) error {
 	log := zerolog.Ctx(ctx).With().
 		Stringer("room_id", roomID).
@@ -369,6 +391,11 @@ func (f *Fetcher) addPrevEventStates(
 		known[ev.ID] = struct{}{}
 	}
 	for _, prevID := range prevIDs {
+		if !time.Now().Before(deadline) {
+			states.unfetched[prevID] = struct{}{}
+			states.errs = append(states.errs, fmt.Errorf("%s: state at %s: %w", server, prevID, errGapFillBounds))
+			continue
+		}
 		stateIDs, fetched, fetchErr, err := f.fetchPrevEventState(ctx, server, roomID, roomVersion, prevID, known)
 		util.ReportProgress(ctx)
 		if ctx.Err() != nil {
