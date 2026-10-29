@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,6 +36,9 @@ type stateBudgetConfig struct {
 	// Approximate bytes staged per transaction, leaving headroom for FoundationDB overhead
 	// Default: 5 MB
 	StagingBytes int `yaml:"stagingBytes"`
+	// Distinct contexts a state resolution run inline resolves, past which an artifact job runs it
+	// Default: 64
+	InlineResolutionContexts int `yaml:"inlineResolutionContexts"`
 	// Candidate events of a state resolution run inline, past which an artifact job runs it
 	// Default: 2000
 	InlineResolutionCandidates int `yaml:"inlineResolutionCandidates"`
@@ -42,6 +46,57 @@ type stateBudgetConfig struct {
 	// runs it, as its auth difference reads the auth header of every state event of its inputs
 	// Default: 10000
 	InlineResolutionStateTuples int `yaml:"inlineResolutionStateTuples"`
+}
+
+// Bounds on a room's ingest job, which joins the room and publishes the events whose state it needs
+type ingestConfig struct {
+	// How long a job runs without progress before its lease expires, stopping its runner
+	// Default: 2m
+	LeaseTimeout time.Duration `yaml:"leaseTimeout"`
+	// How long after its first send_join a join retries transient failures before it fails
+	// Default: 10m
+	JoinTimeout time.Duration `yaml:"joinTimeout"`
+	// How long a send_join waits for its response to start, which for a large room takes minutes
+	// Default: 5m
+	SendJoinResponseTimeout time.Duration `yaml:"sendJoinResponseTimeout"`
+	// How long a send_join response may stream once it started, past JoinTimeout
+	// Default: 2h
+	JoinStreamTimeout time.Duration `yaml:"joinStreamTimeout"`
+	// Most bytes of a v1–v12 send_join response, which is held whole
+	// Default: 512 MiB
+	MaxJoinResponseBytes int `yaml:"maxJoinResponseBytes"`
+	// Most joins and gap fills run at once across jobs, each holding up to hundreds of MB it fetched
+	// Default: 4 and 16
+	MaxConcurrentJoins    int `yaml:"maxConcurrentJoins"`
+	MaxConcurrentGapFills int `yaml:"maxConcurrentGapFills"`
+	// How long a gap fill asks servers for a chunk of PDUs before holding back those still open
+	// Default: 5m
+	GapFillTimeout time.Duration `yaml:"gapFillTimeout"`
+	// Most events a join accepts: the state and auth chain, or the state DAG (MSC4242)
+	// Default: 1000000
+	MaxJoinEvents int `yaml:"maxJoinEvents"`
+	// Most state events a gap fill fetches per PDU, and per job run before gap fills wait for the next
+	// Default: 10000 and 100000
+	MaxGapEvents       int `yaml:"maxGapEvents"`
+	MaxGapEventsPerRun int `yaml:"maxGapEventsPerRun"`
+	// Most PDUs and bytes a room's job queues before /send waits for it to publish
+	// Default: 2000 and 50000000
+	MaxQueuedPDUs     int   `yaml:"maxQueuedPDUs"`
+	MaxQueuedPDUBytes int64 `yaml:"maxQueuedPDUBytes"`
+	// How long /send takes at most, under Synapse's one minute response timeout: PDUs wait on a full
+	// queue for four fifths of it before failing, leaving the rest to the EDUs held for them
+	// Default: 50s
+	QueueWait time.Duration `yaml:"queueWait"`
+}
+
+type babbleBotConfig struct {
+	// Default: babblebot
+	Localpart string `yaml:"localpart"`
+	// Default: BabbleBot
+	DisplayName string `yaml:"displayName"`
+	// How long a join is pending before BabbleBot tells the joining user it is under way
+	// Default: 60s
+	JoinNoticeAfter time.Duration `yaml:"joinNoticeAfter"`
 }
 
 type NotifierConfig struct {
@@ -59,6 +114,9 @@ type BabbleConfig struct {
 		Database       databaseConfig `yaml:"database"`
 		Notifier       NotifierConfig `yaml:"notifier"`
 		DefaultVersion string         `yaml:"defaultVersion"`
+
+		// Offer the unstable state DAG room version (MSC4242) for creates, joins and invites
+		UnstableStateDAGs bool `yaml:"unstableStateDAGs"`
 
 		// Max notifications per user/room to keep count of, is not accurately applied, ie counts
 		// may go over this before being trimmed back down after the timeout below or sufficient
@@ -80,6 +138,7 @@ type BabbleConfig struct {
 		MaxCreateRoomInvites int `yaml:"maxCreateRoomInvites"`
 
 		StateBudget stateBudgetConfig `yaml:"stateBudget"`
+		Ingest      ingestConfig      `yaml:"ingest"`
 	} `yaml:"rooms"`
 
 	Accounts struct {
@@ -132,9 +191,19 @@ type BabbleConfig struct {
 		Servers []serverConfig `yaml:"servers"`
 	} `yaml:"routes"`
 
+	// A server-owned local user telling local users about work on their behalf, such as slow joins
+	BabbleBot babbleBotConfig `yaml:"babbleBot"`
+
 	Federation struct {
 		MaxFetchMissingEvents       int  `yaml:"maxFetchMissingEvents"`
 		FetchProfileForMemberEvents bool `yaml:"fetchProfileForMemberEvents"`
+		// Most state DAG events send_join serves; larger rooms refuse joins before accepting them
+		// Default: 1000000
+		MaxServedStateDAG int `yaml:"maxServedStateDAG"`
+		// Concurrent and queued state DAG send_joins per origin before a 429, like Synapse's rc_federation
+		// Default: 3 and 50
+		MaxStateDAGJoinsPerOrigin       int `yaml:"maxStateDAGJoinsPerOrigin"`
+		MaxQueuedStateDAGJoinsPerOrigin int `yaml:"maxQueuedStateDAGJoinsPerOrigin"`
 	} `yaml:"federation"`
 
 	// For development usage - serve the .well-known client/server endpoints
@@ -221,14 +290,98 @@ func NewBabbleConfig(filename string, commitHash string) BabbleConfig {
 	if cfg.Rooms.StateBudget.StagingBytes <= 0 {
 		cfg.Rooms.StateBudget.StagingBytes = 5_000_000
 	}
+	if cfg.Rooms.StateBudget.InlineResolutionContexts <= 0 {
+		cfg.Rooms.StateBudget.InlineResolutionContexts = 64
+	}
 	if cfg.Rooms.StateBudget.InlineResolutionCandidates <= 0 {
 		cfg.Rooms.StateBudget.InlineResolutionCandidates = 2000
 	}
 	if cfg.Rooms.StateBudget.InlineResolutionStateTuples <= 0 {
 		cfg.Rooms.StateBudget.InlineResolutionStateTuples = 10_000
 	}
+	if cfg.Rooms.Ingest.LeaseTimeout <= 0 {
+		cfg.Rooms.Ingest.LeaseTimeout = 2 * time.Minute
+	}
+	if cfg.Rooms.Ingest.JoinTimeout <= 0 {
+		cfg.Rooms.Ingest.JoinTimeout = 10 * time.Minute
+	}
+	if cfg.Rooms.Ingest.MaxJoinEvents <= 0 {
+		cfg.Rooms.Ingest.MaxJoinEvents = 1_000_000
+	}
+	if cfg.Rooms.Ingest.MaxGapEvents <= 0 {
+		cfg.Rooms.Ingest.MaxGapEvents = 10_000
+	}
+	if cfg.Rooms.Ingest.MaxGapEventsPerRun <= 0 {
+		cfg.Rooms.Ingest.MaxGapEventsPerRun = 100_000
+	}
+	if cfg.Federation.MaxServedStateDAG <= 0 {
+		cfg.Federation.MaxServedStateDAG = 1_000_000
+	}
+	if cfg.Rooms.Ingest.MaxQueuedPDUs <= 0 {
+		cfg.Rooms.Ingest.MaxQueuedPDUs = 2000
+	}
+	if cfg.Rooms.Ingest.MaxQueuedPDUBytes <= 0 {
+		cfg.Rooms.Ingest.MaxQueuedPDUBytes = 50_000_000
+	}
+	if cfg.Rooms.Ingest.QueueWait <= 0 {
+		cfg.Rooms.Ingest.QueueWait = 50 * time.Second
+	}
+	if cfg.Rooms.Ingest.SendJoinResponseTimeout <= 0 {
+		cfg.Rooms.Ingest.SendJoinResponseTimeout = 5 * time.Minute
+	}
+	if cfg.Rooms.Ingest.JoinStreamTimeout <= 0 {
+		cfg.Rooms.Ingest.JoinStreamTimeout = 2 * time.Hour
+	}
+	if cfg.Rooms.Ingest.MaxJoinResponseBytes <= 0 {
+		cfg.Rooms.Ingest.MaxJoinResponseBytes = 512 << 20
+	}
+	if cfg.Rooms.Ingest.MaxConcurrentJoins <= 0 {
+		cfg.Rooms.Ingest.MaxConcurrentJoins = 4
+	}
+	if cfg.Rooms.Ingest.MaxConcurrentGapFills <= 0 {
+		cfg.Rooms.Ingest.MaxConcurrentGapFills = 16
+	}
+	if cfg.Rooms.Ingest.GapFillTimeout <= 0 {
+		cfg.Rooms.Ingest.GapFillTimeout = 5 * time.Minute
+	}
+	if cfg.Federation.MaxStateDAGJoinsPerOrigin <= 0 {
+		cfg.Federation.MaxStateDAGJoinsPerOrigin = 3
+	}
+	if cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin <= 0 {
+		cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin = 50
+	}
+	if cfg.BabbleBot.Localpart == "" {
+		cfg.BabbleBot.Localpart = "babblebot"
+	}
+	if cfg.BabbleBot.DisplayName == "" {
+		cfg.BabbleBot.DisplayName = "BabbleBot"
+	}
+	if cfg.BabbleBot.JoinNoticeAfter <= 0 {
+		cfg.BabbleBot.JoinNoticeAfter = time.Minute
+	}
 
 	return cfg
+}
+
+var stableRoomVersions = []string{"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+
+// RoomVersions maps the versions this server creates and joins to whether each is stable
+func (c *BabbleConfig) RoomVersions() map[string]bool {
+	versions := make(map[string]bool, len(stableRoomVersions)+1)
+	for _, version := range stableRoomVersions {
+		versions[version] = true
+	}
+	if c.Rooms.UnstableStateDAGs {
+		versions[string(gomatrixserverlib.RoomVersionStateDAGs)] = false
+	}
+	return versions
+}
+
+// JoinsRoomVersion is narrower than gomatrixserverlib, which implements versions such as pseudo IDs
+// (MSC4014) whose events this server can neither build nor verify
+func (c *BabbleConfig) JoinsRoomVersion(version string) bool {
+	_, found := c.RoomVersions()[version]
+	return found
 }
 
 func (c *BabbleConfig) MustGetSigningKey(keyID string) ed25519.PrivateKey {

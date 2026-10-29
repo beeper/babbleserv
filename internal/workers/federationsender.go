@@ -1,9 +1,12 @@
 package workers
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -254,9 +257,9 @@ func (fs *FederationSender) sendTransaction(ctx context.Context, serverName stri
 		var sent bool
 		var err error
 		if isRooms {
-			sent, err = fs.syncRoomsForServer(ctx, serverName, serverVersions)
+			sent, err = fs.syncRoomsForServer(ctx, serverName, serverVersions, lock)
 		} else {
-			sent, err = fs.syncTransientForServer(ctx, serverName, serverVersions)
+			sent, err = fs.syncTransientForServer(ctx, serverName, serverVersions, lock)
 		}
 		if err != nil {
 			return false, err
@@ -281,6 +284,7 @@ func (fs *FederationSender) syncRoomsForServer(
 	ctx context.Context,
 	serverName string,
 	serverVersions types.VersionMap,
+	lock lock.Lock,
 ) (bool, error) {
 	log := zerolog.Ctx(ctx)
 
@@ -308,12 +312,15 @@ func (fs *FederationSender) syncRoomsForServer(
 		return false, nil
 	}
 
-	allEvs := make([]*types.Event, 0, 50)
-	allReceipts := make([]*types.EDU, 0, 50)
-
-	for _, room := range rooms {
-		allEvs = append(allEvs, room.StateEvents.Events...)
-		allEvs = append(allEvs, room.TimelineEvents.Events...)
+	// Ordered so that a resent sync's chunks hold what their transaction IDs first did
+	var items []transactionItem
+	for _, membershipTup := range slices.SortedFunc(maps.Keys(rooms), func(a, b types.MembershipTup) int {
+		return cmp.Or(cmp.Compare(a.RoomID, b.RoomID), cmp.Compare(a.EventID, b.EventID))
+	}) {
+		room := rooms[membershipTup]
+		for _, pdu := range util.EventsToJSONs(slices.Concat(room.StateEvents.Events, room.TimelineEvents.Events)) {
+			items = append(items, transactionItem{pdu: pdu})
+		}
 
 		for _, rc := range room.Receipts {
 			if rc.Type != event.ReceiptTypeRead {
@@ -339,17 +346,21 @@ func (fs *FederationSender) syncRoomsForServer(
 			}
 
 			// TODO: we could merge receipts with the same room/type
-			allReceipts = append(allReceipts, &types.EDU{
+			items = append(items, transactionItem{edu: &types.EDU{
 				Type:    types.EDUTypeReceipt,
 				Content: b,
-			})
+			}})
 		}
 	}
 
-	if len(allEvs) > 0 || len(allReceipts) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allReceipts); err != nil {
-			return false, fmt.Errorf("failed to send rooms transaction: %w", err)
-		}
+	// The rooms position only moves once every chunk is sent, so a failure resends them all
+	err = sendChunks(chunkTransaction(items), func(i int, chunk transactionChunk) error {
+		lock.Refresh()
+		transactionID := fmt.Sprintf("r%s.%d", types.MustVersionstampToString(nextVersion), i)
+		return fs.sendTransactionToServer(ctx, serverName, transactionID, chunk.pdus, chunk.edus)
+	}, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to send rooms transaction: %w", err)
 	}
 
 	serverVersions[types.RoomsVersionKey] = nextVersion
@@ -360,6 +371,7 @@ func (fs *FederationSender) syncTransientForServer(
 	ctx context.Context,
 	serverName string,
 	serverVersions types.VersionMap,
+	lock lock.Lock,
 ) (bool, error) {
 	log := zerolog.Ctx(ctx)
 
@@ -387,47 +399,45 @@ func (fs *FederationSender) syncTransientForServer(
 		return false, nil
 	}
 
-	allEvs := make([]*types.Event, 0)
-	allEDUs := make([]*types.EDU, 0, 100)
+	items := make([]transactionItem, 0, len(toDevice))
 
 	for _, td := range toDevice {
 		switch td.Type {
 		case types.BabbleservRemoteDeviceListUpdate:
-			allEDUs = append(allEDUs, &types.EDU{
+			items = append(items, transactionItem{version: td.Version, edu: &types.EDU{
 				Type:    types.EDUTypeDeviceListUpdate,
 				Content: td.Content,
-			})
+			}})
 			log.Debug().
 				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
 				Str("device_id", gjson.GetBytes(td.Content, "device_id").String()).
 				Msg("Sending remote device list update")
 			continue
 		case types.BabbleservRemoteSigningKeyUpdate:
-			allEDUs = append(allEDUs, &types.EDU{
+			items = append(items, transactionItem{version: td.Version, edu: &types.EDU{
 				Type:    types.EDUTypeSigningKeyUpdate,
 				Content: td.Content,
-			})
+			}})
 			log.Debug().
 				Str("user_id", gjson.GetBytes(td.Content, "user_id").String()).
 				Msg("Sending remote signing key update")
 			continue
 		case types.BabbleservRemotePresenceChange:
-			allEDUs = append(allEDUs, &types.EDU{
+			items = append(items, transactionItem{version: td.Version, edu: &types.EDU{
 				Type:    types.EDUTypePresence,
 				Content: td.Content,
-			})
+			}})
 			log.Debug().
 				Str("user_id", gjson.GetBytes(td.Content, "push[0].user_id").String()).
 				Msg("Sending remote presence update")
 			continue
 		case types.BabbleservRemoteOutlierEvent:
-			var ev *types.Event
-			exerrors.PanicIfNotNil(json.Unmarshal(td.Content, &ev))
-			allEvs = append(allEvs, ev)
+			// Sent as stored: parsed without its room version, it would be rewritten in another format
+			items = append(items, transactionItem{version: td.Version, pdu: td.Content})
 			log.Debug().
-				Stringer("event_id", ev.ID).
-				Stringer("type", ev.Type).
-				Stringer("sender", ev.Sender).
+				Str("room_id", gjson.GetBytes(td.Content, "room_id").String()).
+				Str("type", gjson.GetBytes(td.Content, "type").String()).
+				Str("sender", gjson.GetBytes(td.Content, "sender").String()).
 				Msg("Sending remote outlier event")
 			continue
 		}
@@ -451,10 +461,10 @@ func (fs *FederationSender) syncTransientForServer(
 			panic(err)
 		}
 
-		allEDUs = append(allEDUs, &types.EDU{
+		items = append(items, transactionItem{version: td.Version, edu: &types.EDU{
 			Type:    types.EDUTypeToDevice,
 			Content: b,
-		})
+		}})
 		log.Debug().
 			Str("user_id", td.UserID.String()).
 			Str("device_id", td.DeviceID.String()).
@@ -463,26 +473,85 @@ func (fs *FederationSender) syncTransientForServer(
 			Msg("Sending remote to-device event")
 	}
 
-	if len(allEDUs) > 0 || len(allEvs) > 0 {
-		if err := fs.sendTransactionToServer(ctx, serverName, roomsVersion, allEvs, allEDUs); err != nil {
-			return false, fmt.Errorf("failed to send transient transaction: %w", err)
-		}
+	// A chunk's transaction ID is its last row: resent from the same saved position, a chunk holds
+	// the same rows, or more under a new ID
+	err = sendChunks(chunkTransaction(items), func(_ int, chunk transactionChunk) error {
+		lock.Refresh()
+		transactionID := "t" + types.MustVersionstampToString(chunk.last)
+		return fs.sendTransactionToServer(ctx, serverName, transactionID, chunk.pdus, chunk.edus)
+	}, func(chunk transactionChunk) error {
+		serverVersions[types.TransientVersionKey] = chunk.last
+		return fs.db.System.UpdateServerPositions(ctx, serverName, serverVersions, lock)
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to send transient transaction: %w", err)
 	}
 
 	serverVersions[types.TransientVersionKey] = nextVersion
 	return true, nil
 }
 
+// The spec's limits on a transaction, past which Synapse refuses it, as /send here does
+const (
+	maxTransactionPDUs = 50
+	maxTransactionEDUs = 100
+)
+
+type transactionItem struct {
+	pdu     json.RawMessage
+	edu     *types.EDU
+	version tuple.Versionstamp
+}
+
+type transactionChunk struct {
+	pdus []json.RawMessage
+	edus []*types.EDU
+	last tuple.Versionstamp
+}
+
+// chunkTransaction cuts the items into transactions in order, each within the spec's limits
+func chunkTransaction(items []transactionItem) []transactionChunk {
+	var chunks []transactionChunk
+	for _, item := range items {
+		if n := len(chunks); n == 0 ||
+			item.edu == nil && len(chunks[n-1].pdus) == maxTransactionPDUs ||
+			item.edu != nil && len(chunks[n-1].edus) == maxTransactionEDUs {
+			chunks = append(chunks, transactionChunk{})
+		}
+		chunk := &chunks[len(chunks)-1]
+		if item.edu == nil {
+			chunk.pdus = append(chunk.pdus, item.pdu)
+		} else {
+			chunk.edus = append(chunk.edus, item.edu)
+		}
+		chunk.last = item.version
+	}
+	return chunks
+}
+
+// sendChunks sends the chunks in order, saving each but the last as sent, so a failure resends from
+// the first chunk not saved
+func sendChunks(chunks []transactionChunk, send func(int, transactionChunk) error, save func(transactionChunk) error) error {
+	for i, chunk := range chunks {
+		if err := send(i, chunk); err != nil {
+			return err
+		} else if save != nil && i < len(chunks)-1 {
+			if err := save(chunk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (fs *FederationSender) sendTransactionToServer(
 	ctx context.Context,
 	serverName string,
-	version tuple.Versionstamp,
-	pdus []*types.Event,
+	transactionID string,
+	pdus []json.RawMessage,
 	edus []*types.EDU,
 ) error {
 	log := zerolog.Ctx(ctx)
-
-	transactionID := types.MustVersionstampToString(version)
 
 	log.Debug().
 		Int("pdus", len(pdus)).
@@ -506,7 +575,7 @@ func (fs *FederationSender) sendTransactionToServer(
 		Origin:         spec.ServerName(fs.config.ServerName),
 		Destination:    spec.ServerName(serverName),
 		OriginServerTS: spec.Timestamp(time.Now().UnixMilli()),
-		PDUs:           util.EventsToJSONs(pdus),
+		PDUs:           pdus,
 		EDUs:           gedus,
 	}); err != nil {
 		return err

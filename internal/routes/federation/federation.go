@@ -11,6 +11,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/util"
@@ -25,6 +26,9 @@ type FederationRoutes struct {
 	keyStore   *util.KeyStore
 	datastores *util.Datastores
 	notifiers  *notifier.Notifiers
+	ingestJobs *ingest.Jobs
+	// The send_join responses of state DAG rooms served to each server
+	stateDAGJoins *originLimiter
 }
 
 func NewFederationRoutes(
@@ -36,6 +40,7 @@ func NewFederationRoutes(
 	keyStore *util.KeyStore,
 	datastores *util.Datastores,
 	notifiers *notifier.Notifiers,
+	ingestJobs *ingest.Jobs,
 ) *FederationRoutes {
 	log := log.With().
 		Str("routes", "federation").
@@ -50,6 +55,9 @@ func NewFederationRoutes(
 		keyStore:   keyStore,
 		datastores: datastores,
 		notifiers:  notifiers,
+		ingestJobs: ingestJobs,
+
+		stateDAGJoins: newOriginLimiter(cfg.Federation.MaxStateDAGJoinsPerOrigin, cfg.Federation.MaxQueuedStateDAGJoinsPerOrigin),
 	}
 }
 

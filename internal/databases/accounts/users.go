@@ -32,6 +32,9 @@ func (a *AccountsDatabase) GetLocalUser(ctx context.Context, userID id.UserID) (
 }
 
 func (a *AccountsDatabase) IsLocalUsernameAvailable(ctx context.Context, username string) (bool, error) {
+	if a.isReservedLocalpart(username) {
+		return false, nil
+	}
 	userID := id.NewUserID(username, a.config.ServerName)
 	user, err := a.GetLocalUser(ctx, userID)
 	return user == nil, err
@@ -232,6 +235,9 @@ func (a *AccountsDatabase) RegisterWithPasswordHash(
 	inhibitLogin bool,
 	uiaSession, method, path string,
 ) (authResp, error) {
+	if a.isReservedLocalpart(username) {
+		return authResp{}, types.ErrUserAlreadyExists
+	}
 	if !inhibitLogin && deviceID == "" {
 		deviceID = generateDeviceID()
 	}

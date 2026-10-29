@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -30,6 +31,18 @@ import (
 // future non-outlier memberships overwrite. An event already stored as a room event is left as it
 // is, an outlier copy would take it out of room state.
 func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context, ev *types.Event) error {
+	_, err := r.sendOutlierMembership(ctx, ev, outlierChecks{})
+	return err
+}
+
+// outlierChecks are read in the write, so a job started or a membership changed meanwhile conflicts
+type outlierChecks struct {
+	refuseWhileIngesting bool
+	endsHeld             bool
+}
+
+// sendOutlierMembership returns false when the checks refuse the event
+func (r *RoomsDatabase) sendOutlierMembership(ctx context.Context, ev *types.Event, checks outlierChecks) (bool, error) {
 	if ev.Type != event.StateMember {
 		panic("outlier event is not a member event")
 	}
@@ -40,11 +53,18 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 	userID := id.UserID(*ev.StateKey)
 	isLocal := r.isLocalUser(userID)
 
+	var refused bool
 	versionFut, err := util.DoWriteTransactionWithVersion(ctx, r.db, func(txn fdb.Transaction) (fdb.FutureKey, error) {
+		refused = false
 		roomEventVersion := txn.Get(r.events.KeyForIDToVersion(ev.ID))
 		var storedFut fdb.FutureByteSlice
 		if isLocal {
 			storedFut = txn.Get(r.users.KeyForMembership(userID, ev.RoomID))
+		}
+		if checks.refuseWhileIngesting {
+			if err := r.txnCheckNoIngestJob(txn, ev.RoomID); err != nil {
+				return nil, err
+			}
 		}
 		// A normal read, so a publish to the room meanwhile conflicts with this write, which is only
 		// for a room this server is not in
@@ -55,6 +75,14 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 			return nil, fmt.Errorf("cannot send outlier events to rooms this server is participating in")
 		} else if roomEventVersion.MustGet() != nil {
 			return nil, nil
+		}
+		if checks.endsHeld && ev.Membership() == event.MembershipLeave {
+			if ends, err := r.txnEndsHeldMembership(txn, ev); err != nil {
+				return nil, err
+			} else if !ends {
+				refused = true
+				return nil, nil
+			}
 		}
 
 		version := r.events.TxnStoreEventRows(txn, true, ev)[ev.ID]
@@ -73,10 +101,12 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 	})
 
 	if err != nil {
-		return err
+		return false, err
+	} else if refused {
+		return false, nil
 	} else if versionFut == nil {
 		zerolog.Ctx(ctx).Debug().Stringer("event_id", ev.ID).Msg("Outlier membership event is stored as a room event")
-		return nil
+		return true, nil
 	}
 	if isLocal {
 		r.notifier.SendChange(notifier.Change{
@@ -91,14 +121,15 @@ func (r *RoomsDatabase) SendFederatedOutlierMembershipEvent(ctx context.Context,
 		Bool("is_outlier", ev.Outlier).
 		Any("versionstamp", types.DecodeRawVersionstamp(versionFut.MustGet())).
 		Msg("Stored outlier membership event")
-	return nil
+	return true, nil
 }
 
 var (
-	ErrAuthStage4            = errors.New("failed to auth event (step 4)")
-	ErrAuthStage5            = errors.New("failed to auth event (step 5)")
-	ErrEventDropped          = errors.New("event dropped")
-	ErrPrevEventsUnavailable = errors.New("state at prev events unavailable")
+	ErrAuthStage4                 = errors.New("failed to auth event (step 4)")
+	ErrAuthStage5                 = errors.New("failed to auth event (step 5)")
+	ErrEventDropped               = errors.New("event dropped")
+	ErrPrevEventsUnavailable      = errors.New("state at prev events unavailable")
+	ErrPrevStateEventsUnavailable = errors.New("state at prev state events unavailable")
 )
 
 // State another server gave where our state doesn't exist or is stale (we're (re)joining a room)
@@ -112,12 +143,20 @@ type GivenStates struct {
 	Events []*types.Event
 }
 
+type SendFederatedEventsOptions struct {
+	// Fail with ErrRoomIngesting while the room has an ingest job, which publishes the room's events
+	// itself. The publish reads the job's record, so a job started meanwhile conflicts.
+	RefuseWhileIngesting bool
+	// Ingest job targets, cleared by the publish that stores them
+	Targets map[id.EventID]types.IngestTargetKind
+}
+
 // Send federated events to a room after passing through all the required
 // authorization checks. (steps 4-6: https://spec.matrix.org/v1.10/server-server-api/#checks-performed-on-receipt-of-a-pdu)
 //
 // Every event fetched from other servers must be in evs or given: an event that cannot be evaluated
 // is dropped with an error wrapping ErrEventDropped. An event with a given before-state takes it
-// instead of the state after its prev events. Remote joins are passed to remoteJoinIn.
+// instead of the state after its prev events. Remote joins go through RemoteJoin instead.
 func (r *RoomsDatabase) SendFederatedEvents(
 	ctx context.Context,
 	roomID id.RoomID,
@@ -125,10 +164,11 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	given *GivenStates,
 	userPushRules types.UserPushRulesMap,
 	userRoomContext types.UserRoomContextMap,
+	options SendFederatedEventsOptions,
 ) (*SendEventsResult, error) {
 	push := pushContext{rules: userPushRules, rooms: userRoomContext}
-	p := &federatedEventSender{eventSender: r.newEventSender(roomID, push)}
-	evs = p.sortEventsTopologically(evs)
+	p := &federatedEventSender{eventSender: r.newEventSender(roomID, push), options: options}
+	evs = SortEventsTopologically(evs)
 	p.evs = evs
 	log := r.getTxnLogContext(ctx, "SendFederatedEvents").
 		Str("room_id", roomID.String()).
@@ -141,18 +181,13 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	}
 	p.build = p.executePreparationWork
 
-	if join := r.remoteJoinIn(evs, given); join != nil {
-		ctx, cancel := p.withSendTimeout(ctx, remoteJoinTimeout)
-		defer cancel()
-		p.join = join
-		p.given = givenStates{beforeEvents: map[id.EventID][]id.EventID{join.ev.ID: join.stateIDs}}
-		s := &remoteJoinSender{federatedEventSender: p}
-		return s.send(ctx)
-	}
-	if joined, err := r.IsServerJoined(ctx, roomID, r.config.ServerName); err != nil {
+	room, err := r.GetRoom(ctx, roomID)
+	if err != nil {
 		return nil, err
-	} else if !joined {
-		return r.sendOutlierMemberships(ctx, roomID, evs)
+	} else if given != nil && isStateDAGSend(room, evs) {
+		return nil, fmt.Errorf("%w: %s", errStateDAGGivenStates, roomID)
+	} else if !isServerJoined(room) {
+		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
 
 	ctx, cancel := p.withSendTimeout(ctx, sendTimeout)
@@ -160,61 +195,84 @@ func (r *RoomsDatabase) SendFederatedEvents(
 	res, err := p.send(ctx)
 	if errors.Is(err, ErrServerNotInRoom) {
 		log.Info().Err(err).Msg("This server left the room while sending events")
-		return r.sendOutlierMemberships(ctx, roomID, evs)
+		return r.sendOutlierMemberships(ctx, roomID, evs, options)
 	}
 	return res, err
 }
 
 // sendOutlierMemberships stores those of a batch's events for a room this server is not in that are
 // outlier memberships, see isOutlierMembership, and drops the rest with ErrServerNotInRoom.
-func (r *RoomsDatabase) sendOutlierMemberships(ctx context.Context, roomID id.RoomID, evs []*types.Event) (*SendEventsResult, error) {
+// A room with an ingest job, started by a join in progress, takes the events as targets instead.
+func (r *RoomsDatabase) sendOutlierMemberships(
+	ctx context.Context,
+	roomID id.RoomID,
+	evs []*types.Event,
+	options SendFederatedEventsOptions,
+) (*SendEventsResult, error) {
+	if options.RefuseWhileIngesting {
+		if job, err := r.GetIngestJob(ctx, roomID); err != nil {
+			return nil, err
+		} else if job != nil {
+			return nil, fmt.Errorf("%w: %s", ErrRoomIngesting, roomID)
+		}
+	}
+	checks := outlierChecks{refuseWhileIngesting: options.RefuseWhileIngesting, endsHeld: true}
 	res := &SendEventsResult{}
 	for _, ev := range evs {
-		if outlier, err := r.isOutlierMembership(ctx, roomID, ev); err != nil {
-			return nil, err
-		} else if !outlier {
+		outlier := *ev
+		stored := false
+		if r.isOutlierMembership(roomID, ev) {
+			var err error
+			if stored, err = r.sendOutlierMembership(ctx, &outlier, checks); err != nil {
+				return nil, err
+			}
+		}
+		if !stored {
 			res.Rejected = append(res.Rejected, RejectedEvent{ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, ErrServerNotInRoom, roomID)})
 			continue
-		}
-		outlier := *ev
-		if err := r.SendFederatedOutlierMembershipEvent(ctx, &outlier); err != nil {
-			return nil, err
 		}
 		res.Allowed = append(res.Allowed, &outlier)
 	}
 	return res, nil
 }
 
-// isOutlierMembership reports whether a member event of a room this server is not in reaches a local
-// user who sees it outside the room: an invite of a local user, or the inviter's leave rescinding it.
+// isOutlierMembership reports whether a member event of a room this server is not in may reach a
+// local user outside the room: their invite, or a leave, see endsHeldMembership.
 // A remote user's membership is never an outlier, as only local users have membership rows, so a
 // remote invitee's rejection is not taken: the invitee's server records it locally.
-func (r *RoomsDatabase) isOutlierMembership(ctx context.Context, roomID id.RoomID, ev *types.Event) (bool, error) {
-	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID {
-		return false, nil
-	}
-	target := id.UserID(*ev.StateKey)
-	if !r.isLocalUser(target) {
-		return false, nil
+func (r *RoomsDatabase) isOutlierMembership(roomID id.RoomID, ev *types.Event) bool {
+	if ev.Type != event.StateMember || ev.StateKey == nil || ev.RoomID != roomID || !r.isLocalUser(id.UserID(*ev.StateKey)) {
+		return false
 	}
 	switch ev.Membership() {
-	case event.MembershipInvite:
-		return true, nil
-	case event.MembershipLeave:
-		return util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (bool, error) {
-			memberships, err := r.txnGetRoomUserMemberships(txn, roomID, []id.UserID{target})
-			if err != nil {
-				return false, err
-			} else if membership, found := memberships[target]; !found || membership.Membership != event.MembershipInvite {
-				return false, nil
-			} else if invite := r.events.TxnGetEvent(txn, membership.EventID); invite == nil {
-				return false, nil
-			} else {
-				return ev.Sender == invite.Sender, nil
-			}
-		})
+	case event.MembershipInvite, event.MembershipLeave:
+		return true
 	}
-	return false, nil
+	return false
+}
+
+func (r *RoomsDatabase) txnEndsHeldMembership(txn fdb.ReadTransaction, leave *types.Event) (bool, error) {
+	target := id.UserID(*leave.StateKey)
+	memberships, err := r.txnGetRoomUserMemberships(txn, leave.RoomID, []id.UserID{target})
+	if err != nil {
+		return false, err
+	} else if membership, found := memberships[target]; !found {
+		return false, nil
+	} else if held := r.events.TxnGetEvent(txn, membership.EventID); held == nil {
+		return false, nil
+	} else {
+		return endsHeldMembership(leave, held), nil
+	}
+}
+
+// endsHeldMembership accepts only the inviter rescinding an invite. In a state DAG room the leave
+// must also cite the invite in prev_state_events, the only sign it supersedes it without state
+// resolution (MSC4242). Knocks are never ended, as in Synapse: the sender's power cannot be checked.
+func endsHeldMembership(leave, held *types.Event) bool {
+	if held.StateDAGs() && !slices.Contains(leave.PrevStateEventIDs, held.ID) {
+		return false
+	}
+	return held.Membership() == event.MembershipInvite && leave.Sender == held.Sender
 }
 
 // givenStates is what a send keeps of the states the sending server gave
@@ -234,7 +292,8 @@ type federatedEventSender struct {
 	given   givenStates
 	fetched []*types.Event
 	// Set for a remote join, including after it switches to member mode
-	join *remoteJoin
+	join    *remoteJoin
+	options SendFederatedEventsOptions
 }
 
 func (p *federatedEventSender) send(ctx context.Context) (*SendEventsResult, error) {
@@ -314,7 +373,7 @@ func (s *federatedEventSender) checkFetchedEvents(ctx context.Context) (*checked
 		return nil, err
 	}
 
-	unstored = s.sortEventsTopologically(unstored)
+	unstored = SortEventsTopologically(unstored)
 	reads, err := eventsendutil.NewArtifactReads(ctx, s.r.db, s.r.events, s.roomID, nil, nil)
 	if err != nil {
 		return nil, err
@@ -341,21 +400,20 @@ type federatedPreparation struct {
 	givenBefore map[id.EventID]types.StateHash
 	dropped     map[id.EventID]struct{}
 	rejected    map[id.EventID]struct{}
+	// Batch events stored without state, whose staged headers cite no auth events
+	stateless map[id.EventID]struct{}
+	batch     map[id.EventID]struct{}
+	stateDAGs bool
 }
 
 func (p *federatedPreparation) newContextResolver() *eventsendutil.Resolver {
-	return eventsendutil.NewResolver(p.txn, p.plan.eventsProvider, p.plan.authGraph, eventsendutil.ResolverOptions{
-		StateBatch:     p.plan.stateBatch,
-		RoomID:         p.roomID,
-		RoomVersion:    p.plan.room.Version,
-		MaxCandidates:  p.r.config.Rooms.StateBudget.InlineResolutionCandidates,
-		MaxStateTuples: p.r.config.Rooms.StateBudget.InlineResolutionStateTuples,
-	})
+	return p.newResolver(p.txn, &p.plan.preparedEvents, p.plan.room.Version)
 }
 
 // txnPrepareFederated prepares an attempt's copies of federated events. Events are authorized
 // against their own auth events, step 4, the state before them, step 5, and the room's current
 // state, step 6.
+// A state DAG room's events cite no auth events, so skip step 4, and only its messages face step 6.
 func (s *federatedEventSender) txnPrepareFederated(
 	ctx context.Context,
 	txn fdb.ReadTransaction,
@@ -374,9 +432,13 @@ func (s *federatedEventSender) txnPrepareFederated(
 	} else if !joined && !join.inJoinMode() {
 		return nil, fmt.Errorf("%w: %s", ErrServerNotInRoom, s.roomID)
 	}
-	var extremities []id.EventID
+	stateDAGs := util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs)
+	var extremities, stateExtremities []id.EventID
 	if !join.inJoinMode() {
 		extremities = s.r.events.TxnLookupCurrentRoomExtremEventIDs(txn, s.roomID)
+		if stateDAGs {
+			stateExtremities = s.r.events.TxnLookupCurrentRoomStateExtremEventIDs(txn, s.roomID)
+		}
 	} else if join.diff == nil || room.CurrentState != join.diff.from {
 		return needsWork{work: joinStateWork{from: room.CurrentState}}, nil
 	}
@@ -406,8 +468,12 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 	stateBatch, authGraph := s.txnNewStateBatch(txn, eventsProvider, evs...)
 	plan := &publishPlan{
-		room:  room,
-		guard: sendGuard{revision: room.StateRevision, joined: !join.inJoinMode()},
+		room: room,
+		guard: sendGuard{
+			revision:    room.StateRevision,
+			joined:      !join.inJoinMode(),
+			noIngestJob: s.options.RefuseWhileIngesting,
+		},
 		preparedEvents: preparedEvents{
 			stateBatch:          stateBatch,
 			authGraph:           authGraph,
@@ -422,8 +488,14 @@ func (s *federatedEventSender) txnPrepareFederated(
 		txn:                  txn,
 		plan:                 plan,
 		// Batch events citing a fetched event that could not be evaluated are dropped with it
-		dropped:  maps.Clone(fetchedDropped),
-		rejected: make(map[id.EventID]struct{}),
+		dropped:   maps.Clone(fetchedDropped),
+		rejected:  make(map[id.EventID]struct{}),
+		stateless: make(map[id.EventID]struct{}),
+		batch:     make(map[id.EventID]struct{}, len(evs)),
+		stateDAGs: stateDAGs,
+	}
+	for _, ev := range evs {
+		p.batch[ev.ID] = struct{}{}
 	}
 	p.resolver = p.newContextResolver()
 	if p.dropped == nil {
@@ -432,29 +504,48 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 	// Step 4: Passes authorization rules based on the event’s auth events, otherwise it is rejected.
 	for _, ev := range evs {
-		if _, found := stored[ev.ID]; found {
-			storedEv, err := storedEvents.Get(ev.ID)
-			if err != nil {
-				return nil, err
+		if _, found := stored[ev.ID]; !found {
+			plan.guard.unstored = append(plan.guard.unstored, ev.ID)
+		} else if storedEv, err := storedEvents.Get(ev.ID); err != nil {
+			return nil, err
+		} else if stateDAGs && storedEv != nil && !storedEv.HasStateIn(s.roomID) {
+			// Staged without state by a join or gap fill, so evaluated as new unless given state meanwhile
+			plan.guard.stateless = append(plan.guard.stateless, ev.ID)
+			p.stateless[ev.ID] = struct{}{}
+		} else {
+			if storedEv != nil {
+				ev.CopyOutcome(storedEv)
+				// Calculated in a state DAG room rather than sent, and resolutions read them from here
+				ev.AuthEventIDs = storedEv.AuthEventIDs
+				if storedEv.Unpublished {
+					// The replay set its prev_content, which a copy read before the replay lacks
+					ev.Unsigned = storedEv.Unsigned
+				}
+			}
+			if ev.Unpublished {
+				// Replayed by the room's ingest job, published now with the replay's state, see txnStoreEvents
+				ev.RoomVersion = room.Version
+				continue
 			}
 			// Still evaluated in turn, as events later in the batch may cite it, and they see the
 			// outcome and state stored for it
 			log.Warn().Stringer("event_id", ev.ID).Msg("Received duplicate event we already know about")
 			ev.IsDuplicate = true
-			if storedEv != nil {
-				ev.CopyOutcome(storedEv)
-			}
 			if ev.Rejected {
 				plan.rejected = append(plan.rejected, RejectedEvent{ev, types.ErrAlreadyExists})
 			}
 			continue
 		}
-		plan.guard.unstored = append(plan.guard.unstored, ev.ID)
 		if err := s.r.txnCheckEventBeforeStore(txn, s.roomID, ev); err != nil {
 			p.reject(ev, err)
 			continue
 		}
 		ev.RoomVersion = room.Version
+		if stateDAGs {
+			// Calculated in step 5, replacing any a local event was prepared with
+			ev.AuthEventIDs = nil
+			continue
+		}
 		drop, authErr, err := s.checkAuthEvents(ctx, eventsProvider, ev, p.dropped, false)
 		if err != nil {
 			return nil, err
@@ -473,7 +564,7 @@ func (s *federatedEventSender) txnPrepareFederated(
 	if join != nil {
 		if i := slices.IndexFunc(evs, func(ev *types.Event) bool { return ev.ID == join.ev.ID }); i >= 0 && evs[i].IsDuplicate {
 			if join.inJoinMode() {
-				// Answered outside the room's join lock, see remoteJoinSender.send
+				// The send starts again answering the stored join, see remoteJoinSender.send
 				return nil, errJoinStored
 			}
 			join.stored = true
@@ -486,6 +577,11 @@ func (s *federatedEventSender) txnPrepareFederated(
 		plan.boundary = join.diff
 		plan.resetExtremities = join.ev.ID
 		p.givenBefore = map[id.EventID]types.StateHash{join.ev.ID: join.boundary}
+		if stateDAGs {
+			if stateExtremities, err = s.stateDAGJoinTips(eventsProvider); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		boundaries, givenBefore, err := p.txnBoundaryContexts(evs, &s.given)
 		if err != nil {
@@ -502,6 +598,15 @@ func (s *federatedEventSender) txnPrepareFederated(
 		if _, dropped := p.dropped[ev.ID]; dropped {
 			continue
 		} else if ev.IsDuplicate {
+			plan.evs = append(plan.evs, ev)
+		} else if ev.Unpublished {
+			// Not evaluated, but still checked, as send_join, send_leave and send_knock skip the fast-path check
+			if unpublished, err := p.citedUnpublished(ev); err != nil {
+				return nil, err
+			} else if unpublished != "" {
+				p.drop(ev, fmt.Errorf("%w: %w: %s is not published yet", ErrEventDropped, ErrPrevStateEventsUnavailable, unpublished))
+				continue
+			}
 			plan.evs = append(plan.evs, ev)
 		} else if keep, request, err := p.evaluate(ev); err != nil {
 			return nil, err
@@ -526,11 +631,39 @@ func (s *federatedEventSender) txnPrepareFederated(
 	// “soft failed”. Pending extremities start from the room's stored extremities, none for a join in
 	// join mode, and advance as events are accepted. Current state is the state after them, resolved
 	// when there are several.
+	// A state DAG room's current state follows its state extremities, which only state events advance.
 	pendingExtremities := extremities
 	current := stateSteps{current: room.CurrentState}
+	// Events the ingest job replayed are older state kept out of the extremities and timeline. A run
+	// of them joins the state extremities and moves current state once, before the next event.
+	var replayed *types.Event
+	stepReplayed := func() (*eventsendutil.ResolutionRequest, error) {
+		if replayed == nil {
+			return nil, nil
+		}
+		next := replayed.AfterState
+		if len(stateExtremities) > 1 {
+			resolved, request, err := p.resolver.Resolve(stateExtremities)
+			if err != nil || request != nil {
+				return request, err
+			}
+			next = resolved
+		}
+		current.advance(replayed.ID, next)
+		replayed = nil
+		return nil, nil
+	}
 	for _, ev := range plan.evs {
 		if ev.IsDuplicate || ev.Rejected {
 			continue
+		} else if ev.Unpublished {
+			stateExtremities = advanceStateExtremities(stateExtremities, ev)
+			replayed = ev
+			continue
+		} else if request, err := stepReplayed(); err != nil {
+			return nil, err
+		} else if request != nil {
+			return p.resolutionWork(request), nil
 		}
 		evLog := log.With().
 			Stringer("event_id", ev.ID).
@@ -539,56 +672,90 @@ func (s *federatedEventSender) txnPrepareFederated(
 
 		var replaced []id.EventID
 		if !join.inJoinMode() {
-			_, authErr, err := plan.txnAuthorizeAt(ctx, txn, current.current, ev)
-			if err != nil {
-				return nil, err
-			} else if authErr != nil {
-				evLog.Err(authErr).
-					Any("event", ev).
-					Msg("Soft failed to auth event (step 6)")
-				// Soft failed events keep their state, but stay out of room indices, extremities
-				// and current state
-				ev.SoftFailed = true
-				continue
+			if softFails(ev) {
+				_, authErr, err := plan.txnAuthorizeAt(ctx, txn, current.current, ev)
+				if err != nil {
+					return nil, err
+				} else if authErr != nil {
+					evLog.Err(authErr).
+						Any("event", ev).
+						Msg("Soft failed to auth event (step 6)")
+					// Soft failed events keep their state, but stay out of room indices, extremities
+					// and current state
+					ev.SoftFailed = true
+					continue
+				}
+				evLog.Trace().Msg("Event passed authorization step 6")
 			}
-			evLog.Trace().Msg("Event passed authorization step 6")
 
+			var err error
 			if replaced, err = plan.findReplacedExtremities(evLog, pendingExtremities, ev.PrevEventIDs); err != nil {
 				return nil, err
 			}
 		}
-		pendingExtremities = s.advanceExtremities(pendingExtremities, replaced, ev.ID)
+		pendingExtremities = advanceExtremities(pendingExtremities, replaced, ev.ID)
 		plan.replacedExtremities[ev.ID] = replaced
 
-		next := ev.AfterState
-		if len(pendingExtremities) > 1 {
-			var request *eventsendutil.ResolutionRequest
-			if next, request, err = p.resolver.Resolve(pendingExtremities); err != nil {
-				return nil, err
-			} else if request != nil {
-				return p.resolutionWork(request), nil
-			}
+		after := pendingExtremities
+		if stateDAGs {
+			stateExtremities = advanceStateExtremities(stateExtremities, ev)
+			after = stateExtremities
 		}
-		current.advance(ev.ID, next)
+		if !stateDAGs || entersStateDAG(ev) {
+			next := ev.AfterState
+			if len(after) > 1 {
+				var request *eventsendutil.ResolutionRequest
+				if next, request, err = p.resolver.Resolve(after); err != nil {
+					return nil, err
+				} else if request != nil {
+					return p.resolutionWork(request), nil
+				}
+			}
+			current.advance(ev.ID, next)
+		}
 		evLog.Debug().Msg("Event authorized for storage")
 	}
+	if request, err := stepReplayed(); err != nil {
+		return nil, err
+	} else if request != nil {
+		return p.resolutionWork(request), nil
+	}
 
-	if len(pendingExtremities) > 1 {
+	if len(pendingExtremities) > 1 && !stateDAGs {
 		log.Warn().
 			Strs("extremity_event_ids", util.StringersToStrs(pendingExtremities)).
 			Msg("Room has several extremities, current state is resolved")
+	} else if len(stateExtremities) > 1 {
+		log.Debug().
+			Strs("state_extremity_event_ids", util.StringersToStrs(stateExtremities)).
+			Msg("Room has several state extremities, current state is resolved")
 	}
 	plan.stateSteps = current.steps
+	if join.inJoinMode() && stateDAGs {
+		plan.resetStateExtremities = stateExtremities
+	}
+	if len(s.options.Targets) > 0 {
+		plan.extra = func(txn fdb.Transaction, _ *types.Room) error {
+			return s.r.txnClearPublishedTargets(txn, s.roomID, plan.evs, s.options.Targets)
+		}
+	}
 	return readyToPublish{plan: plan}, nil
 }
 
 // evaluate assigns an event its state and authorizes it against the state before it, step 5.
 // Returns false for an event dropped from the batch.
+// A state DAG event takes the state after its prev state events, and auth events calculated from it.
 func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.ResolutionRequest, error) {
 	log := zerolog.Ctx(p.ctx).With().
 		Stringer("event_id", ev.ID).
 		Stringer("type", ev.Type).
 		Logger()
+
+	if p.stateDAGs && !ev.Rejected {
+		if keep, err := p.authorizePrevStateEvents(ev); err != nil || !keep || ev.Rejected {
+			return keep, nil, err
+		}
+	}
 
 	before, given := p.givenBefore[ev.ID]
 	var knownPrevs []id.EventID
@@ -596,12 +763,23 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		// Resolving only a subset of the prev events would persist incomplete state. Leave the
 		// event unstored so it can be evaluated again when state at every prev event is available,
 		// from the sending server for prev events without state here.
+		// A state DAG room never fetches state: /send passes only PDUs whose prev state events are
+		// known or earlier in the batch, so this drops only send_ endpoint memberships citing others.
+		prevs, unavailable := ev.PrevEventIDs, ErrPrevEventsUnavailable
+		if p.stateDAGs {
+			prevs, unavailable = ev.PrevStateEventIDs, ErrPrevStateEventsUnavailable
+		}
 		var unknownPrevs []id.EventID
 		var err error
-		if knownPrevs, unknownPrevs, err = p.resolver.PartitionPrevs(ev.PrevEventIDs); err != nil {
+		if knownPrevs, unknownPrevs, err = p.resolver.PartitionPrevs(prevs); err != nil {
 			return false, nil, err
 		} else if len(unknownPrevs) > 0 {
-			p.drop(ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, ErrPrevEventsUnavailable, unknownPrevs))
+			p.drop(ev, fmt.Errorf("%w: %w: %s", ErrEventDropped, unavailable, unknownPrevs))
+			return false, nil, nil
+		} else if unpublished, err := p.citedUnpublished(ev); err != nil {
+			return false, nil, err
+		} else if unpublished != "" {
+			p.drop(ev, fmt.Errorf("%w: %w: %s is not published yet", ErrEventDropped, unavailable, unpublished))
 			return false, nil, nil
 		}
 	}
@@ -641,8 +819,16 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 		return true, nil, nil
 	}
 
-	authState, authErr, err := p.plan.txnAuthorizeAt(p.ctx, p.txn, before, ev)
+	authState, err := p.plan.txnLookupAuthState(p.txn, before, ev)
 	if err != nil {
+		return false, nil, err
+	} else if p.stateDAGs {
+		ev.AuthEventIDs = events.AuthEventIDsFor(ev, authState)
+		if _, found := p.stateless[ev.ID]; found {
+			p.plan.authGraph.AddCalculated(ev)
+		}
+	}
+	if authErr, err := p.plan.authorize(p.ctx, authState, ev); err != nil {
 		return false, nil, err
 	} else if authErr != nil {
 		log.Err(authErr).
@@ -679,17 +865,43 @@ func (p *federatedPreparation) evaluate(ev *types.Event) (bool, *eventsendutil.R
 	return true, nil, nil
 }
 
-// resolutionWork captures only the preparation inputs the job needs after this transaction ends.
+// citedUnpublished returns a cited prev state event the ingest job replayed but has not published,
+// or a dropped batch one: no published event may cite either, see types.Event.Unpublished
+func (p *federatedPreparation) citedUnpublished(ev *types.Event) (id.EventID, error) {
+	for _, prevID := range ev.PrevStateEventIDs {
+		if _, found := p.batch[prevID]; found {
+			if _, dropped := p.dropped[prevID]; dropped {
+				return prevID, nil
+			}
+			continue
+		} else if prev, err := p.plan.eventsProvider.Get(prevID); err != nil {
+			return "", err
+		} else if prev != nil && prev.Unpublished {
+			return prevID, nil
+		}
+	}
+	return "", nil
+}
+
+// authorizePrevStateEvents applies MSC4242's section 2: an event citing a rejected event, a message
+// or another room's event is rejected rather than dropped, since its ID fixes what it cites, and
+// takes empty state, as nothing reads it. Returns false for an event citing one not stored.
+func (p *federatedPreparation) authorizePrevStateEvents(ev *types.Event) (bool, error) {
+	authErr, err := util.AuthorizePrevStateEvents(ev, p.plan.eventsProvider.Get)
+	if errors.Is(err, util.ErrPrevStateEventMissing) {
+		p.drop(ev, fmt.Errorf("%w: %w: %w", ErrEventDropped, ErrPrevStateEventsUnavailable, err))
+		return false, nil
+	} else if err != nil {
+		return false, err
+	} else if authErr != nil {
+		ev.BeforeState, ev.AfterState = state.EmptyContext, state.EmptyContext
+		p.reject(ev, fmt.Errorf("%w: %w", ErrAuthStage5, authErr))
+	}
+	return true, nil
+}
+
 func (p *federatedPreparation) resolutionWork(request *eventsendutil.ResolutionRequest) needsWork {
-	return needsWork{work: resolveStateWork{
-		request: request,
-		inputs: artifactInputs{
-			stateBatch:     p.plan.stateBatch,
-			eventsProvider: p.plan.eventsProvider,
-			authGraph:      p.plan.authGraph,
-		},
-		roomVersion: p.plan.room.Version,
-	}}
+	return needsWork{work: p.plan.resolutionWork(request, p.plan.room.Version)}
 }
 
 // reject flags an event rejected, it is still stored, and records why
@@ -853,7 +1065,7 @@ func (s *federatedEventSender) eventsToStage(
 			unique = append(unique, ev)
 		}
 	}
-	stored, err := s.r.storedEventIDs(ctx, util.EventsToIDs(unique))
+	stored, err := s.r.GetStoredEventIDs(ctx, util.EventsToIDs(unique))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -954,6 +1166,7 @@ func (s *federatedEventSender) stageStatelessEvents(ctx context.Context, staging
 		}); err != nil {
 			return err
 		}
+		util.ReportProgress(ctx)
 	}
 	staging.staged = true
 	return nil
@@ -1136,12 +1349,16 @@ func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 		return err
 	}
 	stateBatch := s.r.state.NewJobBatch(s.roomID, reads.Read)
-	// A job batch reads in the job's transactions whatever transaction it is given
-	base, baseState, err := s.txnBoundaryBase(nil, stateBatch, room.CurrentState, len(join.state))
-	if err != nil {
-		return err
+	var base, boundary types.StateHash
+	var baseState types.StateEntries
+	if join.ev.StateDAGs() {
+		boundary, err = s.stateDAGJoinBefore(ctx, reads, stateBatch, room.Version)
+	} else {
+		// A job batch reads in the job's transactions whatever transaction it is given
+		if base, baseState, err = s.txnBoundaryBase(nil, stateBatch, room.CurrentState, len(join.state)); err == nil {
+			boundary, err = s.txnApplyBoundary(nil, stateBatch, base, baseState, join.state)
+		}
 	}
-	boundary, err := s.txnApplyBoundary(nil, stateBatch, base, baseState, join.state)
 	if err != nil {
 		return err
 	}
@@ -1168,10 +1385,10 @@ func (s *federatedEventSender) buildJoinBoundary(ctx context.Context) error {
 
 // Event ordering
 
-// sortEventsTopologically orders a batch so every event follows the batch events it cites as prev
+// SortEventsTopologically orders a batch so every event follows the batch events it cites as prev
 // or auth events, otherwise keeping the input order, and without later copies of an event. Events
 // on a cycle, which no valid batch has, follow the rest in input order.
-func (s *federatedEventSender) sortEventsTopologically(batch []*types.Event) []*types.Event {
+func SortEventsTopologically(batch []*types.Event) []*types.Event {
 	evs := make([]*types.Event, 0, len(batch))
 	indexes := make(map[id.EventID]int, len(batch))
 	for _, ev := range batch {
@@ -1240,7 +1457,7 @@ func (h *indexHeap) Pop() any {
 
 // advanceExtremities returns the pending extremities once an event is accepted: those it does not
 // replace, then the event.
-func (s *federatedEventSender) advanceExtremities(pendingExtremities, replaced []id.EventID, eventID id.EventID) []id.EventID {
+func advanceExtremities(pendingExtremities, replaced []id.EventID, eventID id.EventID) []id.EventID {
 	next := make([]id.EventID, 0, len(pendingExtremities)+1)
 	for _, extremityID := range pendingExtremities {
 		if extremityID != eventID && !slices.Contains(replaced, extremityID) {

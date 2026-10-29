@@ -71,6 +71,7 @@ func (r *RoomsDatabase) txnStoreEvents(
 		Msg("Storing batch of events")
 
 	var version tuple.Versionstamp
+	stateDAGs := util.RoomVersionHas(room.Version, gomatrixserverlib.IRoomVersion.StateDAGs)
 	depthKey := r.KeyForRoomDepth(room.ID)
 	depth := types.BytesToRoomDepth(txn.Get(depthKey).MustGet())
 
@@ -98,6 +99,14 @@ func (r *RoomsDatabase) txnStoreEvents(
 
 		// Rejected and soft failed events never appear to clients, so neither enters the room indices
 		if ev.Rejected || ev.SoftFailed {
+			continue
+		}
+		if stateDAGs && entersStateDAG(ev) {
+			r.events.TxnSetRoomStateExtremEventID(txn, room.ID, ev.ID, version, ev.PrevStateEventIDs)
+			r.events.TxnAddRoomStateDAGEvent(txn, room.ID, ev.ID, version)
+		}
+		// State an ingest job replayed for a gap stays out of the timeline and extremities, as in Synapse
+		if ev.Unpublished {
 			continue
 		}
 
@@ -140,12 +149,12 @@ func (r *RoomsDatabase) txnStoreEvents(
 				}
 			}
 
-			if relType == event.RelAnnotation {
-				// room-ev-reactions/rel-ev/uid/key
-				// Note: dupe check is handled before we call storeEvents
+			if isReaction(ev) {
+				// room-ev-reactions/rel-ev/uid/key, which a local send checks for its duplicates
 				txn.Set(r.events.KeyForRoomReaction(room.ID, relEvID, ev.Sender, ev.ReactionKey()), []byte(ev.ID))
 			}
 		}
+		r.txnClearRedactedReaction(txn, room.ID, ev, newEvs)
 
 		// Store notification counts for local users
 		if userNotifs, ok := eventNotifications[ev.ID]; ok {
@@ -593,8 +602,6 @@ func createRoomVersion(createEv *types.PartialEvent) string {
 
 var errRoomNotFederated = errors.New("this room is not federated")
 
-// Run final internal checks on an event before we accept it for storage, this
-// is where we prevent duplicate annotations currently.
 func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	txn fdb.ReadTransaction,
 	roomID id.RoomID,
@@ -609,16 +616,47 @@ func (r *RoomsDatabase) txnCheckEventBeforeStore(
 	} else if ev.RoomVersion == "" {
 		panic("event room version is missing")
 	}
-
-	relEvID, relType := ev.RelatesTo()
-	if relType == event.RelAnnotation {
-		existng := txn.Get(r.events.KeyForRoomReaction(ev.RoomID, relEvID, ev.Sender, ev.ReactionKey())).MustGet()
-		if existng != nil {
-			return errors.New("duplicate reaction for this event/user")
-		}
-	}
-
 	return nil
+}
+
+func isReaction(ev *types.Event) bool {
+	_, relType := ev.RelatesTo()
+	return ev.Type == event.EventReaction && ev.StateKey == nil && relType == event.RelAnnotation
+}
+
+// txnCheckDuplicateReaction checks only local sends, as Synapse does: refusing a federated event
+// would, in a state DAG room, cut this server off from every event descending from it
+func (r *RoomsDatabase) txnCheckDuplicateReaction(txn fdb.ReadTransaction, ev *types.Event) error {
+	if !isReaction(ev) {
+		return nil
+	}
+	relEvID, _ := ev.RelatesTo()
+	if txn.Get(r.events.KeyForRoomReaction(ev.RoomID, relEvID, ev.Sender, ev.ReactionKey())).MustGet() != nil {
+		return errors.New("duplicate reaction for this event/user")
+	}
+	return nil
+}
+
+// txnClearRedactedReaction lets the sender react with the key again, as Synapse deletes a redacted relation
+func (r *RoomsDatabase) txnClearRedactedReaction(txn fdb.Transaction, roomID id.RoomID, redaction *types.Event, batch []*types.Event) {
+	redactedID := redaction.RedactedEventID()
+	if redactedID == "" {
+		return
+	}
+	var redacted *types.Event
+	if i := slices.IndexFunc(batch, func(ev *types.Event) bool { return ev.ID == redactedID }); i >= 0 {
+		redacted = batch[i]
+	} else {
+		redacted = r.events.TxnGetEvent(txn, redactedID)
+	}
+	if redacted == nil || redacted.RoomID != roomID || !isReaction(redacted) {
+		return
+	}
+	relEvID, _ := redacted.RelatesTo()
+	key := r.events.KeyForRoomReaction(roomID, relEvID, redacted.Sender, redacted.ReactionKey())
+	if id.EventID(txn.Get(key).MustGet()) == redactedID {
+		txn.Clear(key)
+	}
 }
 
 // Strip everything unexpected from an event's unsigned map before it is stored.

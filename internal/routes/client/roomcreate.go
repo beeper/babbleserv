@@ -111,7 +111,7 @@ func (c *ClientRoutes) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	if roomVersion == "" {
 		roomVersion = c.config.Rooms.DefaultVersion
 	}
-	if !slices.Contains(supportedRoomVersions, roomVersion) {
+	if _, found := c.config.RoomVersions()[roomVersion]; !found {
 		util.ResponseErrorJSON(w, r, mautrix.MUnsupportedRoomVersion)
 		return
 	}

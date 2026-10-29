@@ -18,6 +18,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/middleware"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/routes/client"
@@ -54,6 +55,7 @@ func NewRoutes(
 	fedClient *maufederation.Client,
 	keyStore *util.KeyStore,
 	dstores *util.Datastores,
+	ingestJobs *ingest.Jobs,
 ) *Routes {
 	log := logger.With().
 		Str("component", "routes").
@@ -66,8 +68,8 @@ func NewRoutes(
 		databases: databases,
 
 		babbleserv: debug.NewDebugRoutes(cfg, logger, databases, notifiers, dstores),
-		client:     client.NewClientRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers),
-		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers),
+		client:     client.NewClientRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers, ingestJobs),
+		federation: federation.NewFederationRoutes(cfg, logger, databases, fclient, fedClient, keyStore, dstores, notifiers, ingestJobs),
 
 		servers: make([]*Server, 0),
 	}

@@ -78,11 +78,39 @@ type RoomsDatabase struct {
 	// (EventID, UserID, DeviceID) -> TransactionID
 	eventTransactionIDs subspace.Subspace
 
+	// A room's ingest job, holding the room version, present while the room has targets,
+	// see docs/event-sending.md#ingest-jobs
+	//
+	// key: RoomID
+	// value: types.IngestJob (msgpack)
+	ingestJobs subspace.Subspace
+	// Events the room's job publishes once the state they need is stored, a local user's
+	// join or a PDU
+	//
+	// key: (RoomID, EventID)
+	// value: types.IngestTarget (msgpack)
+	ingestTargets subspace.Subspace
+	// The join target of a local user's pending join, or why it failed, which the user's
+	// /join watches
+	//
+	// key: (RoomID, UserID)
+	// value: types.IngestJoin (msgpack)
+	ingestJoins subspace.Subspace
+	// The PDU targets queued and their event bytes, kept with atomic adds
+	//
+	// key: (RoomID, "pdus" | "bytes")
+	// value: little-endian int64
+	ingestQueues subspace.Subspace
+
+	// BabbleBot's direct message room with each local user
+	//
+	// key: UserID
+	// value: RoomID
+	botRooms subspace.Subspace
+
 	// Per-look lock used to serialize per-room DB writes, this is an optional optimization since
 	// FDB will enforce serialization at the DB level.
 	roomLocks *exsync.Map[id.RoomID, *sync.Mutex]
-	// Serializes this process's remote joins to a room, see lockJoin
-	joinLocks *exsync.Map[id.RoomID, chan struct{}]
 }
 
 func NewRoomsDatabase(
@@ -137,8 +165,13 @@ func NewRoomsDatabase(
 		eventTransactions:   roomsDir.Sub("etx"),
 		eventTransactionIDs: roomsDir.Sub("eti"),
 
+		ingestJobs:    roomsDir.Sub("ijb"),
+		ingestTargets: roomsDir.Sub("ijt"),
+		ingestJoins:   roomsDir.Sub("iju"),
+		ingestQueues:  roomsDir.Sub("ijq"),
+		botRooms:      roomsDir.Sub("bot"),
+
 		roomLocks: exsync.NewMap[id.RoomID, *sync.Mutex](),
-		joinLocks: exsync.NewMap[id.RoomID, chan struct{}](),
 	}
 }
 
@@ -157,18 +190,6 @@ func (r *RoomsDatabase) lockRoom(roomID id.RoomID) (unlock func()) {
 	lock, _ := r.roomLocks.GetOrSet(roomID, &sync.Mutex{})
 	lock.Lock()
 	return lock.Unlock
-}
-
-// lockJoin serializes this process's remote joins to a room until the returned func is called, or
-// fails once ctx ends while it waits.
-func (r *RoomsDatabase) lockJoin(ctx context.Context, roomID id.RoomID) (unlock func(), err error) {
-	lock, _ := r.joinLocks.GetOrSet(roomID, make(chan struct{}, 1))
-	select {
-	case lock <- struct{}{}:
-		return func() { <-lock }, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("waiting for another join to the room: %w", ctx.Err())
-	}
 }
 
 func (r *RoomsDatabase) GetTimeForVersion(ctx context.Context, version tuple.Versionstamp) (*time.Time, error) {

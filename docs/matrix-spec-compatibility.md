@@ -57,3 +57,23 @@ Not implemented yet.
 ## Device last_seen and last_seen_ip aren't populated
 
 Not implemented yet.
+
+## Room Versions
+
+Babbleserv creates, joins and takes invites to rooms of versions 3 to 12, and of `org.matrix.msc4242.12` once `rooms.unstableStateDAGs` is set, which capabilities then list as unstable. gomatrixserverlib implements other versions, such as pseudo IDs (MSC4014), whose events this server can neither build nor verify: a `make_join` or `make_knock` template of one answers the client `M_INCOMPATIBLE_ROOM_VERSION`, a federated invite to one is refused with it, and `make_knock` offers only the versions above.
+
+From v11 the redaction algorithm keeps `content.third_party_invite.signed` of a member event, as the spec and Synapse do, where gomatrixserverlib's rules drop it (`types/redaction.go`, registered over its v11, v12 and state DAG versions). Event IDs, hashes and signatures of such events match other servers' since, and differ from those this server computed before.
+
+## State DAGs (MSC4242)
+
+Unstable support for [MSC4242](https://github.com/matrix-org/matrix-spec-proposals/pull/4242) rooms (`org.matrix.msc4242.12`), off unless `rooms.unstableStateDAGs` is set. Deliberate gaps:
+
+- No faster joins (`omit_members`, `partial_state_event_ids`): a join fetches and replays the whole state DAG, and BabbleBot tells the user meanwhile (below).
+- Received events citing more than 20 `prev_state_events` are dropped, as upstream Synapse drops them; the MSC states the cap under security considerations only.
+- `/send` answers 200 for a PDU before it knows the PDU connects to the create event, where the MSC says a server SHOULD reject it: the room's ingest job fills the gap afterwards, as Synapse processes missing events asynchronously.
+- A local out-of-band rescind of an invite or knock cites the membership it ends only while the resolution that citation brings about keeps current state; otherwise it is sent citing the state extremities alone, which the target's server may refuse. The MSC requires the citation, which can roll back current state everywhere.
+- Out-of-band knock rejections are never taken, as in Synapse, and restricted joins are unsupported: a template carrying `join_authorised_via_users_server` is refused with a 403.
+
+## Remote Joins and BabbleBot
+
+`/join` to a room this server is not in stays blocking, but runs in the room's ingest job: a client retrying it after its own timeout attaches to the pending join rather than making another. Once a join has been pending for `babbleBot.joinNoticeAfter` (60 seconds), BabbleBot, a server-owned local user (`babbleBot.localpart`, default `babblebot`), sends the user an `m.notice` in a direct message room with them saying the join is under way, and follows up when it publishes or fails. It is not the spec's server notices room (`m.server_notice`), which babbleserv does not implement.

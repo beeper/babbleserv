@@ -126,7 +126,7 @@ func (c *ClientRoutes) prepareAndSendInviteForRemoteUser(
 	// Now that we've prepared, other HS signed and we verified the event we  can send it. We send
 	// it as if it's a federated event which triggers all the authorization checks, accounting for
 	// any state changes in the room during the signing process above.
-	results, err := c.db.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, nil)
+	results, err := c.db.SendFederatedEvents(backgroundCtx, roomID, []*types.Event{ev}, nil, rooms.SendFederatedEventsOptions{})
 	if err != nil {
 		return nil, nil, err
 	}

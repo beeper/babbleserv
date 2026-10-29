@@ -2,17 +2,18 @@ package client
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
-	"time"
 
+	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/rs/zerolog/hlog"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -31,22 +32,38 @@ func makeMembershipContent(membership event.Membership, reason string) map[strin
 	return content
 }
 
-func getOtherServers(r *http.Request, roomID id.RoomID) []string {
-	// User provided ?server_name query
-	otherServers := r.URL.Query()["server_name"]
-
-	// TODO: don't blindly use roomID server here - but use what? Alias?
-	// TODO: use invite sender!
-	roomIDBits := strings.SplitN(roomID.String(), ":", 2)
-	otherServers = append(otherServers, roomIDBits[len(roomIDBits)-1])
+// As Synapse does: ?via, ?server_name which via replaced in spec 1.12, the alias lookup's servers,
+// then the room ID's domain, which v12 room IDs lack
+func getOtherServers(r *http.Request, roomID id.RoomID, aliasServers []string) []string {
+	query := r.URL.Query()
+	otherServers := slices.Concat(query["via"], query["server_name"], aliasServers)
+	if _, server, found := strings.Cut(roomID.String(), ":"); found {
+		otherServers = append(otherServers, server)
+	}
 	return otherServers
-
 }
 
-func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) id.RoomID {
+func (c *ClientRoutes) remoteMembershipServers(r *http.Request, roomID id.RoomID, userID id.UserID, aliasServers []string) ([]string, error) {
+	otherServers := getOtherServers(r, roomID, aliasServers)
+	if mtup, ev, err := c.db.Rooms.GetCurrentMembershipAndEvent(r.Context(), userID, roomID); err != nil {
+		return nil, err
+	} else if mtup != nil && mtup.Membership == event.MembershipInvite && ev != nil {
+		otherServers = append(otherServers, ev.Sender.Homeserver())
+	}
+	servers := make([]string, 0, len(otherServers))
+	for _, server := range otherServers {
+		if server != "" && server != c.config.ServerName && !slices.Contains(servers, server) {
+			servers = append(servers, server)
+		}
+	}
+	return servers, nil
+}
+
+// getRoomIDFromRequest also returns the servers a room alias lookup gave
+func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) (id.RoomID, []string) {
 	roomID := util.RoomIDFromRequestURLParam(r, param)
 	if strings.HasPrefix(roomID.String(), "!") {
-		return roomID
+		return roomID, nil
 	}
 
 	roomAlias := util.RoomAliasFromRequestURLParam(r, param)
@@ -59,10 +76,14 @@ func (c *ClientRoutes) getRoomIDFromRequest(r *http.Request, param string) id.Ro
 		string(roomAlias),
 	)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 
-	return id.RoomID(aliasResp.RoomID)
+	servers := []string{otherServer}
+	for _, server := range aliasResp.Servers {
+		servers = append(servers, string(server))
+	}
+	return id.RoomID(aliasResp.RoomID), servers
 }
 
 type federatedMakeResp struct {
@@ -70,12 +91,17 @@ type federatedMakeResp struct {
 	RoomVersion gomatrixserverlib.RoomVersion
 }
 
-// A server answering make_* with a template this server cannot sign
-var errInvalidMembershipTemplate = errors.New("invalid membership event template")
+var (
+	// A server answering make_* with a template this server cannot sign
+	errInvalidMembershipTemplate = errors.New("invalid membership event template")
+	errIncompatibleRoomVersion   = errors.New("room version not supported")
+	errMakeRequestFailed         = errors.New("make request failed")
+	errNoKnownServers            = errors.New("no known servers")
+)
 
 // makeFederatedEvent signs the template of the first of the other servers giving one it can. When
-// none does, the error of the last server whose request failed is returned, or else an
-// errInvalidMembershipTemplate.
+// none does, an unsupported room version or restricted join is reported ahead of a failed request,
+// then an invalid template.
 func (c *ClientRoutes) makeFederatedEvent(
 	r *http.Request,
 	roomID id.RoomID,
@@ -85,7 +111,7 @@ func (c *ClientRoutes) makeFederatedEvent(
 ) (*types.Event, string, error) {
 	log := hlog.FromRequest(r)
 
-	var requestErr, templateErr error
+	var versionErr, unsupportedErr, requestErr, templateErr error
 	for _, otherServer := range otherServers {
 		serverLog := log.With().
 			Stringer("room_id", roomID).
@@ -96,7 +122,11 @@ func (c *ClientRoutes) makeFederatedEvent(
 		resp, err := getMakeResp(otherServer)
 		if err != nil {
 			serverLog.Warn().Err(err).Msg("Failed to make federated event via server")
-			requestErr = err
+			requestErr = fmt.Errorf("%w via %s: %w", errMakeRequestFailed, otherServer, err)
+			continue
+		} else if !c.config.JoinsRoomVersion(string(resp.RoomVersion)) {
+			serverLog.Warn().Str("room_version", string(resp.RoomVersion)).Msg("Server gave a template of a room version not supported")
+			versionErr = fmt.Errorf("%w: %s", errIncompatibleRoomVersion, resp.RoomVersion)
 			continue
 		}
 		ev, err := membershipTemplateEvent(middleware.GetRequestUserID(r), roomID, membership, resp)
@@ -107,45 +137,66 @@ func (c *ClientRoutes) makeFederatedEvent(
 		if err != nil {
 			serverLog.Warn().Err(err).Msg("Server gave an invalid membership event template")
 			templateErr = fmt.Errorf("%w from %s: %w", errInvalidMembershipTemplate, otherServer, err)
+			if errors.Is(err, util.ErrRestrictedJoinUnsupported) {
+				unsupportedErr = templateErr
+			}
 			continue
 		}
 		serverLog.Debug().Msg("Making federated event via server")
 		return ev, otherServer, nil
 	}
-	return nil, "", cmp.Or(requestErr, templateErr)
+	return nil, "", cmp.Or(versionErr, unsupportedErr, requestErr, templateErr, errNoKnownServers)
 }
 
-// membershipTemplateEvent holds a make_* template to what was asked for and sets the membership
-// asked for, as Synapse does
 func membershipTemplateEvent(
 	userID id.UserID,
 	roomID id.RoomID,
 	membership event.Membership,
 	resp federatedMakeResp,
 ) (*types.Event, error) {
-	if _, err := gomatrixserverlib.GetRoomVersion(resp.RoomVersion); err != nil {
-		return nil, err
-	}
-	ev, err := types.EventFromProtoEvent(resp.Event)
-	if err != nil {
-		return nil, err
-	} else if ev.Type != event.StateMember || ev.StateKey == nil || *ev.StateKey != userID.String() ||
-		ev.Sender != userID || ev.RoomID != roomID {
-		return nil, fmt.Errorf("not a member event of %s in %s", userID, roomID)
-	}
-	if !gjson.ParseBytes(ev.Content).IsObject() {
-		return nil, errors.New("content is not an object")
-	} else if ev.Content, err = sjson.SetBytes(ev.Content, "membership", membership); err != nil {
-		return nil, err
-	}
-	ev.Timestamp = time.Now().UTC().UnixMilli()
-	ev.RoomVersion = string(resp.RoomVersion)
-	return ev, nil
+	return util.MembershipTemplateEvent(userID, roomID, membership, resp.Event, resp.RoomVersion)
 }
 
-// As Synapse does, a server failing to give a usable template is a bad gateway
+func (c *ClientRoutes) joinedRoomVersions() []gomatrixserverlib.RoomVersion {
+	var versions []gomatrixserverlib.RoomVersion
+	for version := range gomatrixserverlib.RoomVersions() {
+		if c.config.JoinsRoomVersion(string(version)) {
+			versions = append(versions, version)
+		}
+	}
+	slices.Sort(versions)
+	return versions
+}
+
+// As Synapse does, a server's refusal is passed on, with the room version of an incompatible one, and
+// a server failing to give a usable template is a bad gateway
 func responseMakeFederatedEventError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, errInvalidMembershipTemplate) {
+	var httpErr gomatrix.HTTPError
+	if errors.As(err, &httpErr) {
+		var respErr mautrix.RespError
+		if httpErr.Code >= 400 && httpErr.Code < 500 && json.Unmarshal(httpErr.Contents, &respErr) == nil && respErr.ErrCode != "" {
+			body := map[string]any{"errcode": respErr.ErrCode, "error": respErr.Err}
+			if roomVersion, ok := respErr.ExtraData["room_version"].(string); ok && respErr.ErrCode == mautrix.MIncompatibleRoomVersion.ErrCode {
+				body["room_version"] = roomVersion
+			}
+			util.ResponseJSON(w, r, httpErr.Code, body)
+			return
+		}
+		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
+			"errcode": util.MUnknown.ErrCode,
+			"error":   err.Error(),
+		})
+		return
+	} else if errors.Is(err, errIncompatibleRoomVersion) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MIncompatibleRoomVersion, err.Error())
+		return
+	} else if errors.Is(err, errNoKnownServers) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "No known servers")
+		return
+	} else if errors.Is(err, util.ErrRestrictedJoinUnsupported) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MForbidden, util.ErrRestrictedJoinUnsupported.Error())
+		return
+	} else if errors.Is(err, errInvalidMembershipTemplate) || errors.Is(err, errMakeRequestFailed) {
 		util.ResponseJSON(w, r, http.StatusBadGateway, map[string]string{
 			"errcode": util.MUnknown.ErrCode,
 			"error":   err.Error(),

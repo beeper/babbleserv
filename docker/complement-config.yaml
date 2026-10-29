@@ -34,6 +34,7 @@ notifier:
 rooms:
   enabled: true
   defaultVersion: 11
+  unstableStateDAGs: true
   # Small, so that Complement stages over several transactions and runs an artifact job for every
   # resolution with conflicts.
   stateBudget:
@@ -41,6 +42,9 @@ rooms:
     inlineResolutionCandidates: 1
     # Every resolution with conflicts reads its auth difference in a job
     inlineResolutionStateTuples: 1
+# Long enough that ordinary joins never get a notice, short enough for a test delaying send_join
+babbleBot:
+  joinNoticeAfter: 10s
 accounts:
   enabled: true
 transient:

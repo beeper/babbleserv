@@ -39,6 +39,8 @@ type remoteJoin struct {
 	// The state before the join once staged, and the changes to it from the room's current state
 	boundary types.StateHash
 	diff     *boundaryChanges
+	// The state DAG tips the resident served with the join, see stateDAGJoinTips
+	tips []id.EventID
 	// Another join got this server into the room, so the join is sent as any federated event
 	asMember bool
 	// Stored already, so the send reports the stored outcome, see txnStoredJoinResult
@@ -52,15 +54,108 @@ type boundaryChanges struct {
 	changes     []types.StateChange
 }
 
-// remoteJoinIn returns the join of a batch that is a local user's join with a given before-state,
-// nil for any other batch
-func (r *RoomsDatabase) remoteJoinIn(evs []*types.Event, given *GivenStates) *remoteJoin {
-	if given == nil || len(evs) != 1 || evs[0].StateKey == nil || !isJoinEvent(evs[0]) {
-		return nil
-	} else if stateIDs, found := given.BeforeEvents[evs[0].ID]; found && r.isLocalUser(id.UserID(*evs[0].StateKey)) {
-		return &remoteJoin{ev: evs[0], stateIDs: stateIDs}
+// RemoteJoin is a local user's join to a room this server is not in, run by the room's ingest job in
+// phases. Publish runs it through, redoing any earlier work a change to the room invalidated, and
+// sends it as a member's should another join get this server into the room first.
+type RemoteJoin struct {
+	sender *remoteJoinSender
+	log    zerolog.Logger
+}
+
+// NewRemoteJoin takes the send_join response's state and auth chain events in any order
+func (r *RoomsDatabase) NewRemoteJoin(
+	ctx context.Context,
+	joinEv *types.Event,
+	stateIDs []id.EventID,
+	evs []*types.Event,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
+) (*RemoteJoin, error) {
+	return r.newRemoteJoin(ctx, &remoteJoin{ev: joinEv, stateIDs: stateIDs}, evs, pushContext{rules: userPushRules, rooms: userRoomContext})
+}
+
+// NewStateDAGRemoteJoin prepares a join to a state DAG room (MSC4242) once the job replayed the
+// served state DAG. Its publish makes the join and the tips it does not cite the state extremities.
+func (r *RoomsDatabase) NewStateDAGRemoteJoin(
+	ctx context.Context,
+	joinEv *types.Event,
+	tips []id.EventID,
+	userPushRules types.UserPushRulesMap,
+	userRoomContext types.UserRoomContextMap,
+) (*RemoteJoin, error) {
+	if !joinEv.StateDAGs() {
+		return nil, fmt.Errorf("event %s is not of a state DAG room", joinEv.ID)
 	}
-	return nil
+	return r.newRemoteJoin(ctx, &remoteJoin{ev: joinEv, tips: tips}, nil, pushContext{rules: userPushRules, rooms: userRoomContext})
+}
+
+func (r *RoomsDatabase) newRemoteJoin(ctx context.Context, join *remoteJoin, evs []*types.Event, push pushContext) (*RemoteJoin, error) {
+	joinEv := join.ev
+	if joinEv.StateKey == nil || !isJoinEvent(joinEv) || !r.isLocalUser(id.UserID(*joinEv.StateKey)) {
+		return nil, fmt.Errorf("event %s is not a local user's join", joinEv.ID)
+	}
+	roomID := joinEv.RoomID
+	p := &federatedEventSender{
+		eventSender: r.newEventSender(roomID, push),
+		evs:         []*types.Event{joinEv},
+		fetched:     evs,
+		join:        join,
+		options: SendFederatedEventsOptions{
+			Targets: map[id.EventID]types.IngestTargetKind{joinEv.ID: types.IngestTargetJoin},
+		},
+	}
+	if !joinEv.StateDAGs() {
+		p.given = givenStates{beforeEvents: map[id.EventID][]id.EventID{joinEv.ID: join.stateIDs}}
+	}
+	p.build = p.executePreparationWork
+	log := r.getTxnLogContext(ctx, "RemoteJoin").
+		Stringer("room_id", roomID).
+		Stringer("event_id", joinEv.ID).
+		Logger()
+	return &RemoteJoin{sender: &remoteJoinSender{federatedEventSender: p}, log: log}, nil
+}
+
+// Stage authorizes the join and stages the response events (phase A)
+func (j *RemoteJoin) Stage(ctx context.Context) error {
+	return j.runUntil(ctx, stagingDone)
+}
+
+// BuildState builds the state before the join and its diff from current state (phase B)
+func (j *RemoteJoin) BuildState(ctx context.Context) error {
+	return j.runUntil(ctx, workDone)
+}
+
+// Publish ends the join (phase C). A join stored already reports its stored outcome.
+func (j *RemoteJoin) Publish(ctx context.Context) (*SendEventsResult, error) {
+	return j.sender.send(j.log.WithContext(ctx))
+}
+
+func (j *RemoteJoin) runUntil(ctx context.Context, stopAt func(preparationOutcome) bool) error {
+	s := j.sender
+	s.stopAt = stopAt
+	defer func() { s.stopAt = nil }()
+	_, err := s.run(j.log.WithContext(ctx), s.prepare)
+	if errors.Is(err, errJoinStored) {
+		s.join.stored = true
+		return nil
+	} else if errors.Is(err, errPhaseReached) {
+		return nil
+	}
+	return err
+}
+
+func stagingDone(outcome preparationOutcome) bool {
+	needs, ok := outcome.(needsWork)
+	if !ok {
+		return true
+	}
+	_, staging := needs.work.(stageEventsWork)
+	return !staging
+}
+
+func workDone(outcome preparationOutcome) bool {
+	_, ok := outcome.(needsWork)
+	return !ok
 }
 
 // inJoinMode reports whether a send publishes a remote join that replaces the room's state
@@ -87,21 +182,12 @@ type remoteJoinSender struct {
 }
 
 func (s *remoteJoinSender) send(ctx context.Context) (*SendEventsResult, error) {
-	res, err := s.sendInJoinTurn(ctx)
+	res, err := s.run(ctx, s.prepare)
 	if errors.Is(err, errJoinStored) {
 		s.join.stored = true
 		return s.run(ctx, s.prepare)
 	}
 	return res, err
-}
-
-func (s *remoteJoinSender) sendInJoinTurn(ctx context.Context) (*SendEventsResult, error) {
-	unlock, err := s.r.lockJoin(ctx, s.roomID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	return s.run(ctx, s.prepare)
 }
 
 func (s *remoteJoinSender) prepare(ctx context.Context) (preparationOutcome, error) {
@@ -122,7 +208,16 @@ func (s *remoteJoinSender) prepare(ctx context.Context) (preparationOutcome, err
 }
 
 func (p *remoteJoinSender) prepareJoin(ctx context.Context) (preparationOutcome, error) {
-	if p.staging == nil || !p.staging.staged {
+	if p.join.ev.StateDAGs() {
+		// The room's job already staged and replayed the state DAG the join cites
+		room, err := util.DoReadTransaction(ctx, p.r.db, func(txn fdb.ReadTransaction) (*types.Room, error) {
+			return p.txnCheckRemoteJoinRoom(txn, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		p.join.room = room
+	} else if p.staging == nil || !p.staging.staged {
 		staging, err := p.checkRemoteJoin(ctx)
 		if err != nil {
 			return nil, err
@@ -219,6 +314,12 @@ func (s *remoteJoinSender) txnCheckRemoteJoinRoom(
 				break
 			}
 		}
+		// A state DAG room's ID names its create event, which is staged
+		if joinEv.StateDAGs() {
+			if createEv := s.r.events.TxnGetEvent(txn, joinEv.ImplicitCreateEventID()); createEv != nil {
+				roomCreate = []*types.PartialEvent{&createEv.PartialEvent}
+			}
+		}
 		room, err = s.r.newRoomFromEvents(s.roomID, roomCreate)
 	} else if err == nil && isServerJoined(room) {
 		return nil, errServerJoined
@@ -257,7 +358,7 @@ func (s *remoteJoinSender) checkRemoteJoinAuth(
 	responseEvs []*types.Event,
 ) ([]*types.Event, map[id.EventID]struct{}, error) {
 	// The join goes first so it is the copy checked when the response repeats it
-	evs := s.sortEventsTopologically(slices.Concat([]*types.Event{joinEv}, responseEvs))
+	evs := SortEventsTopologically(slices.Concat([]*types.Event{joinEv}, responseEvs))
 	dropped, rejectedAuth, err := s.checkOwnAuthEvents(ctx, reads, evs, joinEv)
 	if err != nil {
 		return nil, nil, err

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -28,7 +29,7 @@ type PartialEvent struct {
 	Sender    id.UserID       `msgpack:"sdr" json:"sender,omitempty"`
 	StateKey  *string         `msgpack:"sky" json:"state_key,omitzero"`
 	Content   json.RawMessage `msgpack:"cnt" json:"content"`
-	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v10
+	Redacts   id.EventID      `msgpack:"rds" json:"redacts,omitempty"` // room <v11
 	Timestamp int64           `msgpack:"ots" json:"origin_server_ts,omitzero"`
 
 	// event.Type doesn't implement msgpack marshalling, so we use TypeStr
@@ -56,6 +57,8 @@ type Event struct {
 	SoftFailed bool `msgpack:"sfd" json:"-"`
 	Outlier    bool `msgpack:"out" json:"-"`
 	Rejected   bool `msgpack:"rej" json:"-"`
+	// Given state by an ingest job's replay but not published yet, so no published event may cite it
+	Unpublished bool `msgpack:"unp,omitempty" json:"-"`
 	// Internal indicator of whether the event has been redacted - needed? (content hash)
 	Redacted bool `msgpack:"red" json:"-"`
 
@@ -70,9 +73,12 @@ type Event struct {
 	AfterState  StateHash `msgpack:"ast" json:"-"`
 
 	// Only here for backwards compat ???
-	PrevState []id.EventID `msgpack:"pst" json:"prev_state,omitzero"`
+	PrevState []id.EventID `msgpack:"pst" json:"-"`
+	// The state DAG extremities the event cites in a state DAG room (MSC4242), empty for the create
+	PrevStateEventIDs []id.EventID `msgpack:"pse" json:"-"`
 
 	PrevEventIDs []id.EventID `msgpack:"pid" json:"prev_events"`
+	// In a state DAG room these are calculated from the state before the event, and never serialized
 	AuthEventIDs []id.EventID `msgpack:"aid" json:"auth_events"`
 
 	Hashes     map[string]string            `msgpack:"hsh" json:"hashes"`
@@ -85,9 +91,27 @@ type Event struct {
 	ClientTransactionID string `msgpack:"-" json:"-"`
 	IsForClientAPI      bool   `msgpack:"-" json:"-"`
 	IsDuplicate         bool   `msgpack:"-" json:"-"`
+
+	authEventsMember bool
 }
 
 type EventExtra map[string]jsontext.Value
+
+// takeEventIDs leaves any value but a list of strings in the extra members, to be sent on as received
+func (e EventExtra) takeEventIDs(name string) []id.EventID {
+	var values []jsontext.Value
+	if value, found := e[name]; !found || jsonv2.Unmarshal(value, &values) != nil || values == nil {
+		return nil
+	}
+	eventIDs := make([]id.EventID, len(values))
+	for i, value := range values {
+		if value.Kind() != '"' || jsonv2.Unmarshal(value, &eventIDs[i]) != nil {
+			return nil
+		}
+	}
+	delete(e, name)
+	return eventIDs
+}
 
 // Members are kept as received but only their canonical form is size checked, so they're compacted
 // when stored
@@ -185,6 +209,13 @@ func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) (*Event, error) {
 	if err != nil {
 		return nil, err
 	}
+	var prevStateEventIDs []id.EventID
+	if protoEv.PrevStateEvents != nil {
+		prevStateEventIDs = make([]id.EventID, len(*protoEv.PrevStateEvents))
+		for i, eventID := range *protoEv.PrevStateEvents {
+			prevStateEventIDs[i] = id.EventID(eventID)
+		}
+	}
 	return &Event{
 		PartialEvent: PartialEvent{
 			RoomID:   id.RoomID(protoEv.RoomID),
@@ -195,9 +226,10 @@ func EventFromProtoEvent(protoEv gomatrixserverlib.ProtoEvent) (*Event, error) {
 			Content:  []byte(protoEv.Content),
 			Redacts:  id.EventID(protoEv.Redacts),
 		},
-		Depth:        protoEv.Depth,
-		AuthEventIDs: authEventIDs,
-		PrevEventIDs: prevEventIDs,
+		Depth:             protoEv.Depth,
+		AuthEventIDs:      authEventIDs,
+		PrevEventIDs:      prevEventIDs,
+		PrevStateEventIDs: prevStateEventIDs,
 	}, nil
 }
 
@@ -251,6 +283,7 @@ func (ev *Event) ToMsgpack() []byte {
 func (ev Event) MarshalJSON() ([]byte, error) {
 	roomSpec, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
 	domainlessCreate := ev.Type == event.StateCreate && err == nil && roomSpec.DomainlessRoomIDs()
+	stateDAGs := err == nil && roomSpec.StateDAGs()
 	if ev.IsForClientAPI {
 		// Client API removes room_id, adds event_id
 		b, err := jsonv2.Marshal(clientEvent{ev.PartialEvent, ev.Extra}, jsonv2.Deterministic(true))
@@ -258,6 +291,8 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
+		b = exerrors.Must(sjson.DeleteBytes(b, "prev_state"))
+		b = exerrors.Must(sjson.DeleteBytes(b, "prev_state_events"))
 		// Clients need the derived room ID even though v12 create PDUs omit it.
 		if domainlessCreate {
 			b = exerrors.Must(sjson.SetBytes(b, "room_id", ev.RoomID))
@@ -275,8 +310,20 @@ func (ev Event) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ev.PrevState != nil {
+		b = exerrors.Must(sjson.SetBytes(b, "prev_state", ev.PrevState))
+	}
+	if stateDAGs && ev.PrevStateEventIDs == nil {
+		ev.PrevStateEventIDs = []id.EventID{}
+	}
+	if ev.PrevStateEventIDs != nil {
+		b = exerrors.Must(sjson.SetBytes(b, "prev_state_events", ev.PrevStateEventIDs))
+	}
 	if domainlessCreate {
 		b = exerrors.Must(sjson.DeleteBytes(b, "room_id"))
+	}
+	if stateDAGs {
+		b = exerrors.Must(sjson.DeleteBytes(b, "auth_events"))
 	}
 	// Strip unsigned from any S2S API calls
 	b = exerrors.Must(sjson.DeleteBytes(b, "unsigned"))
@@ -295,8 +342,11 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 	} else if err := ev.checkExtra(); err != nil {
 		return err
 	}
+	ev.PrevState = ev.Extra.takeEventIDs("prev_state")
+	ev.PrevStateEventIDs = ev.Extra.takeEventIDs("prev_state_events")
+	ev.authEventsMember = gjson.GetBytes(b, "auth_events").Exists()
 	if ev.Type != event.StateCreate {
-		return nil
+		return ev.CheckStateDAGFormat()
 	}
 	roomVersion := ev.RoomVersion
 	if roomVersion == "" {
@@ -318,6 +368,27 @@ func (ev *Event) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	ev.RoomID = id.RoomID(pdu.RoomID().String())
+	return ev.CheckStateDAGFormat()
+}
+
+// Synapse drops state DAG events citing more prev_events or prev_state_events, so taking one diverges
+const MaxStateDAGPrevEvents = 20
+
+// CheckStateDAGFormat refuses a state DAG event (MSC4242) parsed with auth_events, which would be
+// taken for its calculated ones, without a prev_state_events list, or citing too many events.
+func (ev *Event) CheckStateDAGFormat() error {
+	switch {
+	case !ev.StateDAGs():
+		return nil
+	case ev.authEventsMember:
+		return errors.New("state DAG event has auth_events")
+	case ev.PrevStateEventIDs == nil:
+		return errors.New("state DAG event has no prev_state_events list")
+	case len(ev.PrevEventIDs) > MaxStateDAGPrevEvents:
+		return fmt.Errorf("state DAG event cites %d prev_events, over %d", len(ev.PrevEventIDs), MaxStateDAGPrevEvents)
+	case len(ev.PrevStateEventIDs) > MaxStateDAGPrevEvents:
+		return fmt.Errorf("state DAG event cites %d prev_state_events, over %d", len(ev.PrevStateEventIDs), MaxStateDAGPrevEvents)
+	}
 	return nil
 }
 
@@ -327,7 +398,8 @@ var droppedMemberNames = []string{"age_ts", "outlier", "destinations"}
 // The members gomatrixserverlib reads using jsonv1, which it matches regardless of case
 var caseFoldedMemberNames = []string{
 	"type", "room_id", "sender", "state_key", "content", "redacts", "unsigned", "hashes", "signatures",
-	"depth", "prev_events", "prev_state", "auth_events", "origin", "origin_server_ts", "membership",
+	"depth", "prev_events", "prev_state", "prev_state_events", "auth_events", "origin", "origin_server_ts",
+	"membership",
 }
 
 // checkExtra drops the members Synapse leaves out of the content hash, and refuses those that would
@@ -399,6 +471,11 @@ func (ev *Event) GetRoomVersion() gomatrixserverlib.RoomVersion {
 // Create EventPDU instance for this event, note pointer so PDU can write
 func (ev *Event) PDU() EventPDU {
 	return EventPDU{ev, ev.GetRoomVersion()}
+}
+
+func (ev *Event) StateDAGs() bool {
+	roomSpec, err := gomatrixserverlib.GetRoomVersion(ev.GetRoomVersion())
+	return err == nil && roomSpec.StateDAGs()
 }
 
 func (ev *Event) MustGetRoomSpec() gomatrixserverlib.IRoomVersion {
@@ -483,13 +560,25 @@ func (ev *Event) DomainlessRoomID() id.RoomID {
 	return id.RoomID("!" + ev.ID[1:])
 }
 
-// AuthDependencyIDs are the event's auth events, preceded by the create event that it cites
-// implicitly in a room with a domainless room ID.
+// AuthDependencyIDs are the event's auth events, or prev state events in a state DAG room, preceded
+// by the create event that it cites implicitly in a room with a domainless room ID.
 func (ev *Event) AuthDependencyIDs() []id.EventID {
-	if createID := ev.ImplicitCreateEventID(); createID != "" && ev.Type != event.StateCreate {
-		return append([]id.EventID{createID}, ev.AuthEventIDs...)
+	if ev.StateDAGs() {
+		return ev.withImplicitCreate(ev.PrevStateEventIDs)
 	}
-	return ev.AuthEventIDs
+	return ev.AuthEventIDsWithCreate()
+}
+
+// AuthEventIDsWithCreate are where the event's auth chain starts, whatever the room version
+func (ev *Event) AuthEventIDsWithCreate() []id.EventID {
+	return ev.withImplicitCreate(ev.AuthEventIDs)
+}
+
+func (ev *Event) withImplicitCreate(eventIDs []id.EventID) []id.EventID {
+	if createID := ev.ImplicitCreateEventID(); createID != "" && ev.Type != event.StateCreate && !slices.Contains(eventIDs, createID) {
+		return append([]id.EventID{createID}, eventIDs...)
+	}
+	return eventIDs
 }
 
 // HasStateIn reports whether the event, which may be nil, is in the room with known state contexts.
@@ -498,14 +587,14 @@ func (ev *Event) HasStateIn(roomID id.RoomID) bool {
 	return ev != nil && !ev.Outlier && ev.RoomID == roomID && !ev.AfterState.IsZero()
 }
 
-// ResetOutcome clears what authorizing the event decided: its rejection, soft failure and state.
+// ResetOutcome clears the event's rejection, soft failure, state and pending publication.
 func (ev *Event) ResetOutcome() {
-	ev.Rejected, ev.SoftFailed = false, false
+	ev.Rejected, ev.SoftFailed, ev.Unpublished = false, false, false
 	ev.BeforeState, ev.AfterState = StateHash{}, StateHash{}
 }
 
 // CopyOutcome gives the event what authorizing another copy of it decided.
 func (ev *Event) CopyOutcome(from *Event) {
-	ev.Rejected, ev.SoftFailed = from.Rejected, from.SoftFailed
+	ev.Rejected, ev.SoftFailed, ev.Unpublished = from.Rejected, from.SoftFailed, from.Unpublished
 	ev.BeforeState, ev.AfterState = from.BeforeState, from.AfterState
 }

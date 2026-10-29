@@ -15,7 +15,7 @@ import (
 
 // Returns those of the events not stored as room events, which includes outliers
 func (r *RoomsDatabase) GetUnstoredEventIDs(ctx context.Context, eventIDs []id.EventID) ([]id.EventID, error) {
-	stored, err := r.storedEventIDs(ctx, eventIDs)
+	stored, err := r.GetStoredEventIDs(ctx, eventIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -25,8 +25,8 @@ func (r *RoomsDatabase) GetUnstoredEventIDs(ctx context.Context, eventIDs []id.E
 	}), nil
 }
 
-// storedEventIDs returns a map of event IDs already stored
-func (r *RoomsDatabase) storedEventIDs(ctx context.Context, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+// GetStoredEventIDs returns those of the events stored as room events, staged ones included
+func (r *RoomsDatabase) GetStoredEventIDs(ctx context.Context, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
 	stored := make(map[id.EventID]struct{})
 	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
 		chunkStored, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (map[id.EventID]struct{}, error) {
@@ -38,6 +38,29 @@ func (r *RoomsDatabase) storedEventIDs(ctx context.Context, eventIDs []id.EventI
 		maps.Copy(stored, chunkStored)
 	}
 	return stored, nil
+}
+
+// GetPrevStateEventIDsInPlace returns the events a prev_state_events citation can be judged by:
+// published here with state contexts, or stored in another room, which MSC4242 section 2 rejects
+func (r *RoomsDatabase) GetPrevStateEventIDsInPlace(ctx context.Context, roomID id.RoomID, eventIDs []id.EventID) (map[id.EventID]struct{}, error) {
+	withState := make(map[id.EventID]struct{})
+	for chunk := range slices.Chunk(eventIDs, storedCheckChunk) {
+		if _, err := util.DoReadTransaction(ctx, r.db, func(txn fdb.ReadTransaction) (types.Nil, error) {
+			eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+			eventsProvider.WillGet(chunk...)
+			for _, eventID := range chunk {
+				if ev, err := eventsProvider.Get(eventID); err != nil {
+					return nil, err
+				} else if ev.HasStateIn(roomID) && !ev.Unpublished || ev != nil && ev.RoomID != roomID {
+					withState[eventID] = struct{}{}
+				}
+			}
+			return nil, nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return withState, nil
 }
 
 // MissingEventsRequest is what a get_missing_events request for a federated batch names
@@ -175,6 +198,19 @@ func (r *RoomsDatabase) txnGetStoredEventIDs(txn fdb.ReadTransaction, eventIDs [
 		}
 	}
 	return stored, nil
+}
+
+func (r *RoomsDatabase) txnAnyHasState(ctx context.Context, txn fdb.ReadTransaction, roomID id.RoomID, eventIDs []id.EventID) (bool, error) {
+	eventsProvider := r.events.NewTxnEventsProvider(ctx, txn)
+	eventsProvider.WillGet(eventIDs...)
+	for _, eventID := range eventIDs {
+		if ev, err := eventsProvider.Get(eventID); err != nil {
+			return false, err
+		} else if ev.HasStateIn(roomID) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *RoomsDatabase) GetEvent(ctx context.Context, eventID id.EventID) (*types.Event, error) {

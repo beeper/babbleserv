@@ -166,6 +166,9 @@ func VerifyRemoteEvent(ctx context.Context, ev *types.Event, keyStore *KeyStore)
 	return ev, nil, nil
 }
 
+// Events verified between progress reports, on top of the report each key fetch makes
+const verifyProgressEvents = 100
+
 // Parses and verifies events fetched from another server, skipping those that cannot be parsed or
 // fail verification and any already seen. Redacted events are kept, redacted.
 func VerifyRemoteEvents[S ~[]E, E ~[]byte](
@@ -175,13 +178,34 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 	keyStore *KeyStore,
 	seenIDs map[id.EventID]struct{},
 ) ([]*types.Event, error) {
-	log := zerolog.Ctx(ctx)
+	return VerifyParsedRemoteEvents(ctx, ParseRemoteEvents(ctx, raws, roomVersion), keyStore, seenIDs)
+}
+
+func ParseRemoteEvents[S ~[]E, E ~[]byte](ctx context.Context, raws S, roomVersion string) []*types.Event {
 	evs := make([]*types.Event, 0, len(raws))
 	for _, b := range raws {
 		remoteEv := &types.Event{RoomVersion: roomVersion}
 		if err := json.Unmarshal(b, remoteEv); err != nil {
-			log.Warn().Err(err).Msg("Skipping remote event that cannot be parsed")
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Skipping remote event that cannot be parsed")
 			continue
+		}
+		evs = append(evs, remoteEv)
+	}
+	return evs
+}
+
+// VerifyParsedRemoteEvents is VerifyRemoteEvents for parsed events; one given an ID is verified to have it
+func VerifyParsedRemoteEvents(
+	ctx context.Context,
+	remoteEvs []*types.Event,
+	keyStore *KeyStore,
+	seenIDs map[id.EventID]struct{},
+) ([]*types.Event, error) {
+	log := zerolog.Ctx(ctx)
+	evs := make([]*types.Event, 0, len(remoteEvs))
+	for i, remoteEv := range remoteEvs {
+		if i > 0 && i%verifyProgressEvents == 0 {
+			ReportProgress(ctx)
 		}
 		verifiedEv, verifyErr, err := VerifyRemoteEvent(ctx, remoteEv, keyStore)
 		if err != nil {
@@ -207,6 +231,8 @@ func VerifyRemoteEvents[S ~[]E, E ~[]byte](
 
 func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keyStore *KeyStore) (error, error) {
 	if _, err := spec.NewRoomID(ev.RoomID.String()); err != nil {
+		return err, nil
+	} else if err := ev.CheckStateDAGFormat(); err != nil {
 		return err, nil
 	} else if err := CheckEventSize(ev); err != nil {
 		return err, nil
@@ -250,7 +276,10 @@ func verifyEvent(ctx context.Context, ev *types.Event, serverName string, keySto
 		}
 		verifyErr = results[0].Error
 	}
-	if verifyErr != nil {
+	if verifyErr != nil && ctx.Err() != nil {
+		// The caller gave up waiting for the signing keys, which says nothing of the event
+		return nil, verifyErr
+	} else if verifyErr != nil {
 		return verifyErr, nil
 	}
 

@@ -94,6 +94,24 @@ type EventsDirectory struct {
 	// value: empty
 	roomExtremIDs subspace.Subspace
 
+	// The tips of a state DAG room's state DAG (MSC4242), which local events cite in
+	// `prev_state_events` and whose states make up current state. Written only by publication: an
+	// accepted state event replaces the prev state events it cites, other events change nothing.
+	// Past the cap on `prev_state_events`, local events cite those published last.
+	//
+	// key: (RoomID, EventID)
+	// value: Versionstamp the event was published at
+	roomStateExtremIDs subspace.Subspace
+
+	// A state DAG room's state DAG as other servers see it (MSC4242): every accepted state
+	// event, written as it is published, or as a join's replay from outside the room gives it
+	// contexts, the resident having published it. send_join serves the rows before the join's.
+	// Staging never writes it, so a joiner never adopts state no other server has.
+	//
+	// key: (RoomID, Versionstamp)
+	// value: EventID
+	roomStateDAG subspace.Subspace
+
 	// RoomID/related-event-ID/version to (eventID, relType)
 	//
 	// - paginate events relating to this event
@@ -147,6 +165,8 @@ func NewEventsDirectory(logger zerolog.Logger, db fdb.Database, parentDir direct
 		roomVersionToTup:      eventsDir.Sub("rmv"),
 		roomVersionToState:    eventsDir.Sub("rch"),
 		roomExtremIDs:         eventsDir.Sub("rex"),
+		roomStateExtremIDs:    eventsDir.Sub("srx"),
+		roomStateDAG:          eventsDir.Sub("sdg"),
 		byRoomRelation:        eventsDir.Sub("rel"),
 		byRoomReaction:        eventsDir.Sub("rea"),
 		roomThreadVersionToID: eventsDir.Sub("rth"),
@@ -164,11 +184,12 @@ func (e *EventsDirectory) keyForAuthEventIDs(eventID id.EventID) fdb.Key {
 // TxnStoreEventRows writes events stored for the first time and returns the version this transaction
 // gives each: its body, an unfinalized auth header, its version unless it is an outlier, and with
 // indexed its entry in the index of all events. A member event stored before as an outlier keeps its
-// auth header, which an auth graph may have finalized as another event's auth event.
+// auth header, which an auth graph may have finalized as another event's auth event, as does an
+// unpublished event a replay gave state, which is stored published.
 func (e *EventsDirectory) TxnStoreEventRows(txn fdb.Transaction, indexed bool, evs ...*types.Event) map[id.EventID]tuple.Versionstamp {
 	storedHeaders := make(map[id.EventID]fdb.FutureByteSlice)
 	for _, ev := range evs {
-		if ev.Type == event.StateMember {
+		if ev.Type == event.StateMember && !ev.Unpublished {
 			storedHeaders[ev.ID] = txn.Get(e.keyForAuthEventIDs(ev.ID))
 		}
 	}
@@ -176,10 +197,15 @@ func (e *EventsDirectory) TxnStoreEventRows(txn fdb.Transaction, indexed bool, e
 	for i, ev := range evs {
 		version := tuple.IncompleteVersionstamp(uint16(i))
 		versions[ev.ID] = version
-		txn.Set(e.KeyForEventID(ev.ID), ev.ToMsgpack())
-		if header, found := storedHeaders[ev.ID]; !found || len(header.MustGet()) == 0 {
+		body := ev
+		if ev.Unpublished {
+			published := *ev
+			published.Unpublished = false
+			body = &published
+		} else if header, found := storedHeaders[ev.ID]; !found || len(header.MustGet()) == 0 {
 			txn.Set(e.keyForAuthEventIDs(ev.ID), packAuthHeader(types.AuthHeader{AuthEventIDs: ev.AuthEventIDs}))
 		}
+		txn.Set(e.KeyForEventID(ev.ID), body.ToMsgpack())
 		if indexed {
 			txn.SetVersionstampedKey(e.KeyForVersion(version), types.EventTupToBytes(ev.EventTup()))
 		}
@@ -306,6 +332,10 @@ func (e *EventsDirectory) roomExtremKeyToEventID(key fdb.Key) id.EventID {
 func (e *EventsDirectory) rangeForRoomExtrems(roomID id.RoomID) fdb.ExactRange {
 	return types.GetVersionRange(e.roomExtremIDs, types.ZeroVersionstamp, types.ZeroVersionstamp, roomID.String())
 	// return e.roomExtremIDs
+}
+
+func (e *EventsDirectory) keyForRoomStateExtrem(roomID id.RoomID, eventID id.EventID) fdb.Key {
+	return e.roomStateExtremIDs.Pack(tuple.Tuple{roomID.String(), eventID.String()})
 }
 
 // Room relations/reactions/threads

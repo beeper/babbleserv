@@ -96,8 +96,8 @@ func txnEvaluateNotificationsForEvents(
 	result := make(map[id.EventID]map[id.UserID]types.Notifications, len(evs))
 
 	for _, ev := range evs {
-		// Skip duplicates, rejected, soft-failed, and outlier events
-		if ev.IsDuplicate || ev.Rejected || ev.SoftFailed || ev.Outlier {
+		// Skip duplicates, rejected, soft-failed, outlier and replayed unpublished events
+		if ev.IsDuplicate || ev.Rejected || ev.SoftFailed || ev.Outlier || ev.Unpublished {
 			continue
 		}
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/notifier"
 )
 
@@ -27,6 +28,7 @@ func NewWorkers(
 	notifiers *notifier.Notifiers,
 	fclient fclient.FederationClient,
 	fedClient *federation.Client,
+	ingestJobs *ingest.Jobs,
 ) *Workers {
 	log := logger.With().
 		Str("component", "workers").
@@ -59,6 +61,9 @@ func NewWorkers(
 		NewPresenceChangeIterator(log, cfg, db, notifiers),
 		// Presence timeouts -> presence changes
 		NewPresenceTimeoutIterator(log, cfg, db, notifiers),
+
+		// Resumes rooms' ingest jobs whose runner stopped
+		NewIngestJobWorker(log, db, ingestJobs),
 	}
 
 	return &Workers{

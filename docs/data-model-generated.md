@@ -96,6 +96,8 @@ indices to enable fast access to various bits of (room) event data.
 | `localRoomVersionToTup` | `(RoomID, tuple.Versionstamp)` | `types.EventTup` | Ordered `EventTup`s originating from this homeserver, for paginating events to send over<br/>federation.<br/> |
 | `roomVersionToState` | `(RoomID, tuple.Versionstamp)` | `(ContextID)` | The room's current state context by room/version, one row per step moving it, at the version<br/>of the event making the step. The latest row at or before a version is the room's current<br/>state as of that version, for syncing state changes.<br/> |
 | `roomExtremIDs` | `(RoomID, EventID)` | `empty` | Current room extremeties, keys only roomID/eventID. We range over them to pull the current<br/>DAG extremeties before clearing when writing events (and setting the written event).<br/>- on local send take all event IDs as `prev_events`<br/>- on store event clear any found in `prev_events`<br/> |
+| `roomStateExtremIDs` | `(RoomID, EventID)` | `Versionstamp the event was published at` | `srx`: the tips of a state DAG room's state DAG (MSC4242), which local events cite in<br/>`prev_state_events` and whose states make up current state. Written only by publication: an<br/>accepted state event replaces the prev state events it cites, other events change nothing.<br/>Past the cap on `prev_state_events`, local events cite those published last.<br/> |
+| `roomStateDAG` | `(RoomID, Versionstamp)` | `EventID` | `sdg`: a state DAG room's state DAG as other servers see it (MSC4242): every accepted state<br/>event, written as it is published, or as a join's replay from outside the room gives it<br/>contexts, the resident having published it. send_join serves the rows before the join's.<br/>Staging never writes it, so a joiner never adopts state no other server has.<br/> |
 | `byRoomRelation` |  |  | RoomID/related-event-ID/version to (eventID, relType)<br/>- paginate events relating to this event<br/>- paginate events of a certain rel_type relating to this event<br/>  - have to paginate through types that don't match<br/>  - probably sufficient performance (rare)<br/> |
 | `byRoomReaction` |  |  | Room event reactions<br/>- de-dupe reactions to an event by user/key<br/>- paginate reactions for a given event (`/relations/rel_to_ev_id/m.annotation`)<br/> |
 | `roomThreadVersionToID` |  |  | root event ID by room/root-ev-version<br/>Note: only set for new thread roots, on the first replying (in-thread) event.<br/>- paginate thread roots in a room<br/> |
@@ -124,6 +126,11 @@ indices to enable fast access to various bits of (room) event data.
 | `publishedRooms` | `(-MemberCount, RoomID); value: empty` |  | Published rooms ordered by descending joined-member count, then room ID.<br/> |
 | `eventTransactions` |  |  | (UserID, DeviceID, RoomID, Endpoint, TransactionID) -> EventID<br/> |
 | `eventTransactionIDs` |  |  | (EventID, UserID, DeviceID) -> TransactionID<br/> |
+| `ingestJobs` | `RoomID` | `types.IngestJob (msgpack)` | `ijb`: a room's ingest job, holding the room version, present while the room has targets,<br/>see docs/event-sending.md#ingest-jobs<br/> |
+| `ingestTargets` | `(RoomID, EventID)` | `types.IngestTarget (msgpack)` | `ijt`: events the room's job publishes once the state they need is stored, a local user's<br/>join or a PDU<br/> |
+| `ingestJoins` | `(RoomID, UserID)` | `types.IngestJoin (msgpack)` | `iju`: the join target of a local user's pending join, or why it failed, which the user's<br/>/join watches<br/> |
+| `ingestQueues` | `(RoomID, "pdus" \| "bytes")` | `little-endian int64` | `ijq`: the PDU targets queued and their event bytes, kept with atomic adds<br/> |
+| `botRooms` | `UserID` | `RoomID` | `bot`: BabbleBot's direct message room with each local user<br/> |
 
 ### ServersDirectory
 

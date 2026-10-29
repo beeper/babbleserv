@@ -17,6 +17,9 @@ type User struct {
 	CreatedAt time.Time `msgpack:"ct"`
 
 	DeviceListVersion int64 `msgpack:"dlv"`
+
+	// Owned by the server, as BabbleBot is, rather than registered
+	ServerOwned bool `msgpack:"svo,omitempty"`
 }
 
 func NewUserFromBytes(b []byte, username, serverName string) (*User, error) {

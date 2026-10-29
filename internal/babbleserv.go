@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/tls"
 	"net/http"
@@ -13,8 +14,10 @@ import (
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/babbleserv/internal/babblebot"
 	"github.com/beeper/babbleserv/internal/config"
 	"github.com/beeper/babbleserv/internal/databases"
+	"github.com/beeper/babbleserv/internal/ingest"
 	"github.com/beeper/babbleserv/internal/notifier"
 	"github.com/beeper/babbleserv/internal/routes"
 	"github.com/beeper/babbleserv/internal/util"
@@ -22,10 +25,12 @@ import (
 )
 
 type Babbleserv struct {
-	db        *databases.Databases
-	notifiers *notifier.Notifiers
-	routes    *routes.Routes
-	workers   *workers.Workers
+	db         *databases.Databases
+	notifiers  *notifier.Notifiers
+	bot        *babblebot.Bot
+	ingestJobs *ingest.Jobs
+	routes     *routes.Routes
+	workers    *workers.Workers
 }
 
 type UserAgentTransport struct {
@@ -78,31 +83,40 @@ func NewBabbleserv(cfg config.BabbleConfig) *Babbleserv {
 
 	db := databases.NewDatabases(cfg, log, notifiers)
 
+	bot := babblebot.New(cfg, log, db)
+	ingestJobs := ingest.NewJobs(cfg, log, db, fclient, ingest.NewFetcher(cfg, db, fedClient, keyStore), keyStore, bot)
+
 	var rts *routes.Routes
 	if cfg.RoutesEnabled {
-		rts = routes.NewRoutes(cfg, log, db, notifiers, fclient, fedClient, keyStore, datastores)
+		rts = routes.NewRoutes(cfg, log, db, notifiers, fclient, fedClient, keyStore, datastores, ingestJobs)
 	} else {
 		log.Info().Msg("Routes disabled")
 	}
 
 	var wrks *workers.Workers
 	if cfg.WorkersEnabled {
-		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient, fedClient)
+		wrks = workers.NewWorkers(cfg, log, db, notifiers, fclient, fedClient, ingestJobs)
 	} else {
 		log.Info().Msg("Workers disabled")
 	}
 
 	return &Babbleserv{
-		db:        db,
-		notifiers: notifiers,
-		routes:    rts,
-		workers:   wrks,
+		db:         db,
+		notifiers:  notifiers,
+		bot:        bot,
+		ingestJobs: ingestJobs,
+		routes:     rts,
+		workers:    wrks,
 	}
 }
 
 func (b *Babbleserv) Start() {
 	b.db.Start()
 	b.notifiers.Start()
+
+	if err := b.bot.EnsureUser(context.Background()); err != nil {
+		log.Err(err).Msg("Failed to create BabbleBot's user, creating it on first use")
+	}
 
 	if b.routes != nil {
 		b.routes.Start()
@@ -119,6 +133,7 @@ func (b *Babbleserv) Stop() {
 	if b.workers != nil {
 		b.workers.Stop()
 	}
+	b.ingestJobs.Stop()
 
 	b.notifiers.Stop()
 	b.db.Stop()

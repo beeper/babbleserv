@@ -10,7 +10,6 @@ import (
 	"github.com/rs/zerolog/hlog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/babbleserv/internal/databases/rooms"
 	"github.com/beeper/babbleserv/internal/middleware"
@@ -54,11 +53,9 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 		// membership. A rejected invite falls back to the invitee's server recording it locally.
 		util.ResponseErrorMessageJSON(w, r, mautrix.MNotFound, "Not an active room on this server")
 		return
-	} else if checkRequestVersions {
-		if !slices.Contains(r.URL.Query()["ver"], room.Version) {
-			util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, "Room version not supported")
-			return
-		}
+	} else if checkRequestVersions && !slices.Contains(r.URL.Query()["ver"], room.Version) {
+		responseIncompatibleRoomVersion(w, r, room.Version, "Your homeserver does not support the room's version")
+		return
 	}
 
 	content := map[string]any{
@@ -114,11 +111,22 @@ func (f *FederationRoutes) makeMembershipEventForOtherServer(
 	}{ev, ev.RoomVersion})
 }
 
+// membershipResponse's beforeSend may refuse a verified event before it is sent; afterSend returns a
+// streamedResponse for a response too large to build whole.
+type membershipResponse struct {
+	beforeSend func(room *types.Room, ev *types.Event) error
+	afterSend  func(room *types.Room, ev *types.Event) (any, error)
+}
+
+type streamedResponse interface {
+	write(w http.ResponseWriter, r *http.Request)
+}
+
 func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 	w http.ResponseWriter,
 	r *http.Request,
 	membership event.Membership,
-	responseAfterSend func(roomID id.RoomID, eventID id.EventID) (any, error),
+	response membershipResponse,
 ) {
 	var ev types.Event
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
@@ -170,10 +178,16 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		util.ResponseErrorMessageJSON(w, r, mautrix.MInvalidParam, verifyErr.Error())
 		return
 	}
+	if response.beforeSend != nil {
+		if err := response.beforeSend(room, &ev); err != nil {
+			responseMembershipError(w, r, err)
+			return
+		}
+	}
 
 	// For a room this server is not in, none is taken, as a remote user's membership is never an
 	// outlier
-	res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, nil)
+	res, err := f.db.SendFederatedEvents(r.Context(), roomID, []*types.Event{&ev}, nil, rooms.SendFederatedEventsOptions{})
 	var rejection error
 	if err == nil && len(res.Rejected) > 0 {
 		rejection = res.Rejected[0].Error
@@ -189,13 +203,37 @@ func (f *FederationRoutes) sendMembershipEventFromOtherServer(
 		return
 	}
 
-	var response any = util.EmptyJSON
-	if responseAfterSend != nil {
-		response, err = responseAfterSend(roomID, ev.ID)
+	var resp any = util.EmptyJSON
+	if response.afterSend != nil {
+		resp, err = response.afterSend(room, &ev)
 		if err != nil {
-			util.ResponseErrorUnknownJSON(w, r, err)
+			responseMembershipError(w, r, err)
 			return
 		}
 	}
-	util.ResponseJSON(w, r, http.StatusOK, response)
+	if streamed, ok := resp.(streamedResponse); ok {
+		streamed.write(w, r)
+		return
+	}
+	util.ResponseJSON(w, r, http.StatusOK, resp)
+}
+
+func responseMembershipError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, rooms.ErrStateDAGTooLarge) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MTooLarge, err.Error())
+		return
+	} else if errors.Is(err, errTooManyStateDAGJoins) {
+		util.ResponseErrorMessageJSON(w, r, mautrix.MLimitExceeded, err.Error())
+		return
+	}
+	util.ResponseErrorUnknownJSON(w, r, err)
+}
+
+// responseIncompatibleRoomVersion names the room version, as the spec asks
+func responseIncompatibleRoomVersion(w http.ResponseWriter, r *http.Request, roomVersion, message string) {
+	util.ResponseJSON(w, r, http.StatusBadRequest, map[string]string{
+		"errcode":      mautrix.MIncompatibleRoomVersion.ErrCode,
+		"error":        message,
+		"room_version": roomVersion,
+	})
 }

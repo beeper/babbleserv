@@ -78,7 +78,7 @@ func (e *EventsDirectory) TxnGetAuthChainForEvents(
 	var seeds []id.EventID
 	for _, ev := range evs {
 		known[ev.ID] = ev.AuthEventIDs
-		seeds = append(seeds, ev.AuthDependencyIDs()...)
+		seeds = append(seeds, ev.AuthEventIDsWithCreate()...)
 	}
 
 	chainIDs, err := e.TxnGetAuthChainIDs(txn, seeds, known)

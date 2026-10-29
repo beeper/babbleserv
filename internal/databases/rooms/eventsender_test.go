@@ -197,3 +197,52 @@ func TestSendRetriesAnArtifactWhoseBuildConflicted(t *testing.T) {
 	assert.Equal(t, []int{1}, s.pauses)
 	assert.Len(t, s.built, 1)
 }
+
+// Remote join phases
+
+func TestSendRunUntilStagingDoneStopsBeforeTheNextWork(t *testing.T) {
+	s := &sendRecorder{
+		t: t,
+		prepares: []func() (preparationOutcome, error){
+			preparedAs(needsWork{work: stageEventsWork{staging: &stagingEvents{}}}),
+			preparedAs(needsWork{work: joinStateWork{from: types.StateHash{1}}}),
+		},
+	}
+	sender := s.sender()
+	sender.stopAt = stagingDone
+	_, err := sender.run(context.Background(), s.prepare)
+	require.ErrorIs(t, err, errPhaseReached)
+	require.Len(t, s.built, 1)
+	assert.IsType(t, stageEventsWork{}, s.built[0], "the join state is left to the next phase")
+	assert.Empty(t, s.after, "nothing published")
+	assert.Empty(t, s.prepares)
+	assert.False(t, s.locked)
+}
+
+func TestSendRunUntilWorkDoneBuildsWorkThenStopsBeforePublishing(t *testing.T) {
+	s := &sendRecorder{
+		t: t,
+		prepares: []func() (preparationOutcome, error){
+			preparedAs(needsWork{work: joinStateWork{from: types.StateHash{1}}}),
+			plannedTo(&publishPlan{}),
+		},
+	}
+	sender := s.sender()
+	sender.stopAt = workDone
+	_, err := sender.run(context.Background(), s.prepare)
+	require.ErrorIs(t, err, errPhaseReached)
+	assert.Len(t, s.built, 1)
+	assert.Empty(t, s.publishes)
+	assert.Empty(t, s.after)
+}
+
+func TestStagingDoneOutcomes(t *testing.T) {
+	assert.False(t, stagingDone(needsWork{work: stageEventsWork{}}))
+	assert.True(t, stagingDone(needsWork{work: joinStateWork{}}))
+	assert.True(t, stagingDone(needsWork{work: resolveStateWork{}}))
+	assert.True(t, stagingDone(readyToPublish{}))
+	assert.True(t, stagingDone(alreadySent{}))
+	assert.False(t, workDone(needsWork{work: joinStateWork{}}))
+	assert.True(t, workDone(readyToPublish{}))
+	assert.True(t, workDone(alreadySent{}))
+}

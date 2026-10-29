@@ -26,6 +26,7 @@ var (
 	errNeedsStaging             = errors.New("the send needs staging")
 	errGuardFailed              = errors.New("the room changed since the send was prepared")
 	errEventsStoredConcurrently = fmt.Errorf("%w: events were stored concurrently", errGuardFailed)
+	errPhaseReached             = errors.New("the send reached the outcome it runs until")
 )
 
 // Event sending timeouts & retries
@@ -33,7 +34,6 @@ const (
 	firstSendRetryPause   = 10 * time.Millisecond
 	longestSendRetryPause = 250 * time.Millisecond
 	sendTimeout           = 60 * time.Second
-	remoteJoinTimeout     = 10 * time.Minute
 )
 
 // sendGuard is room data checked at publish time to ensure no other process has mutated the room
@@ -41,6 +41,9 @@ type sendGuard struct {
 	revision uint64
 	joined   bool
 	unstored []id.EventID
+	// Events stored without state, which the publish gives state as new events
+	stateless   []id.EventID
+	noIngestJob bool
 }
 
 // publishPlan contains everything needed to complete (publish) an event send
@@ -51,7 +54,8 @@ type publishPlan struct {
 	// Stored rejected events a remote join accepts, which its publish then un-rejects
 	readopted []*types.Event
 	// The remote join whose publish replaces every extremity
-	resetExtremities id.EventID
+	resetExtremities      id.EventID
+	resetStateExtremities []id.EventID
 	// What else the publish writes: an alias, publication, a transaction ID or a lock refresh
 	extra func(fdb.Transaction, *types.Room) error
 }
@@ -86,6 +90,8 @@ type eventSender struct {
 	build   func(context.Context, preparationWork) error
 	after   func(context.Context, *SendEventsResult)
 	pause   func(context.Context, int) error
+	// Ends attempts with errPhaseReached once an outcome matches, so a job can run a send in phases
+	stopAt func(preparationOutcome) bool
 }
 
 func (r *RoomsDatabase) newEventSender(roomID id.RoomID, push pushContext) eventSender {
@@ -146,6 +152,8 @@ func (s *eventSender) attempt(ctx context.Context, prepare prepareEvents) (*Send
 	outcome, err := prepare(ctx)
 	if err != nil {
 		return nil, nil, err
+	} else if s.stopAt != nil && s.stopAt(outcome) {
+		return nil, nil, errPhaseReached
 	}
 	switch outcome := outcome.(type) {
 	case readyToPublish:
@@ -294,8 +302,12 @@ func (p *preparedEvents) txnAuthorizeAt(
 	if authState, err = p.txnLookupAuthState(txn, at, ev); err != nil {
 		return nil, nil, err
 	}
-	authErr, err = events.NewTxnAuthEventsProvider(ctx, p.eventsProvider, authState).IsEventAllowed(ev)
+	authErr, err = p.authorize(ctx, authState, ev)
 	return authState, authErr, err
+}
+
+func (p *preparedEvents) authorize(ctx context.Context, authState types.StateMap, ev *types.Event) (authErr, err error) {
+	return events.NewTxnAuthEventsProvider(ctx, p.eventsProvider, authState).IsEventAllowed(ev)
 }
 
 // txnApplyEvent gives an authorized event its state contexts, a state event moving state on from
@@ -330,6 +342,30 @@ func (s *eventSender) txnNewStateBatch(
 	authGraph := s.r.events.NewAuthGraph(txn, s.roomID, eventsProvider)
 	authGraph.Add(pending...)
 	return s.r.state.NewBatch(s.roomID), authGraph
+}
+
+func (s *eventSender) newResolver(txn fdb.ReadTransaction, p *preparedEvents, roomVersion string) *eventsendutil.Resolver {
+	return eventsendutil.NewResolver(txn, p.eventsProvider, p.authGraph, eventsendutil.ResolverOptions{
+		StateBatch:     p.stateBatch,
+		RoomID:         s.roomID,
+		RoomVersion:    roomVersion,
+		MaxContexts:    s.r.config.Rooms.StateBudget.InlineResolutionContexts,
+		MaxCandidates:  s.r.config.Rooms.StateBudget.InlineResolutionCandidates,
+		MaxStateTuples: s.r.config.Rooms.StateBudget.InlineResolutionStateTuples,
+	})
+}
+
+// resolutionWork captures only the preparation inputs the job needs after its transaction ends
+func (p *preparedEvents) resolutionWork(request *eventsendutil.ResolutionRequest, roomVersion string) resolveStateWork {
+	return resolveStateWork{
+		request: request,
+		inputs: artifactInputs{
+			stateBatch:     p.stateBatch,
+			eventsProvider: p.eventsProvider,
+			authGraph:      p.authGraph,
+		},
+		roomVersion: roomVersion,
+	}
 }
 
 // finalizeAcceptedState finalizes the auth graph headers of the accepted state events, which state
@@ -506,7 +542,7 @@ func (s *eventSender) stageAndPublish(ctx context.Context, plan *publishPlan) (*
 // remote join accepts, the events with the rows indexing them, the room's current state with every
 // row it moves, see txnStoreRoomState, and the plan's other writes.
 func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan *publishPlan) (*SendEventsResult, error) {
-	room, err := s.txnCheckGuard(txn, plan)
+	room, err := s.txnCheckGuard(ctx, txn, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -529,6 +565,10 @@ func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan 
 	if plan.resetExtremities != "" {
 		s.r.events.TxnResetRoomExtremEventIDs(txn, room.ID, plan.resetExtremities)
 	}
+	if version, found := versions[plan.resetExtremities]; found && len(plan.resetStateExtremities) > 0 {
+		// At the join's version, so local events citing the extremities published last cite these
+		s.r.events.TxnResetRoomStateExtremEventIDs(txn, room.ID, plan.resetStateExtremities, version)
+	}
 	if plan.extra != nil {
 		if err := plan.extra(txn, room); err != nil {
 			return nil, err
@@ -540,7 +580,7 @@ func (s *eventSender) txnPublish(ctx context.Context, txn fdb.Transaction, plan 
 // txnCheckGuard returns the room a plan publishes to, failing with errGuardFailed unless the room is
 // as the plan was prepared for and none of the auth chains and headers its graph labelled changed
 // since.
-func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*types.Room, error) {
+func (s *eventSender) txnCheckGuard(ctx context.Context, txn fdb.Transaction, plan *publishPlan) (*types.Room, error) {
 	stored, err := roomOrNil(s.r.txnGetRoom(txn, plan.room.ID))
 	if err != nil {
 		return nil, err
@@ -553,11 +593,19 @@ func (s *eventSender) txnCheckGuard(txn fdb.Transaction, plan *publishPlan) (*ty
 		return nil, fmt.Errorf("%w: state revision %d, prepared at %d", errGuardFailed, revision, plan.guard.revision)
 	} else if joined := isServerJoined(stored); joined != plan.guard.joined {
 		return nil, fmt.Errorf("%w: this server joined %t, prepared %t", errGuardFailed, joined, plan.guard.joined)
+	} else if plan.guard.noIngestJob {
+		if err := s.r.txnCheckNoIngestJob(txn, plan.room.ID); err != nil {
+			return nil, err
+		}
 	}
 	if storedNow, err := s.r.txnGetStoredEventIDs(txn, plan.guard.unstored); err != nil {
 		return nil, err
 	} else if len(storedNow) > 0 {
 		return nil, errEventsStoredConcurrently
+	} else if given, err := s.r.txnAnyHasState(ctx, txn, plan.room.ID, plan.guard.stateless); err != nil {
+		return nil, err
+	} else if given {
+		return nil, fmt.Errorf("%w: given state", errEventsStoredConcurrently)
 	}
 	if unchanged, err := plan.authGraph.TxnLabelsUnchanged(txn); err != nil {
 		return nil, err
@@ -653,7 +701,7 @@ func (s *eventSender) buildStateResolution(ctx context.Context, work resolveStat
 		RoomID:      s.roomID,
 		RoomVersion: work.roomVersion,
 	})
-	if err := s.buildAndStoreResolution(ctx, resolver, stateBatch, work.request.Contexts); err != nil {
+	if _, err := s.buildAndStoreResolution(ctx, resolver, stateBatch, work.request.Contexts); err != nil {
 		return fmt.Errorf("failed to resolve contexts: %w", err)
 	}
 	stateEvents, candidates := resolver.Stats()
@@ -668,16 +716,14 @@ func (s *eventSender) buildStateResolution(ctx context.Context, work resolveStat
 	return nil
 }
 
-func (s *eventSender) buildAndStoreResolution(ctx context.Context, resolver *eventsendutil.Resolver, stateBatch *state.Batch, contexts []types.StateHash) error {
+func (s *eventSender) buildAndStoreResolution(ctx context.Context, resolver *eventsendutil.Resolver, stateBatch *state.Batch, contexts []types.StateHash) (types.StateHash, error) {
 	result, request, err := resolver.ResolveContexts(contexts)
 	if err != nil {
-		return err
+		return types.StateHash{}, err
+	} else if request != nil {
+		return types.StateHash{}, errors.New("artifact job requested another resolution")
+	} else if err := stateBatch.Stage(ctx, s.r.config.Rooms.StateBudget.StagingBytes, slices.Concat(contexts, []types.StateHash{result})...); err != nil {
+		return types.StateHash{}, err
 	}
-	if request != nil {
-		return errors.New("artifact job requested another resolution")
-	}
-	if err := stateBatch.Stage(ctx, s.r.config.Rooms.StateBudget.StagingBytes, slices.Concat(contexts, []types.StateHash{result})...); err != nil {
-		return err
-	}
-	return stateBatch.StoreResolved(ctx, contexts, result)
+	return result, stateBatch.StoreResolved(ctx, contexts, result)
 }
